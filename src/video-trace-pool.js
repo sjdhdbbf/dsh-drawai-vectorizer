@@ -1,0 +1,164 @@
+/**
+ * 视频复刻常驻 Worker 池：复用线程，按任务令牌取消排队/在算任务。
+ */
+import { Worker } from 'node:worker_threads'
+import { availableParallelism, cpus, freemem } from 'node:os'
+
+/**
+ * 并行度策略（用户指定）：无论一共多少核心，都只用**一半**逻辑核心。
+ * - 向下取整，至少 1；上限 32（避免超大机器把内存打穿，见 resolvePoolSize 注释）。
+ * - 内存约束：每个 worker 处理一张帧（单帧 SVG 可达数十 MB），
+ *   所以在"一半核心"之外再按可用内存收敛一次。
+ */
+const MAX_WORKERS = 32
+const BYTES_PER_WORKER = 512 * 1024 * 1024 // 每 worker 预算 512MB
+
+export function resolvePoolSize(overrides = {}) {
+  const logical = (() => {
+    try {
+      const n = typeof availableParallelism === 'function' ? availableParallelism() : 0
+      if (Number.isInteger(n) && n > 0) return n
+    } catch { /* 回退到 cpus() */ }
+    const list = cpus()
+    return Array.isArray(list) && list.length > 0 ? list.length : 2
+  })()
+
+  // ① 一半核心（用户规则）
+  let size = Math.max(1, Math.floor(logical / 2))
+
+  // ② 内存收敛：可用内存 / 每 worker 预算
+  try {
+    const freeBytes = Number(freemem?.() ?? 0) || 0
+    if (freeBytes > 0) {
+      const byMemory = Math.max(1, Math.floor(freeBytes / BYTES_PER_WORKER))
+      if (byMemory < size) size = byMemory
+    }
+  } catch { /* 取不到内存就只用核心规则 */ }
+
+  // ③ 硬上限
+  if (size > MAX_WORKERS) size = MAX_WORKERS
+  return Math.max(1, size)
+}
+
+export function createVideoTracePool(options = {}) {
+  const size = options.size ?? resolvePoolSize()
+  const workerUrl = options.workerUrl ?? new URL('./video-trace-worker.js', import.meta.url)
+  let nextId = 1
+  let closed = false
+  const idle = []
+  const queue = []
+  const busy = new Map()
+
+  function spawn() {
+    const worker = new Worker(workerUrl)
+    worker.on('message', (message) => finish(worker, message))
+    worker.on('error', (error) => fail(worker, error))
+    worker.on('exit', (code) => {
+      if (busy.has(worker)) fail(worker, new Error('复刻线程已停止（' + code + '）'))
+      const at = idle.indexOf(worker)
+      if (at >= 0) idle.splice(at, 1)
+    })
+    // 空闲时不拖住进程退出（测试与短命脚本）；接任务时再 ref。
+    if (typeof worker.unref === 'function') worker.unref()
+    return worker
+  }
+
+  function ensure() {
+    while (!closed && idle.length + busy.size < size) idle.push(spawn())
+  }
+
+  function pump() {
+    if (closed) return
+    ensure()
+    while (idle.length && queue.length) {
+      const worker = idle.pop()
+      const item = queue.shift()
+      const id = nextId++
+      const dispatched = performance.now()
+      if (typeof worker.ref === 'function') worker.ref()
+      busy.set(worker, { id, item, dispatched, queueWaitMs: dispatched - item.queuedAt })
+      try {
+        worker.postMessage({ id, png: item.png, raster: item.raster, options: item.options }, item.transfer || [])
+      } catch (error) {
+        busy.delete(worker)
+        if (typeof worker.unref === 'function') worker.unref()
+        idle.push(worker)
+        item.reject(error)
+      }
+    }
+  }
+
+  function finish(worker, message) {
+    const active = busy.get(worker)
+    if (!active) return
+    if (message && message.id !== active.id) return
+    busy.delete(worker)
+    if (!closed) {
+      if (typeof worker.unref === 'function') worker.unref()
+      idle.push(worker)
+    } else worker.terminate().catch(() => {})
+    if (!message || message.ok !== true) active.item.reject(new Error((message && message.error) || '复刻失败'))
+    else active.item.resolve({ ...message, queueWaitMs: active.queueWaitMs, workerRoundTripMs: performance.now() - active.dispatched })
+    pump()
+  }
+
+  function fail(worker, error) {
+    const active = busy.get(worker)
+    busy.delete(worker)
+    if (active) active.item.reject(error instanceof Error ? error : new Error(String(error)))
+    worker.terminate().catch(() => {})
+    if (!closed) pump()
+  }
+
+  function run(png, traceOptions, meta = {}) {
+    if (closed) return Promise.reject(new Error('复刻线程池已关闭'))
+    return new Promise((resolve, reject) => {
+      queue.push({ png, options: traceOptions, resolve, reject, token: meta.token, queuedAt: performance.now() })
+      pump()
+    })
+  }
+
+  function cancelToken(token) {
+    if (token === undefined || token === null) return
+    const kept = []
+    for (const item of queue) {
+      if (item.token === token) item.reject(new Error('已取消复刻'))
+      else kept.push(item)
+    }
+    queue.length = 0
+    for (const item of kept) queue.push(item)
+    for (const [worker, active] of Array.from(busy.entries())) {
+      if (active.item.token !== token) continue
+      busy.delete(worker)
+      active.item.reject(new Error('已取消复刻'))
+      worker.terminate().catch(() => {})
+    }
+    if (!closed) pump()
+  }
+
+  function close() {
+    if (closed) return
+    closed = true
+    for (const item of queue) item.reject(new Error('复刻线程池已关闭'))
+    queue.length = 0
+    for (const [worker, active] of busy) {
+      active.item.reject(new Error('复刻线程池已关闭'))
+      worker.terminate().catch(() => {})
+    }
+    busy.clear()
+    for (const worker of idle) worker.terminate().catch(() => {})
+    idle.length = 0
+  }
+
+  function runRaster(raster, traceOptions, meta = {}) {
+    if (closed) return Promise.reject(new Error('复刻线程池已关闭'))
+    // Copy into an owned allocation; never transfer a Node Buffer pool slab.
+    const pixels = new Uint8Array(raster.data.length); pixels.set(raster.data)
+    return new Promise((resolve, reject) => {
+      queue.push({ raster: { width: raster.width, height: raster.height, data: pixels }, transfer: [pixels.buffer], options: traceOptions,
+        resolve, reject, token: meta.token, queuedAt: performance.now() })
+      pump()
+    })
+  }
+  return { run, runRaster, cancelToken, close, get size() { return size } }
+}

@@ -1,0 +1,13497 @@
+/**
+ * dsh-drawai —— 浏览器半边（Client half）· 源文件
+ *
+ * 这是**源文件**，不要改 lib/client.js —— 那个由 tools/build.mjs 生成。
+ *
+ * 本文件是 bundle factory 的函数体，运行在下面的作用域里：
+ *   factory: (require) => { var module = { exports: {} }; var exports = module.exports; <本文件> }
+ * 因此可以：使用 `require`（只能拿冻结静态模块表里的 9 个 + 已声明的 external）、
+ * 给 `exports` 赋值、以及在结尾 `return module.exports`（由 build 补上）。
+ *
+ * 数据通道走宿主生成的 Remote：ctx.remote.workspaceFiles（官方文件查看器同款），
+ * 不再有动态包专有的 host.call。
+ */
+
+const React = require('react')
+const { createVideoController, VideoSurface, VideoControls, VideoPreview } = videoPlayer
+
+/**
+ * 样式内核（drawio 的 style 键语义）—— 构建时从 src/style-kernel.js 内联进本 bundle，
+ * 宿主半边 import 的是同一份源文件，所以两边的格式判据不可能漂移。
+ *
+ * 这里**按需解构**：内核里与本文件同名的符号（例如 SIDES）不取，继续用本地的，
+ * 于是不会出现"重复 const 声明"那种直接炸掉整棵子树的错误。
+ */
+const {
+  DEFAULT_EDGE_STYLE,
+  DEFAULT_FONT,
+  NODE_SHAPES,
+  PALETTE,
+  arrowFromStyle,
+  colorNameFromStyle,
+  colorsFromStyle,
+  curvedFromStyle,
+  dashFromStyle,
+  dashPatternFromStyle,
+  edgeFreePoint,
+  formatStyle,
+  imageValueFromStyle,
+  isRasterDataUri,
+  isSvgDataUri,
+  isSvgMarkup,
+  isOrthogonalEdgeStyle,
+  jettyFromStyle,
+  lineKindFromStyle,
+  nodeShapeFromStyle,
+  normalizeDrawioDoc,
+  normalizeSvgMarkup,
+  snapDocGeometry,
+  parseStyle,
+  reportNodeShape,
+  sideFromStyle,
+  styleGet,
+  styleNumber,
+  stylePatch,
+  styleWithArrow,
+  styleWithColorName,
+  styleWithImageDataUri,
+  styleWithSvgMarkup,
+  styleWithTextColorName,
+  styleWithoutSvgMarkup,
+  svgMarkupFromStyle,
+  textColorNameFromStyle,
+  styleWithDash,
+  styleWithLineKind,
+  styleWithNodeShape,
+  styleWithSide,
+  isVideoNodeData,
+  DEFAULT_VIDEO_POSTER,
+  copyData,
+} = styleKernel
+
+/** 视频节点缺省尺寸（16:9）。 */
+const NEW_VIDEO_W = 320
+const NEW_VIDEO_H = 180
+const DEFAULT_MEDIA_FPS = 12
+
+function videoMetaOf(node) {
+  if (node === null || node === undefined || isVideoNodeData(node.data) === false) return null
+  const d = node.data
+  const clip = typeof d.mediaClip === 'string' ? d.mediaClip : null
+  if (clip === null || clip.length === 0) return null
+  const fps = Number(d.mediaFps)
+  return {
+    clip: clip,
+    kind: d.mediaKind === 'raster' ? 'raster' : 'svg',
+    fps: Number.isFinite(fps) && fps > 0 ? fps : DEFAULT_MEDIA_FPS,
+    posterFrame: Math.max(0, Math.floor(Number(d.mediaPosterFrame) || 0)),
+  }
+}
+
+function videoPosterOf(node) {
+  const markup = svgMarkupFromStyle(node.style || '')
+  if (markup) return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(markup)
+  return imageValueFromStyle(node.style || '') || 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(DEFAULT_VIDEO_POSTER)
+}
+
+/** 下载节点内嵌原图，保留原始格式、分辨率及 SVG 内容。 */
+function nodeImageExportInfo(node) {
+  if (!node || isVideoNodeData(node.data)) return null
+  const image = imageValueFromStyle(node.style || '')
+  if (!isRasterDataUri(image) && !isSvgDataUri(image)) return null
+  const mime = image.slice(5, image.indexOf(',')).split(';')[0].toLowerCase()
+  const extension = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/jpg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp', 'image/svg+xml': 'svg' }[mime]
+  if (!extension) return null
+  const name = String(node.label || node.id || 'image').trim().replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
+    .replace(/\.(png|jpe?g|gif|webp|svg)$/i, '').replace(/[. ]+$/g, '').slice(0, 120) || 'image'
+  return { image, mime, filename: name + '.' + extension }
+}
+
+function nodeImageExportBlob(info) {
+  const comma = info.image.indexOf(',')
+  const payload = info.image.slice(comma + 1)
+  if (/;base64$/i.test(info.image.slice(0, comma))) {
+    const binary = atob(payload)
+    return new Blob([Uint8Array.from(binary, (character) => character.charCodeAt(0))], { type: info.mime })
+  }
+  return new Blob([decodeURIComponent(payload)], { type: info.mime + ';charset=utf-8' })
+}
+
+function nodeImageExportPng(node, info) {
+  const width = Math.max(1, Number(node.w) || 1)
+  const height = Math.max(1, Number(node.h) || 1)
+  const svg = svgTreeToDom(React.createElement('svg', {
+    xmlns: 'http://www.w3.org/2000/svg', width, height, viewBox: '0 0 ' + width + ' ' + height,
+  }, React.createElement('image', { href: info.image, x: 0, y: 0, width, height,
+    preserveAspectRatio: styleGet(node.style || '', 'imageAspect', '0') === '1' ? 'xMidYMid meet' : 'none',
+  })), document)
+  return encodeExportPng(svg, exportOutputSize(width, height, { format: 'png', scale: 4 }))
+}
+
+function allocateClientClipId(doc) {
+  const used = new Set()
+  if (doc !== null && Array.isArray(doc.nodes)) {
+    for (let i = 0; i < doc.nodes.length; i += 1) {
+      const m = videoMetaOf(doc.nodes[i])
+      if (m !== null) used.add(m.clip)
+    }
+  }
+  let n = 1
+  while (used.has('clip-' + n)) n += 1
+  return 'clip-' + n
+}
+
+function videoDataForNew(clip, w, h) {
+  return {
+    drawaiMedia: '1',
+    mediaKind: 'svg',
+    mediaClip: clip,
+    mediaFps: String(DEFAULT_MEDIA_FPS),
+    mediaW: String(Math.round(w)),
+    mediaH: String(Math.round(h)),
+    mediaPosterFrame: '0',
+  }
+}
+
+const ID = 'drawai:diagram'
+const KIND = 'diagram'
+const DEFAULT_PATH = 'demo.drawio'
+
+/**
+ * 从剪贴板 / 拖放的 DataTransfer 里抽出图片文件（png/jpeg/gif/webp）。
+ * 纯函数：自测可喂假 { items, files }，不碰 DOM。
+ */
+function imageFilesFromDataTransfer(data) {
+  if (data === null || data === undefined || typeof data !== 'object') return []
+  const out = []
+  const seen = new Set()
+  const push = (file) => {
+    if (file === null || file === undefined) return
+    if (typeof file.type !== 'string' || /^image\/(png|jpe?g|gif|webp)$/i.test(file.type) === false) return
+    if (seen.has(file)) return
+    seen.add(file)
+    out.push(file)
+  }
+  if (data.files && typeof data.files.length === 'number') {
+    for (let i = 0; i < data.files.length; i += 1) push(data.files[i])
+  }
+  if (out.length > 0) return out
+  if (data.items && typeof data.items.length === 'number') {
+    for (let i = 0; i < data.items.length; i += 1) {
+      const item = data.items[i]
+      if (item === null || item === undefined) continue
+      if (item.kind === 'file' && typeof item.getAsFile === 'function') push(item.getAsFile())
+    }
+  }
+  return out
+}
+
+const VIDEO_FILE_MAX_BYTES = 48 * 1024 * 1024
+function videoFileExtension(file) {
+  if (!file) return null
+  const match = /\.(mp4|webm|mov|mkv)$/i.exec(file.name || '')
+  if (match) return match[1].toLowerCase()
+  return ({ 'video/mp4': 'mp4', 'video/webm': 'webm', 'video/quicktime': 'mov', 'video/x-matroska': 'mkv', 'video/matroska': 'mkv' })[file.type] || null
+}
+
+function mediaFilesFromDataTransfer(data) {
+  if (!data) return []
+  const files = [], seen = new Set()
+  const add = (file) => {
+    if (!file || seen.has(file) || (!videoFileExtension(file) && !/^image\/(png|jpe?g|gif|webp)$/i.test(file.type || ''))) return
+    seen.add(file); files.push(file)
+  }
+  for (const file of Array.from(data.files || [])) add(file)
+  if (!files.length) for (const item of Array.from(data.items || [])) if (item.kind === 'file' && typeof item.getAsFile === 'function') add(item.getAsFile())
+  return files
+}
+
+function hasMediaFileDrag(data) {
+  return !!data && (mediaFilesFromDataTransfer(data).length > 0 || Array.from(data.types || []).includes('Files') ||
+    Array.from(data.items || []).some((item) => item.kind === 'file'))
+}
+
+async function readVideoFile(file, signal) {
+  if (!videoFileExtension(file)) throw new Error('支持 MP4 / WebM / MOV / MKV 视频文件')
+  if (!Number.isFinite(file.size) || file.size <= 0 || file.size > VIDEO_FILE_MAX_BYTES) throw new Error('视频文件须在 48MB 以内且不能为空')
+  const url = URL.createObjectURL(file), video = document.createElement('video')
+  video.muted = true; video.playsInline = true; video.preload = 'auto'
+  try {
+    await waitForVideoTraceEvent(video, 'loadeddata', signal, () => { video.src = url; video.load() })
+    if (!video.videoWidth || !video.videoHeight || !Number.isFinite(video.duration) || video.duration <= 0) throw new Error('无法读取视频尺寸或时长')
+    const canvas = document.createElement('canvas'), scale = Math.min(1, 320 / Math.max(video.videoWidth, video.videoHeight))
+    canvas.width = Math.max(1, Math.round(video.videoWidth * scale)); canvas.height = Math.max(1, Math.round(video.videoHeight * scale))
+    const context = canvas.getContext('2d')
+    if (!context) throw new Error('无法生成视频封面')
+    context.drawImage(video, 0, 0, canvas.width, canvas.height)
+    const poster = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + canvas.width + ' ' + canvas.height + '"><image width="100%" height="100%" href="' + canvas.toDataURL('image/png') + '"/></svg>'
+    return { w: video.videoWidth, h: video.videoHeight, duration: video.duration, poster }
+  } finally { video.pause(); video.removeAttribute('src'); video.load(); URL.revokeObjectURL(url) }
+}
+
+function readVideoChunk(blob, signal) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    const abort = () => reader.abort()
+    const finish = (error) => { signal.removeEventListener('abort', abort); if (error) reject(error); else resolve(String(reader.result).split(',')[1]) }
+    reader.onload = () => finish()
+    reader.onerror = () => finish(new Error('读取视频文件失败'))
+    reader.onabort = () => finish(new Error('已取消视频导入'))
+    signal.addEventListener('abort', abort, { once: true })
+    if (signal.aborted) { finish(new Error('已取消视频导入')); return }
+    reader.readAsDataURL(blob)
+  })
+}
+
+async function uploadVideoFile(file, metadata, api, signal, onProgress) {
+  let pack
+  const check = () => { if (signal.aborted) throw new Error('已取消视频导入') }
+  try {
+    check()
+    pack = await api('media-upload-start', { name: file.name, extension: videoFileExtension(file), size: file.size, w: metadata.w, h: metadata.h })
+    check()
+    const auth = { clip: pack.clip, token: pack.token }, chunkSize = 1024 * 1024
+    for (let offset = 0; offset < file.size; offset += chunkSize) {
+      check()
+      const base64 = await readVideoChunk(file.slice(offset, Math.min(file.size, offset + chunkSize)), signal)
+      await api('media-upload-chunk', Object.assign({}, auth, { offset, base64 }))
+      check()
+      onProgress(Math.min(file.size, offset + chunkSize), file.size)
+    }
+    await api('media-upload-finish', auth)
+    check()
+    return Object.assign({}, metadata, auth)
+  } catch (error) {
+    if (pack) {
+      try { await api('media-upload-discard', { clip: pack.clip, token: pack.token }) }
+      catch { error.message += '；临时媒体清理失败，可用媒体清理菜单清除未引用素材' }
+    }
+    throw error
+  }
+}
+
+function applyImportedVideoToDoc(doc, result, at, layerId) {
+  const layer = (doc.layers || []).find((item) => item.id === layerId)
+  if (layerId !== null && !layer) throw new Error('目标图层已删除')
+  if (layer && layer.locked) throw new Error('目标图层已锁定')
+  const used = new Set(doc.nodes.concat(doc.edges, doc.layers || [], doc.labels || []).map((cell) => String(cell.id)))
+  let index = 1
+  while (used.has('n' + index)) index++
+  const size = fitImageNodeSize(result.w, result.h)
+  const node = { id: 'n' + index, label: '', x: snapTo(at.x - size.w / 2, GRID), y: snapTo(at.y - size.h / 2, GRID), w: size.w, h: size.h,
+    style: styleWithSvgMarkup('', result.poster, '1'), data: Object.assign(videoDataForNew(result.clip, result.w, result.h), { mediaKind: 'raster', mediaDuration: String(result.duration) }) }
+  if (layerId !== null) node.layer = layerId
+  const host = sectionAtPoint(doc, at.x, at.y, null)
+  if (host) node.parent = host.id
+  doc.nodes.push(node); ensureDrawOrder(doc)
+  return node.id
+}
+
+/**
+ * 标签列表的**纯逻辑**：算"打开 path 之后，标签列表与活动标签变成什么"。
+ *
+ * 抽出来是为了能被命令行自测直接断言 —— 这段规则有一条容易写错：
+ * 同一个文件重复打开必须**切过去**，不能再开一个（否则标签栏会堆满同一个文件）。
+ * 去重要**大小写不敏感**，并把分隔符归一：Windows 上 D:\ws\a 与 D:/WS/A 是同一个文件，
+ * 按字面比会开出第二个标签（探针实测到过）。归一后仍用**先打开的那个**路径当身份，
+ * 免得同一个文件在标签上显示成两种写法。
+ *
+ * 标签**只表示一个已绑定的文件**：没有文件就没有标签（空舞台由 CanvasTabs 直接渲染），
+ * 不再有"(未绑定)"/"未命名"这种幽灵标签 —— 那两套代码已经删掉了。
+ *
+ * 返回值 { tabs, active }；path 非法时原样返回。
+ */
+function openTabIn(list, path) {
+  if (typeof path !== 'string' || path.length === 0) return { tabs: list, active: null }
+  const samePath = (a, b) => typeof a === 'string' && typeof b === 'string' && a.replace(/\\/g, '/').toLowerCase() === b.replace(/\\/g, '/').toLowerCase()
+  for (let i = 0; i < list.length; i += 1) {
+    if (samePath(list[i].path, path)) return { tabs: list, active: list[i].key }
+  }
+  const key = 'tab:' + path
+  return { tabs: list.concat([{ key: key, path: path }]), active: key }
+}
+
+/** 标签标题：文件名。 */
+function tabLabelOf(path) {
+  if (typeof path !== 'string' || path.length === 0) return '画布'
+  const parts = path.split(/[\\/]/)
+  return parts[parts.length - 1] || path
+}
+
+const POLL_MS = 3000
+/**
+ * 打开 workspaceFiles 变更流，兼容 DSH 0.1 与 0.2 的不同签名：
+ *   0.1：changes(sessionId, signal) —— 会话级观测写入
+ *   0.2：changes(sessionId, path, signal) —— 按路径订阅
+ *
+ * `changes.length < 3` 时走 0.1；否则（含 length 为 0 / 不可靠的 Remote 代理）在
+ * 有 path 时先试三参，迭代启动失败再退回两参。外层仍有轮询兜底。
+ */
+async function* openWorkspaceFileChanges(workspaceFiles, sessionId, path, signal) {
+  const changes = workspaceFiles.changes
+  const watchPath = typeof path === 'string' ? path : ''
+  const arity = typeof changes.length === 'number' ? changes.length : 0
+  if (arity > 0 && arity < 3) {
+    yield* changes.call(workspaceFiles, sessionId, signal)
+    return
+  }
+  if (watchPath.length > 0) {
+    try {
+      const stream = changes.call(workspaceFiles, sessionId, watchPath, signal)
+      const iterator = stream[Symbol.asyncIterator]()
+      let first = await iterator.next()
+      while (true) {
+        if (first.done) return
+        yield first.value
+        first = await iterator.next()
+      }
+    } catch {
+      // 三参被拒（老宿主 / 代理 length 说谎）→ 退回 0.1 两参
+    }
+  }
+  yield* changes.call(workspaceFiles, sessionId, signal)
+}
+/**
+ * 选区上报的防抖时间（ms）。
+ *
+ * 框选时指针每移动一下都会 `setSelectedIds` —— 不防抖就是把宿主按帧打。
+ * 300ms 足够让 AI 在下一次 `diagram_read` 里看到"用户刚选了什么"，又不会刷请求。
+ */
+const SELECTION_REPORT_MS = 300
+/** 人工编辑的写回端点（宿主半边注册，见 src/index.js）。 */
+const SAVE_ENDPOINT = '/drawai/api/save'
+/** 自定义请求头，宿主用它做 CSRF 围栏。 */
+const SAVE_HEADER = 'x-drawai-save'
+/** 节点移动/缩放的吸附网格（px）：**一格 = 10px**。 */
+const GRID = 10
+/** 连线（折点/线段）的最小移动单位：**半格 = 5px**。连线比节点需要更细的手感。 */
+const EDGE_GRID = GRID / 2
+
+/**
+ * 指针移动多少像素之后才抢 pointer capture（见 `requestCapture`）。
+ *
+ * 取 3 是跟着"越 3px 才算拖"那套手感走的：手抖一两像素的点击不该被当成拖动，
+ * 更不该因此抢掉捕获 —— 抢了 click/dblclick 就落到画布容器上，双击改标签直接失灵。
+ */
+const CAPTURE_MOVE_PX = 3
+
+/**
+ * 新建节点的默认尺寸：**都取整格**。
+ *
+ * 为什么：尺寸不整格，节点中心就会落在半像素上（旧的 130×56 默认值，中心 y 偏移 28），
+ * 连线于是动不动多出"差一像素"的台阶。默认 60 与 GRID 对齐后，只要坐标在格线上，
+ * 中心就永远是 5 的倍数。
+ */
+const NEW_NODE_W = 130
+const NEW_NODE_H = 60
+
+/** 文档里没写 w/h 时的兜底尺寸（同样整格）。 */
+const FALLBACK_NODE_W = 150
+const FALLBACK_NODE_H = NEW_NODE_H
+
+/** 连线拖拽：指针离目标节点边框多近就算"落在它身上"（吸附容差，用户坐标单位）。 */
+const HOT_PAD = 18
+/** 落盘防抖窗口（ms）：拖拽过程中不写盘，停手后落一次。 */
+const SAVE_DEBOUNCE_MS = 300
+const FONT = 'Helvetica, Arial, sans-serif'
+const FSIZE = 12
+const LHEIGHT = 14
+
+// draw.io 经典调色板（mxGraph 默认色对）。
+//
+// 注意这里**只有"缺省"一套色**：v1.1 起颜色是文档的一部分（style 键 fillColor/strokeColor），
+// 主题只在文档没写颜色时补缺省 —— 这与 drawio 一致（换主题不改文档里的颜色，只改画布与网格）。
+const LIGHT = {
+  page: '#ffffff',
+  text: '#000000',
+  line: '#000000',
+  gridMinor: '#f2f2f2',
+  gridMajor: '#e2e2e2',
+  labelBg: '#ffffff',
+  default: { fill: '#ffffff', stroke: '#000000' },
+}
+
+const DARK = {
+  page: 'transparent',
+  text: '#e8e8e8',
+  line: '#c9c9c9',
+  gridMinor: 'rgba(255,255,255,0.05)',
+  gridMajor: 'rgba(255,255,255,0.10)',
+  labelBg: '#1c1c1c',
+  default: { fill: '#2a2a2a', stroke: '#c9c9c9' },
+}
+
+
+/**
+ * 浏览器根 ctx，由 apply 在激活时绑定。
+ *
+ * 为什么需要它：组件定义在**模块级**（不在 apply 内部），所以拿不到 apply 的参数。
+ * 而动态 Cordis 插件版之所以没这个问题，是因为那时所有组件都定义在 `apply(ctx)` 里、
+ * `ctx` 是闭包变量。拆成静态包时组件被提到了模块级 —— 于是 effect 里的 `ctx.remote`
+ * 变成了 ReferenceError，React 卸载整棵子树，tab 主体一片空白。
+ *
+ * 这个绑定就是模块级组件的入口。apply 一定先于任何组件渲染执行，所以运行时它必然已就绪；
+ * 组件里仍会判空，以免将来重构把顺序弄反时又变成一次无声的空白。
+ */
+let client = null
+
+const CSS = [
+  '.drawai-trace-pin{border:0;border-radius:6px;background:transparent;color:inherit;padding:5px 8px;cursor:pointer;font:inherit;font-size:11px}.drawai-trace-pin:hover,.drawai-trace-pin:focus-visible{background:var(--dsw-alias-bg-hover,#eef0f5)}.drawai-trace-card-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;font-weight:600;margin-bottom:10px}.drawai-trace-card-actions{display:flex;gap:2px}.drawai-video-task-card{position:absolute;right:12px;bottom:36px;width:300px;max-width:calc(100% - 24px);box-sizing:border-box;padding:12px 14px;border:1px solid var(--dsw-alias-border-l2,#e1e3e8);border-radius:12px;background:var(--dsw-alias-bg-overlay,#fff);color:var(--dsw-alias-label-primary,#282c35);box-shadow:0 6px 24px #20273820;z-index:950}.drawai-video-task-card progress{width:100%;height:5px;display:block}.drawai-video-task-detail{font-size:12px;line-height:1.5;margin-top:10px;overflow-wrap:anywhere}.drawai-video-task-detail small{display:block;opacity:.65;margin-top:4px}.drawai-video-task-detail .drawai-btn{margin-top:8px}',
+  // 用绝对定位铺满宿主给的那一格，**不用 height:100%**。
+  //
+  // 这里连续出过两次"画布没高度"（先是一条，后来整块消失）：根因都是
+  // `height:100%` 要求父级有**确定高度**，而宿主给的容器不保证这一点。
+  // inset:0 只要求父级是定位元素，而 .drawai-pane 已经是（我们自己的 CSS），
+  // 所以这条链子只依赖我们自己，不再依赖宿主怎么排。
+  '.drawai-root{display:flex;flex-direction:column;position:absolute;top:0;left:0;right:0;bottom:0;min-height:0;font-size:12px;color:var(--dsw-alias-label-primary,#e6e6e6);outline:none}',
+  '.drawai-head{display:flex;align-items:center;gap:6px;padding:6px 8px;border-bottom:1px solid var(--dsw-alias-border-l1,#333)}',
+  // 多画布标签条。放在工具条**下面**一行：工具条是"对这张画布做什么"，
+  // 标签条是"现在看哪张画布"，两者职责不同，混在一行会挤成一团（右栏本来就窄）。
+  '.drawai-tabs{display:flex;gap:4px;padding:4px 6px 0;overflow-x:auto;border-bottom:1px solid var(--dsw-alias-border-l1,#333);flex:0 0 auto}',
+  '.drawai-tab{display:flex;align-items:center;gap:2px;flex:0 0 auto;border:1px solid var(--dsw-alias-border-l2,#444);border-bottom:none;border-radius:6px 6px 0 0;background:transparent;padding:1px 4px 1px 8px}',
+  '.drawai-tab.on{background:var(--dsw-alias-bg-layer-2,rgba(255,255,255,.08));border-color:var(--dsw-alias-brand-primary,#4c8dff)}',
+  '.drawai-tab-name{border:none;background:transparent;color:inherit;font-size:12px;cursor:pointer;padding:2px 2px;white-space:nowrap;max-width:150px;overflow:hidden;text-overflow:ellipsis}',
+  '.drawai-tab-x{border:none;background:transparent;color:var(--dsw-alias-label-secondary,#9aa0a6);cursor:pointer;font-size:13px;line-height:1;padding:0 3px;border-radius:3px}',
+  '.drawai-tab-x:hover{background:rgba(255,120,120,.25);color:inherit}',
+  // 标签区外壳 = 整个组件根，**用绝对定位铺满宿主给的位置**。
+  //
+  // 这里修过两次，记清楚原因：靠 `flex:1` + `height:100%` 这条链子太脆 ——
+  // 只要宿主给的那一层不是 flex、或者不是"确定高度"，链子就断，
+  // 里面的 flex:1 画布直接塌成 0 高（两次症状：先"只占上方一小条"，后"完全没有了"）。
+  // 绝对定位 + inset:0 只依赖"宿主 tab 面板是定位元素"这一个前提。
+  '.drawai-tabs-wrap{display:flex;flex-direction:column;position:absolute;top:0;left:0;right:0;bottom:0}',
+  '.drawai-panes{position:relative;flex:1;min-height:0}',
+  // 空舞台：一张画布都没打开时的提示（工作栏在它上面，仍然可用）。
+  '.drawai-empty{flex:1;min-height:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;padding:16px;text-align:center}',
+  '.drawai-empty-title{font-size:13px;color:var(--dsw-alias-label-primary,#e6e6e6)}',
+  '.drawai-empty-hint{font-size:12px;color:var(--dsw-alias-label-secondary,#9aa0a6)}',
+  '.drawai-pane{position:absolute;top:0;left:0;right:0;bottom:0;flex-direction:column;min-height:0}',
+  // 画布 + 右侧常驻元素条：横排，条不挤工具栏宽度（飞书侧栏在左，我们放右边）。
+  '.drawai-body{display:flex;flex:1;min-height:0;min-width:0;position:relative}',
+  '.drawai-path{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:ui-monospace,Consolas,monospace;color:var(--dsw-alias-label-secondary,#9aa0a6)}',
+  '.drawai-btn{border:1px solid var(--dsw-alias-border-l2,#444);background:var(--dsw-alias-bg-layer-2,rgba(255,255,255,.06));color:inherit;border-radius:6px;padding:2px 8px;font-size:12px;cursor:pointer;white-space:nowrap}',
+  '.drawai-btn:hover{border-color:var(--dsw-alias-brand-primary,#4c8dff)}',
+  // 视口由我们自己管（viewBox），所以不再让容器滚动 —— 否则滚轮会同时滚动和缩放。
+  // user-select:none —— 拖动平移时不能把图里的文字一起选中（观感很差）。
+  // touch-action:none —— 我们自己处理 pointer 事件，别让浏览器再做触摸滚动/缩放。
+  '.drawai-canvas{flex:1;min-height:0;min-width:0;overflow:hidden;position:relative;user-select:none;-webkit-user-select:none;touch-action:none}',
+  '.drawai-note{padding:4px 8px;color:var(--dsw-alias-label-secondary,#9aa0a6);border-top:1px solid var(--dsw-alias-border-l1,#333);user-select:text;-webkit-user-select:text;cursor:text}.drawai-err{user-select:text;-webkit-user-select:text;cursor:text}.drawai-status-note{display:flex;align-items:flex-start;gap:8px}.drawai-status-text{flex:1;min-width:0;max-height:120px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}.drawai-status-copy{flex:none;border:1px solid var(--dsw-alias-border-l1,#888);border-radius:4px;background:transparent;color:inherit;padding:2px 6px;cursor:pointer;user-select:none}',
+  // 右侧元素条（飞书侧栏观感）：浅底 + 线稿图标 + 宽松间距；同族变体进侧面板。
+  '.drawai-rail{flex:1;display:flex;flex-direction:column;align-items:center;gap:6px;padding:12px 6px;border-left:1px solid var(--dsw-alias-border-l1,rgba(0,0,0,.08));background:var(--dsw-alias-bg-base,#ffffff);overflow-y:auto;overflow-x:hidden}',
+  '.drawai-rail-cap{width:20px;height:1px;margin:0 0 4px;background:var(--dsw-alias-border-l1,rgba(0,0,0,.12));flex:0 0 auto}',
+  '.drawai-rail-chip{display:flex;align-items:center;justify-content:center;width:36px;height:36px;border:none;border-radius:8px;background:transparent;padding:0;cursor:pointer;color:var(--dsw-alias-label-primary,#333333);flex:0 0 auto}',
+  '.drawai-rail-chip:hover{background:rgba(0,0,0,.06)}',
+  '.drawai-rail-chip.on{background:rgba(0,0,0,.08);color:var(--dsw-alias-brand-primary,#3370ff)}',
+  '.drawai-rail-chip.dim{opacity:.35}',
+  '.drawai-rail-chip svg{display:block}',
+  '.drawai-rail-sep{width:20px;height:1px;margin:4px 0;background:var(--dsw-alias-border-l1,rgba(0,0,0,.12));flex:0 0 auto}',
+  // 同族变体：悬停族入口时在左侧弹出白色气泡（不铺满侧栏高度）。
+  '.drawai-rail-wrap{position:relative;flex:0 0 48px;display:flex;flex-direction:row-reverse;align-items:stretch;min-height:0}',
+  '.drawai-rail-wrap>.drawai-rail{flex:0 0 48px}',
+  '.drawai-rail-panel{position:absolute;right:54px;z-index:12;display:grid;grid-template-columns:repeat(3,44px);gap:6px;padding:10px;border:1px solid rgba(0,0,0,.08);border-radius:14px;background:#ffffff;box-shadow:0 8px 28px rgba(0,0,0,.12),0 0 0 1px rgba(0,0,0,.02);max-height:min(320px,70%);overflow-y:auto}',
+  '.drawai-rail-panel-title{grid-column:1/-1;font-size:11px;color:#8f959e;padding:0 2px 2px;user-select:none;white-space:nowrap}',
+  '.drawai-rail-panel .drawai-rail-chip{width:44px;height:34px;color:#333}',
+  '.drawai-rail-panel .drawai-rail-chip:hover{background:rgba(0,0,0,.06)}',
+  '.drawai-rail-panel .drawai-rail-chip.on{background:rgba(51,112,255,.1);color:#3370ff}',
+  // 最后一级（文字/分区/SVG/图片/独立线…）：悬停只浮名称气泡，不铺同族形状格。
+  '.drawai-rail-tip{position:absolute;right:54px;z-index:12;padding:6px 10px;border:1px solid rgba(0,0,0,.08);border-radius:8px;background:#ffffff;box-shadow:0 4px 16px rgba(0,0,0,.12),0 0 0 1px rgba(0,0,0,.02);font-size:12px;line-height:1.3;color:#333;white-space:nowrap;pointer-events:none;user-select:none}',
+  '.drawai-canvas.placing{cursor:crosshair}',
+  '.drawai-err{padding:8px;color:var(--dsw-alias-state-error-primary,#ff6b6b);white-space:pre-wrap}',
+  // 交互态
+  '.drawai-node{cursor:move}',
+  '.drawai-node-hit{cursor:pointer}',
+  '.drawai-edge-hit{cursor:pointer;stroke:transparent;stroke-width:12;fill:none}',
+  '.drawai-sel{stroke:#1a73e8 !important;stroke-width:2 !important}',
+  '.drawai-handle{cursor:crosshair}',
+  // 「编辑数据」面板里的多行输入：等宽字体、跟着菜单宽度走。
+  '.drawai-data{width:100%;box-sizing:border-box;font:12px/1.5 ui-monospace,Consolas,monospace;color:inherit;background:transparent;border:1px solid currentColor;border-radius:4px;padding:4px;resize:vertical}',
+  '.drawai-link{cursor:crosshair}',
+  // 连线拖拽的实时预览（路由后的正交预览线 + 落点提示）。
+  // 这两条路径都是纯视觉件，绝不能挡住命中测试 —— .drawai-edge-hit 的 12px 透明带子、
+  // 节点自己的 <g> 都靠 pointer-events 工作，预览一旦可命中就会把落点判断弄坏。
+  '.drawai-preview{pointer-events:none}',
+  // 从**预览线终点**滑到落点的那一小段收尾线。实线、带箭头 —— 它表示"这条边会这样接过去"，
+  // 和虚线（预览轨迹）区分开。dashoffset 动画让它看起来是从终点流向落点。
+  '.drawai-preview-tip{pointer-events:none;animation:drawai-flow 1.1s linear infinite}',
+  '@keyframes drawai-flow{to{stroke-dashoffset:-18}}',
+  '.drawai-hot-ring{pointer-events:none;animation:drawai-pulse 1.2s ease-in-out infinite}',
+  // 可连接的端点标记。纯提示件，绝不能参与命中测试 —— 否则指针一旦滑过某个端点，
+  // 命中目标就会从"节点"变成"这个圆点"，落点判定跟着乱。
+  '.drawai-anchor{pointer-events:none}',
+  '@keyframes drawai-pulse{0%,100%{opacity:.9}50%{opacity:.4}}',
+  '.drawai-node-hot{cursor:copy}',
+  '.drawai-rs-nw{cursor:nwse-resize}.drawai-rs-se{cursor:nwse-resize}',
+  '.drawai-rs-ne{cursor:nesw-resize}.drawai-rs-sw{cursor:nesw-resize}',
+  '.drawai-rs-n{cursor:ns-resize}.drawai-rs-s{cursor:ns-resize}',
+  '.drawai-rs-e{cursor:ew-resize}.drawai-rs-w{cursor:ew-resize}',
+  // 就地编辑框是画布里唯一需要能选中文字的元素 —— 必须把 user-select 放开回来。
+  //
+  // 它是 **textarea**（不是单行 input）：需求"输入过程中也要自动换行"+"输入时的效果与
+  // 输完后一致"要求它能按节点的文字区宽度换行、并按节点自己的字号字色画。
+  // 用 `outline` 而不是 `border`：边框会占掉 2px 内容宽度，断行位置就跟最终效果差一个字符。
+  // 背景透明、颜色与字号由 inline style 按**这个节点**给（见 renderDiagram 的 labelTextBox）。
+  '.drawai-edit{position:absolute;z-index:5;box-sizing:border-box;outline:2px solid #1a73e8;outline-offset:-2px;border:none;border-radius:4px;background:transparent;color:#000;font-family:Helvetica, Arial, sans-serif;font-size:12px;line-height:14px;text-align:center;padding:0;margin:0;resize:none;overflow:hidden;white-space:pre-wrap;word-break:break-word;user-select:text;-webkit-user-select:text}',
+  '.drawai-tools{display:flex;gap:6px;align-items:center;flex-wrap:wrap}',
+  '.drawai-trace-surface{position:relative;width:100%;height:100%;overflow:hidden}.drawai-trace-surface>svg{display:block;pointer-events:none}.drawai-trace-progress{position:absolute;left:8px;right:8px;bottom:8px;pointer-events:none;line-height:0}.drawai-trace-progress progress{display:block;width:100%;height:5px;accent-color:#386bff}',
+  '.drawai-video-surface{position:relative;width:100%;height:100%;background:transparent;overflow:hidden}.drawai-video-play{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);min-width:44px;min-height:44px;border:1px solid #ffffff80;border-radius:24px;background:#101827bf;color:#fff;font-size:18px;cursor:pointer;z-index:1}.drawai-video-play:disabled{cursor:wait}.drawai-video-chrome{position:absolute;left:0;right:0;bottom:0;z-index:2;display:flex;align-items:center;gap:8px;padding:10px 10px 8px;box-sizing:border-box;background:linear-gradient(transparent,#000000bf);color:#fff;font:11px/1.2 sans-serif}.drawai-video-chrome-toggle{flex:0 0 auto;min-width:28px;min-height:28px;border:0;border-radius:4px;background:transparent;color:#fff;cursor:pointer;font-size:12px;padding:2px 4px;line-height:1}.drawai-video-chrome-toggle:hover,.drawai-video-chrome-toggle:focus-visible{background:#ffffff24}.drawai-video-chrome-progress{flex:1 1 auto;min-width:0;height:4px;margin:0;accent-color:#fff;cursor:pointer}.drawai-video-chrome-time{flex:0 0 auto;font-variant-numeric:tabular-nums;white-space:nowrap;opacity:.9}.drawai-video-message{position:absolute;bottom:0;left:0;right:0;padding:6px;background:#000c;color:#fff;font:12px/1.4 sans-serif;pointer-events:none}.drawai-video-toolbar{overflow:visible!important;max-height:none}.drawai-video-controls{display:flex;flex-wrap:wrap;align-items:center;gap:6px;width:100%;box-sizing:border-box;font:12px/1.4 sans-serif}.drawai-video-controls button,.drawai-video-controls select,.drawai-video-more summary{min-height:30px;border:1px solid var(--dsw-alias-border-l2,#dde1e8);border-radius:6px;background:var(--dsw-alias-bg-overlay,#fff);color:inherit;padding:4px 7px;cursor:pointer}.drawai-video-controls button:disabled{opacity:.4;cursor:default}.drawai-video-controls input[type=range]{flex:1 1 120px;min-width:70px;max-width:100%;accent-color:#386bff}.drawai-video-controls label{display:flex;align-items:center;white-space:nowrap}.drawai-video-time{font-variant-numeric:tabular-nums;white-space:nowrap}.drawai-video-more{position:relative}.drawai-video-more summary{list-style:none}.drawai-video-more>div{position:absolute;right:0;top:100%;display:flex;flex-direction:column;min-width:140px;gap:4px;padding:6px;border-radius:8px;background:var(--dsw-alias-bg-overlay,#fff);box-shadow:0 6px 24px #0003;z-index:10}.drawai-video-preview{position:absolute;inset:0;z-index:1100;display:flex;flex-direction:column;gap:12px;padding:16px;box-sizing:border-box;background:var(--dsw-alias-bg-overlay,#fff);color:var(--dsw-alias-label-primary,#282c35)}.drawai-video-preview-media{flex:1;min-height:0;overflow:hidden}.drawai-video-close{align-self:flex-end;cursor:pointer;background:transparent;color:inherit;border:0;padding:6px}',
+  '.drawai-selection-toolbar{position:absolute;z-index:6;box-sizing:border-box;display:flex;flex-wrap:nowrap;align-items:stretch;gap:2px;padding:5px 6px;overflow-x:auto;overflow-y:hidden;scrollbar-width:thin;border:1px solid var(--dsw-alias-border-l2,#e1e3e8);border-radius:12px;background:var(--dsw-alias-bg-overlay,#fff);color:var(--dsw-alias-label-primary,#282c35);box-shadow:0 8px 28px #20273814,0 2px 6px #20273808}',
+  '.drawai-video-actions{display:flex;align-items:stretch;gap:2px;width:100%;min-width:0}.drawai-toolbar-button{flex:1 0 38px;min-width:38px;border:0;background:transparent;color:inherit;font:inherit}.drawai-toolbar-button:disabled{opacity:.45;cursor:default}.drawai-toolbar-button:disabled:hover{background:transparent}.drawai-video-export-options{display:flex;flex-direction:column;gap:8px}.drawai-video-export-options .drawai-choice-button{min-height:34px;text-align:left;padding:7px 10px}',
+  '.drawai-style-control{display:flex;align-items:center;gap:5px;font-size:11px;white-space:nowrap;padding-left:8px;border-left:1px solid var(--dsw-alias-border-l2,#e1e3e8)}',
+  '.drawai-style-control select,.drawai-style-control input{box-sizing:border-box;height:30px;border:1px solid var(--dsw-alias-border-l2,#e1e3e8);border-radius:7px;background:var(--dsw-alias-bg-overlay,#fff);color:inherit;max-width:100px;padding:2px 5px}',
+  '.drawai-style-control input[type=color]{width:28px;padding:2px;cursor:pointer}.drawai-style-control input[type=number]{width:52px;padding:2px 4px}',
+  '.drawai-color-palette{flex:1 0 38px;min-width:38px}.drawai-color-palette summary,.drawai-toolbar-button{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;cursor:pointer;list-style:none;padding:5px 3px;border-radius:7px;min-height:44px}.drawai-color-palette summary::-webkit-details-marker{display:none}.drawai-color-palette summary:hover,.drawai-color-palette[open] summary,.drawai-toolbar-button:hover,.drawai-toolbar-button:focus-visible{background:var(--dsw-alias-bg-layer-2,#f0f1f3)}.drawai-color-palette.disabled summary{opacity:.45;cursor:default}.drawai-color-palette.disabled summary:hover{background:transparent}',
+  '.drawai-color-preview{display:inline-block;flex:0 0 22px;width:22px;height:22px;border:1px solid #d9dde3;border-radius:50%;background:repeating-conic-gradient(#ddd 0% 25%,#fff 0% 50%) 50%/8px 8px}.drawai-color-caret{font-size:13px;color:#7b818c}.drawai-color-palette:not([open]) .drawai-color-caret{transform:rotate(180deg)}',
+  '.drawai-palette-panel{position:fixed;inset:auto;margin:0;width:320px;box-sizing:border-box;padding:18px;border:1px solid var(--dsw-alias-border-l2,#e1e3e8);border-radius:12px;background:var(--dsw-alias-bg-overlay,#fff);color:var(--dsw-alias-label-primary,#282c35);box-shadow:0 14px 44px #20273824,0 3px 10px #2027380a;overflow:auto;z-index:1000}.drawai-palette-panel::backdrop{background:transparent}.drawai-palette-hint{font-size:11px;opacity:.7;margin:6px 0}',
+  '.drawai-palette-grid{display:grid;grid-template-columns:repeat(9,minmax(0,1fr));gap:10px 7px}.drawai-palette-swatch{width:100%;aspect-ratio:1;min-height:20px;border:none;border-radius:50%;cursor:pointer;padding:0;box-shadow:inset 0 0 0 1px #80808014;transition:box-shadow .12s,transform .12s}.drawai-palette-swatch:hover{transform:scale(1.08)}.drawai-palette-swatch[aria-pressed=true]{outline:2px solid #386bff;outline-offset:3px}',
+  '.drawai-palette-swatch[title^="无颜色"],.drawai-color-preview.none{background:linear-gradient(135deg,transparent 47%,#c8cdd5 48%,#c8cdd5 52%,transparent 53%)!important;border:1px solid #c8cdd5}',
+  '.drawai-palette-custom{margin-top:12px}.drawai-palette-plus{width:100%;aspect-ratio:1;border:none;border-radius:50%;background:var(--dsw-alias-bg-layer-2,#edeef0);color:var(--dsw-alias-label-secondary,#707782);font-size:24px;line-height:1;cursor:pointer}.drawai-palette-plus:hover{background:#e1e7ff;color:#386bff}',
+  '.drawai-palette-add{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:12px;padding-top:12px;border-top:1px solid var(--dsw-alias-border-l2,#eee)}.drawai-palette-add input{box-sizing:border-box;height:30px;border:1px solid #d9dde3;border-radius:6px;background:var(--dsw-alias-bg-overlay,#fff);color:inherit}.drawai-palette-add input[type=color]{width:32px;padding:2px}.drawai-palette-add input[type=text]{width:90px;padding:4px;font:12px ui-monospace,monospace}.drawai-palette-add button{font-size:11px}',
+  '.drawai-palette-opacity{margin-top:24px}.drawai-palette-opacity-label{display:flex;justify-content:space-between;align-items:center;font-size:13px;margin-bottom:10px}.drawai-palette-opacity-label span{color:var(--dsw-alias-label-secondary,#767d89)}.drawai-palette-opacity input{display:block;width:100%;height:18px;margin:0;accent-color:#2355ed;cursor:pointer}',
+  '.drawai-tool-icon{position:relative;height:25px;min-width:28px;display:flex;align-items:center;justify-content:center;padding-right:7px}.drawai-tool-icon>svg{width:28px;height:25px}.drawai-color-label{font-size:10px;line-height:13px;white-space:nowrap;color:var(--dsw-alias-label-secondary,#737a86)}.drawai-tool-icon .drawai-color-caret{position:absolute;right:-2px;top:6px;font-size:10px}.drawai-color-preview.stroke{background:transparent;border-width:5px;box-sizing:border-box}.drawai-font-icon{font:24px/24px Georgia,serif;border-bottom:3px solid}.drawai-value-icon{font:18px/25px Arial,sans-serif}',
+  '.drawai-popover-title{font-size:13px;margin:0 0 12px}.drawai-shape-options{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:5px}.drawai-choice-options{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px}.drawai-choice-button{display:flex;align-items:center;justify-content:center;min-height:38px;padding:4px;border:0;border-radius:7px;background:transparent;color:inherit;cursor:pointer;font-size:16px}.drawai-choice-button:hover{background:var(--dsw-alias-bg-layer-2,#f1f3f6)}.drawai-choice-button.on{background:#e8efff;color:#386bff}.drawai-shape-options .drawai-choice-button{aspect-ratio:1}.drawai-shape-options svg{width:34px;height:28px}',
+  '.drawai-stroke-options{padding-bottom:14px;margin-bottom:16px;border-bottom:1px solid var(--dsw-alias-border-l2,#e1e3e8)}.drawai-option-strip{display:flex;gap:4px;border-radius:8px;background:var(--dsw-alias-bg-layer-2,#f4f5f7);padding:3px;margin:7px 0}.drawai-option-strip>.drawai-choice-button{flex:1}.drawai-width-dot{display:block;background:currentColor;border-radius:50%}.drawai-font-custom{display:flex;flex-direction:column;gap:6px;margin-top:12px;padding-top:12px;border-top:1px solid var(--dsw-alias-border-l2,#eee);font-size:11px}.drawai-font-custom input{box-sizing:border-box;width:100%;height:30px;padding:4px 6px;border:1px solid #d9dde3;border-radius:6px;background:transparent;color:inherit}',
+  // 右键菜单 / 元素库
+  '.drawai-menu{position:absolute;z-index:20;min-width:196px;padding:8px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2,#555);background:var(--dsw-alias-bg-overlay,#1e1e1e);box-shadow:0 10px 28px rgba(0,0,0,.4);color:var(--dsw-alias-label-primary,#e6e6e6)}',
+  '.drawai-menu-title{font-size:11px;color:var(--dsw-alias-label-secondary,#9aa0a6);margin:0 0 6px}',
+  '.drawai-menu-separator{height:1px;margin:6px 0;background:var(--dsw-alias-border-l2,#e1e3e8)}.drawai-menu-label{display:inline-block}.drawai-menu-shortcut{float:right;margin-left:16px;font-size:10px;opacity:.55}.drawai-page-picker{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;padding:8px 2px;border-top:1px solid var(--dsw-alias-border-l2,#e1e3e8)}.drawai-page-picker select{padding:4px;border:1px solid var(--dsw-alias-border-l2,#ddd);border-radius:5px;background:var(--dsw-alias-bg-overlay,#fff);color:inherit}',
+  '.drawai-special-panel{box-sizing:border-box;padding:0;min-width:0;overflow:hidden;border-radius:12px}.drawai-layers-panel{display:flex;flex-direction:column;max-height:inherit}.drawai-panel-heading{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;font-size:13px;font-weight:600;border-bottom:1px solid var(--dsw-alias-border-l2,#e1e3e8)}.drawai-panel-heading span{font-size:11px;font-weight:400;opacity:.65}',
+  '.drawai-layer-list{overflow:auto;min-height:0;max-height:340px;padding:6px}.drawai-layer-row{display:flex;align-items:center;gap:5px;padding:7px 5px;border-radius:8px;min-width:0}.drawai-layer-row.active{background:rgba(56,107,255,.12)}.drawai-layer-row.hidden .drawai-layer-namebox{opacity:.55}.drawai-layer-thumb{flex:0 0 52px;width:52px;height:38px;padding:2px;overflow:hidden;border:1px solid var(--dsw-alias-border-l2,#d9dde3);border-radius:5px;background:#fff;cursor:pointer}.drawai-layer-thumb svg{display:block;width:100%;height:100%;pointer-events:none}.drawai-layer-empty{font-size:9px;color:#999}',
+  '.drawai-layer-namebox{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px}.drawai-layer-name{display:block;max-width:100%;border:0;background:none;padding:0;text-align:left;font-size:12px;color:inherit;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.drawai-layer-meta{font-size:10px;opacity:.6}.drawai-layer-icon{display:flex;align-items:center;justify-content:center;flex:0 0 23px;width:23px;height:26px;border:0;border-radius:5px;background:none;color:inherit;cursor:pointer;padding:2px}.drawai-layer-icon:hover{background:rgba(128,128,128,.15)}',
+  '.drawai-layer-name-input,.drawai-panel-input{box-sizing:border-box;min-width:0;width:100%;border:1px solid #386bff;border-radius:5px;background:var(--dsw-alias-bg-overlay,#fff);color:inherit;padding:4px;font-size:12px}.drawai-panel-input{width:calc(100% - 24px);margin:8px 12px;border-color:var(--dsw-alias-border-l2,#d9dde3)}.drawai-layer-more{display:flex;flex-direction:column;gap:6px;padding:6px 10px 10px}.drawai-layer-more span{font-size:10px;opacity:.65}.drawai-layer-footer{flex:0 0 auto;display:flex;flex-direction:column;gap:8px;padding:10px 12px;border-top:1px solid var(--dsw-alias-border-l2,#e1e3e8)}.drawai-layer-move{display:flex;align-items:center;justify-content:space-between;gap:6px;font-size:11px}.drawai-layer-move select{min-width:0;max-width:55%;border:1px solid var(--dsw-alias-border-l2,#d9dde3);border-radius:5px;padding:4px;background:var(--dsw-alias-bg-overlay,#fff);color:inherit}',
+  '.drawai-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:4px}',
+  '.drawai-export-fields{display:flex;flex-direction:column;gap:12px;padding:14px}.drawai-export-field{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:12px}.drawai-export-field>span{flex:0 0 44px}.drawai-export-field select,.drawai-export-field input{box-sizing:border-box;min-width:0;width:100%;border:1px solid var(--dsw-alias-border-l2,#d9dde3);border-radius:6px;background:var(--dsw-alias-bg-overlay,#fff);color:inherit;padding:6px;font-size:12px}.drawai-export-filename{display:flex;align-items:center;gap:4px;min-width:0}.drawai-export-filename span{font-size:11px;opacity:.65}.drawai-export-info{font-size:11px;opacity:.65;line-height:1.6}.drawai-primary-btn{background:#386bff;color:white;border-color:#386bff;padding:7px 12px}.drawai-primary-btn:disabled{opacity:.5;cursor:default}',
+  '.drawai-export-advanced{border-top:1px solid var(--dsw-alias-border-l2,#e1e3e8);padding-top:10px}.drawai-export-advanced>summary{font-size:12px;cursor:pointer;margin-bottom:10px}.drawai-export-advanced>.drawai-export-field{margin:10px 0}.drawai-export-check{display:flex;align-items:center;gap:6px;font-size:11px;margin:8px 0}.drawai-export-dimensions{display:flex;flex-wrap:wrap;gap:8px}.drawai-export-dimension{display:flex;flex:1;min-width:75px;flex-direction:column;gap:5px;font-size:10px}.drawai-export-dimension input{box-sizing:border-box;width:100%;min-width:0;border:1px solid var(--dsw-alias-border-l2,#ddd);border-radius:5px;padding:6px;background:transparent;color:inherit}.drawai-export-dimensions>.drawai-export-check{flex-basis:100%}.drawai-export-layer-options{display:flex;flex-direction:column;gap:6px;max-height:140px;overflow:auto;padding:8px;border:1px solid var(--dsw-alias-border-l2,#ddd);border-radius:6px}.drawai-export-layer-options label{display:flex;align-items:center;gap:5px;font-size:11px}',
+  '.drawai-chip{display:flex;align-items:center;justify-content:center;border:1px solid transparent;border-radius:6px;background:transparent;padding:1px;cursor:pointer}',
+  '.drawai-chip:hover{border-color:var(--dsw-alias-brand-primary,#4c8dff);background:rgba(76,141,255,.14)}',
+  '.drawai-swatches{display:flex;gap:6px;margin-top:8px}',
+  // 形状**平铺**那一块：与下面那些「类：当前值」的行用同一条分隔线，
+  // 但里面的缩略图按原尺寸自动填充（5 列 1fr 会把 44px 的缩略图挤扁）。
+  '.drawai-pick{margin-top:8px;padding-top:8px;border-top:1px solid var(--dsw-alias-border-l1,#3a3a3a)}',
+  '.drawai-pick>.drawai-grid{grid-template-columns:repeat(auto-fill,minmax(42px,1fr))}',
+  '.drawai-swatch{width:18px;height:18px;border-radius:4px;border:1px solid rgba(0,0,0,.3);cursor:pointer;padding:0}',
+  '.drawai-swatch.on{outline:2px solid var(--dsw-alias-brand-primary,#4c8dff);outline-offset:1px}',
+  // 当前生效的选项（线型/箭头方向）—— 和色板用同一套"被选中"语言。
+  '.drawai-btn.on{outline:2px solid var(--dsw-alias-brand-primary,#4c8dff);outline-offset:1px}',
+  '.drawai-menu-row{display:flex;gap:6px;margin-top:8px;padding-top:8px;border-top:1px solid var(--dsw-alias-border-l1,#3a3a3a)}',
+  // 「一类一个下拉」：几类**并排成一行**，每个只显示当前值（形状：矩形 ▾ / 配色：蓝 ▾ …），
+  // 点开的那一类把选项铺在下面整行里。菜单因此更矮，一眼能看全每一类的当前值。
+  '.drawai-select-chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}',
+  '.drawai-select-chip{display:inline-flex;align-items:center;gap:2px;white-space:nowrap}',
+  '.drawai-menu-caret{opacity:.7;margin-left:2px}',
+  // 展开体：整行宽、缩进一格，看起来是那一排 chips 的下拉面板。
+  '.drawai-menu-select-body{margin:4px 0 0 0;padding-left:8px;border-left:2px solid var(--dsw-alias-border-l1,#3a3a3a)}',
+  // 下拉里的选项一律**横着排**（一行放不下才换行 / 横向滚动），形状缩略图保持原尺寸不被挤扁。
+  '.drawai-menu-select-body>.drawai-menu-row,.drawai-menu-select-body>.drawai-fontrow{margin:0;padding:0;border-top:none;display:flex;flex-wrap:wrap;gap:6px;align-items:center}',
+  '.drawai-menu-select-body>.drawai-grid{grid-template-columns:repeat(auto-fill,minmax(42px,1fr))}',
+  '.drawai-menu-select-body>.drawai-swatches{margin-top:0;flex-wrap:wrap}',
+  // 字号那一行的"手动调节"：− [输入] ＋
+  '.drawai-fontrow{display:flex;flex-wrap:wrap;gap:6px;align-items:center}',
+  '.drawai-fontsize{width:56px;padding:2px 4px;border-radius:4px;border:1px solid var(--dsw-alias-border-l2,#555);background:transparent;color:inherit;font-size:12px;text-align:center}',
+  // 新建/打开面板：固定在工具条下方左侧，盖在画布上（和右键菜单同一层）。
+  // 下拉面板：left/top 由**触发它的按钮**算出来（inline style），这里只给宽度与兜底位置。
+  // 兜底 left:8px;top:38px 用于"量不到按钮位置"的情形（首帧 ref 还没挂）。
+  '.drawai-docmenu{left:8px;top:38px;min-width:220px;max-width:min(320px,90%)}',
+  '.drawai-docmenu.drawai-special-panel{min-width:0;max-width:calc(100% - 8px)}',
+  // 下拉菜单项：整行可点，右侧/下方带一句说明。按钮默认是 inline 且 nowrap，
+  // 这里要改成块级 + 允许换行，否则说明文字会把面板撑爆。
+  '.drawai-menu-item{display:block;width:100%;text-align:left;margin-bottom:3px;white-space:normal}',
+  '.drawai-menu-hint{display:block;font-size:11px;opacity:.65;margin-top:1px}',
+  // 这一格复用 .drawai-edit 的输入框外观，但它是**静态**的（不盖在节点上），
+  // 所以要清掉绝对定位与居中，改成整行宽。
+  '.drawai-docmenu .doc-menu-input{position:static;width:100%;box-sizing:border-box;text-align:left;margin-bottom:2px}',
+].join('\n')
+
+function numberOr(value, fallback) {
+  // null / undefined / 空串一律回落 **不能靠 Number() 判断**：`Number(null) === 0` 而 0 是有限数，
+  // 于是"没给值就用缺省"会静默变成 0。实测过：节点的 fontSize / strokeWidth 变成 0，
+  // 表现是"节点没有文字、连线完全看不见"，而且不报错。
+  if (value === null || value === undefined || value === '') return fallback
+  const n = Number(value)
+  return Number.isFinite(n) ? n : fallback
+}
+
+function has(value, key) {
+  return Object.prototype.hasOwnProperty.call(value, key)
+}
+
+function fmt(n) {
+  return Math.round(n * 100) / 100
+}
+
+function charWidth(ch, size) {
+  const code = ch.codePointAt(0)
+  const wide =
+    (code >= 0x1100 && code <= 0x115f) ||
+    (code >= 0x2e80 && code <= 0xa4cf) ||
+    (code >= 0xac00 && code <= 0xd7a3) ||
+    (code >= 0xf900 && code <= 0xfaff) ||
+    (code >= 0xfe30 && code <= 0xfe6f) ||
+    (code >= 0xff00 && code <= 0xff60) ||
+    (code >= 0xffe0 && code <= 0xffe6)
+  return wide ? size : size * 0.55
+}
+
+let labelMeasureContext = null
+function textWidth(text, size) {
+  // 浏览器按实际字体量宽；无 DOM 的自测环境保留确定性的估算回退。
+  if (labelMeasureContext === null && typeof document !== 'undefined' && typeof document.createElement === 'function') {
+    try { labelMeasureContext = document.createElement('canvas').getContext('2d') } catch (error) { /* 无 canvas 的环境 */ }
+  }
+  if (labelMeasureContext !== null && typeof labelMeasureContext.measureText === 'function') {
+    labelMeasureContext.font = numberOr(size, FSIZE) + 'px ' + FONT
+    return labelMeasureContext.measureText(String(text)).width
+  }
+  const chars = Array.from(String(text))
+  let total = 0
+  for (let i = 0; i < chars.length; i += 1) total += charWidth(chars[i], size)
+  return total
+}
+
+/**
+ * 按宽度把标签切成若干行。
+ *
+ * `size` 是**标签真实的字号**（节点 style 里的 fontSize，缺省 FSIZE）——
+ * 不传的话大字号标签会按 12px 量宽度，断行位置跟着画出来的东西对不上
+ * （"输入时和输完后不一样"的一类来源）。
+ */
+function wrapLabel(label, maxWidth, size) {
+  const fs = numberOr(size, FSIZE)
+  const lines = []
+  const paras = String(label).split('\n')
+  for (let p = 0; p < paras.length; p += 1) {
+    const chars = Array.from(paras[p])
+    let current = ''
+    for (let i = 0; i < chars.length; i += 1) {
+      const nextWidth = textWidth(current + chars[i], fs)
+      if (nextWidth > maxWidth && current.length > 0) {
+        lines.push(current)
+        current = ''
+      }
+      current += chars[i]
+    }
+    lines.push(current)
+  }
+  return lines.length > 0 ? lines : ['']
+}
+
+/**
+ * 文档没给**字色**时，这个节点里的字该是什么色 —— 由**它自己的填充**算出来，不跟主题走。
+ *
+ * 为什么不能跟主题：填充常常是文档里写死的浅色（drawio 调色板 `#ffe6cc` / `#dae8fc`…），
+ * 主题不改它；而缺省字色原来取 `skin.text`（暗色 = `#e8e8e8`）—— 于是**切到暗色外观，
+ * 浅底节点上的字一起变浅，直接看不见**。现在的规矩：浅底黑字、深底浅字，只看填充。
+ * 于是"换主题"不再改动节点里的字色（与上面那条"颜色是文档的一部分"同一个立场）。
+ */
+const ON_DARK_FONT = '#e8e8e8'
+function defaultFontOnFill(fill) {
+  const hex = typeof fill === 'string' ? fill.trim() : ''
+  const m = /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.exec(hex)
+  // 认不出的填充（名字色、透明、渐变…）保守给黑字：drawio 的缺省也是黑字。
+  if (m === null) return DEFAULT_FONT
+  const body = m[1].length === 3 ? m[1][0] + m[1][0] + m[1][1] + m[1][1] + m[1][2] + m[1][2] : m[1]
+  const r = parseInt(body.slice(0, 2), 16)
+  const g = parseInt(body.slice(2, 4), 16)
+  const b = parseInt(body.slice(4, 6), 16)
+  // 相对亮度的常用近似（0.299R + 0.587G + 0.114B）。0.55 让调色板里的颜色都算浅底，
+  // 而主题给无填充节点的 #2a2a2a、以及用户自己写的深色都算深底。
+  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255
+  return luminance > 0.55 ? DEFAULT_FONT : ON_DARK_FONT
+}
+
+/**
+ * 节点的配色：**文档的 style 键说了算**，主题只在"没写"时补缺省。
+ *
+ * 这与 v1 相反 —— v1 把 node.style 当颜色名去查主题表，于是暗色主题会改写文档颜色，
+ * 而颜色名之外的值（真十六进制）根本没法表达。drawio 的语义是：颜色本来就存在文档里。
+ */
+function colorOf(node, mode) {
+  const skin = mode === 'dark' ? DARK : LIGHT
+  const style = typeof node.style === 'string' ? node.style : ''
+  const fill = styleGet(style, 'fillColor', null)
+  const stroke = styleGet(style, 'strokeColor', null)
+  const font = styleGet(style, 'fontColor', null)
+  const resolvedFill = fill !== null ? fill : skin.default.fill
+  return {
+    fill: resolvedFill,
+    stroke: stroke !== null ? stroke : skin.default.stroke,
+    // 字色：文档写了就用文档的；没写就**按这块填充**算（浅底黑字/深底浅字），不跟主题走 ——
+    // 否则暗色外观会把浅色节点上的字一起翻成浅色，看不见（见 defaultFontOnFill）。
+    font: font !== null ? font : defaultFontOnFill(resolvedFill),
+  }
+}
+
+/** 形状：从 style 键推导 —— drawio 里没有 shape 字段，普通矩形就是"没有形状键"。 */
+function shapeOf(node) {
+  return nodeShapeFromStyle(typeof node.style === 'string' ? node.style : '')
+}
+
+/** 图片和视频节点不画标签、也不能就地改字。文件里的 value 仍原样保留。 */
+function nodeShowsLabel(node) {
+  if (node === null || node === undefined) return false
+  if (isVideoNodeData(node.data)) return false
+  const shape = shapeOf(node)
+  return shape !== 'image' && shape !== 'video'
+}
+
+/**
+ * 一个节点里，标签**能不能按宽度换行**。与渲染那一处读的是同一个键
+ * （drawio 的语义：`whiteSpace=nowrap` 不换行，其余含缺省都换行）。
+ */
+function labelWraps(node) {
+  const style = typeof node.style === 'string' ? node.style : ''
+  return styleGet(style, 'whiteSpace', 'wrap') !== 'nowrap'
+}
+
+/**
+ * 标签内边距与对齐（drawio 的 spacing* / align / verticalAlign）。
+ * 左右缺省 6px（对齐旧的 `w-12` 观感）；上下缺省 0（竖直靠 verticalAlign 居中）。
+ * 若写了 `spacing=`，四边都回落它。
+ */
+function labelInsetsOf(node) {
+  const style = typeof node.style === 'string' ? node.style : ''
+  const shape = shapeOf(node)
+  const section = shape === 'section'
+  const base = styleNumber(style, 'spacing', null)
+  const lr = base !== null ? base : 6
+  const tb = base !== null ? base : 0
+  // 分区标题缺省贴左上（与分区预设 spacingLeft=10 / spacingTop=6 一致），即使文件没写这些键。
+  return {
+    left: styleNumber(style, 'spacingLeft', section ? 10 : lr),
+    right: styleNumber(style, 'spacingRight', lr),
+    top: styleNumber(style, 'spacingTop', section ? 6 : tb),
+    bottom: styleNumber(style, 'spacingBottom', tb),
+    align: styleGet(style, 'align', section || shape === 'swimlane' ? 'left' : 'center'),
+    verticalAlign: styleGet(style, 'verticalAlign', section ? 'top' : 'middle'),
+    labelPosition: styleGet(style, 'labelPosition', 'center'),
+    verticalLabelPosition: styleGet(style, 'verticalLabelPosition', 'middle'),
+  }
+}
+
+/**
+ * swimlane 标题带高度（drawio `startSize`，缺省 23）。
+ */
+function swimlaneStartSize(node) {
+  const style = typeof node.style === 'string' ? node.style : ''
+  const n = styleNumber(style, 'startSize', 23)
+  return n > 0 ? n : 23
+}
+
+/**
+ * 图片+标签同框时，图在框内占哪一块（labelPosition 决定标签侧，图在对侧）。
+ * 无非中心 labelPosition / 无标签 → 整框。
+ */
+function imageContentRect(node, geo) {
+  const label = nodeShowsLabel(node) && typeof node.label === 'string' ? node.label : ''
+  const insets = labelInsetsOf(node)
+  const pos = insets.labelPosition
+  const vpos = insets.verticalLabelPosition
+  if (label.length === 0 || (pos === 'center' && vpos === 'middle')) {
+    return { x: geo.x, y: geo.y, w: geo.w, h: geo.h }
+  }
+  // 标签侧大约一半；图至少留出正方形边（小图标行常见）。
+  if (pos === 'right' || pos === 'left') {
+    const split = Math.max(Math.min(geo.h, geo.w * 0.45), Math.min(geo.w * 0.5, 28))
+    if (pos === 'right') return { x: geo.x, y: geo.y, w: split, h: geo.h }
+    return { x: geo.x + geo.w - split, y: geo.y, w: split, h: geo.h }
+  }
+  if (pos === 'bottom' || pos === 'top') {
+    const split = Math.max(Math.min(geo.w, geo.h * 0.45), Math.min(geo.h * 0.5, 28))
+    if (pos === 'bottom') return { x: geo.x, y: geo.y, w: geo.w, h: split }
+    return { x: geo.x, y: geo.y + geo.h - split, w: geo.w, h: split }
+  }
+  return { x: geo.x, y: geo.y, w: geo.w, h: geo.h }
+}
+
+/**
+ * 标签能用的横向宽度 —— 就是渲染时传给 `wrapLabel` 的那个 maxWidth。
+ *
+ * 菱形/椭圆里的字要缩进来才不压到斜边，所以可用宽度比内容区窄。
+ * **只有这一处**：换行位置、自适应高度、就地编辑框的内边距全都读它，
+ * 三处各写一份迟早会漂移（"输入时和输完后不一样"最常见的原因）。
+ */
+function labelTextWidth(node, w) {
+  const insets = labelInsetsOf(node)
+  const shape = shapeOf(node)
+  // `w` 已是标签可用外宽（image+label / swimlane 时由 labelTextBox 先裁过）。
+  const inner = Math.max(12, w - insets.left - insets.right)
+  if (shape === 'diamond') return Math.max(12, inner * 0.6)
+  if (shape === 'ellipse') return Math.max(12, inner * 0.72)
+  return inner
+}
+
+/** 字号 → 行高。渲染与就地编辑框共用，否则编辑时会与最终效果差几像素。 */
+function labelLineHeight(fontSize) {
+  return LHEIGHT * (numberOr(fontSize, FSIZE) / FSIZE)
+}
+
+/**
+ * 就地编辑框该摆在哪儿、多大 —— **文字区盒子 × 缩放 + 画布偏移**，纯函数。
+ *
+ * 为什么不按整个节点框铺：编辑框必须与最终文字**同一个宽度**，否则断行位置都不一样
+ * （需求"输入时的效果与输入完成后一致"）。菱形/椭圆的文字区比节点窄，这一条尤其明显。
+ * 所以位置与尺寸都取 `labelTextBox`，并用草稿计算节点撑高后的几何。
+ *
+ * `ctm` 是 SVG 的屏幕变换（只有缩放与平移，没有旋转），`origin` 是画布容器左上角的屏幕坐标。
+ */
+function nodeEditorBox(node, text, ctm, origin, mode) {
+  const scale = numberOr(ctm.a, 1)
+  const label = typeof text === 'string' ? text : ''
+  const geo = nodeBoxOf(Object.assign({}, node, { label }))
+  const textBox = labelTextBox({ node: node, geo: geo, text: label })
+  const size = nodeEditorTextSize(node, label)
+  // textarea 的首行在自身顶部，必须贴文字行盒，不能从整个节点顶部开始排字。
+  const boxH = textBox.h
+  return {
+    left: textBox.x * scale + numberOr(ctm.e, 0) - origin.left,
+    top: textBox.y * scale + numberOr(ctm.f, 0) - origin.top,
+    width: textBox.w * scale,
+    height: boxH * scale,
+    fontSize: size.fontSize * scale,
+    lineHeight: size.lineHeight * scale,
+    color: colorOf(node, mode).font,
+    opacity: clampNumber(styleNumber(node.style || '', 'textOpacity', 100), 0, 100) / 100,
+    scale: scale,
+    textAlign: textBox.align === 'left' || textBox.align === 'right' ? textBox.align : 'center',
+    // 编辑框里的换行方式与画布上的标签一致：nowrap 的标签在编辑时也不换行。
+    wraps: size.wraps,
+  }
+}
+
+/**
+ * 标签的**文字区**（不是节点框）：按 align / verticalAlign / spacing* 摆，也在这里换行。
+ *
+ * @param {{ node: object, geo: object, fontSize?: number, text?: string }} args
+ * @returns {{ x: number, y: number, w: number, h: number, fontSize: number, lineHeight: number, align: string, verticalAlign: string }}
+ *
+ * 就地编辑框（`openNodeEditor` 的 textarea）就按这个盒子摆 —— 同一宽度 → 同一断行位置，
+ * 同一字色字号行高 → 同一观感。需求里"输入时的效果与输入完成后不一致"根子就在
+ * 编辑框原来是个**单行 input**（不换行、字号写死 12px、颜色写死白色）。
+ * 不过不把字体样式返回出去：那是 CSS 的事，见 `.drawai-edit`。
+ */
+function labelTextBox(box) {
+  const geo = box.geo
+  const node = box.node
+  const style = typeof node.style === 'string' ? node.style : ''
+  const insets = labelInsetsOf(node)
+  const fontSize = numberOr(box.fontSize, styleNumber(style, 'fontSize', FSIZE))
+  const lineHeight = labelLineHeight(fontSize)
+  const text = typeof box.text === 'string' ? box.text : typeof node.label === 'string' ? node.label : ''
+  const shape = shapeOf(node)
+
+  // 标签可用的外框：swimlane 只占标题带；image+label 占 labelPosition 一侧。
+  let areaX = geo.x
+  let areaY = geo.y
+  let areaW = geo.w
+  let areaH = geo.h
+  if (shape === 'swimlane') {
+    areaH = Math.min(geo.h, swimlaneStartSize(node))
+  } else if ((shape === 'image' || shape === 'svg') && text.length > 0) {
+    const pos = insets.labelPosition
+    const vpos = insets.verticalLabelPosition
+    if (pos === 'right' || pos === 'left') {
+      const img = imageContentRect(node, geo)
+      if (pos === 'right') {
+        areaX = img.x + img.w
+        areaW = Math.max(12, geo.w - img.w)
+      } else {
+        areaW = Math.max(12, geo.w - img.w)
+      }
+    } else if (pos === 'bottom' || pos === 'top') {
+      const img = imageContentRect(node, geo)
+      if (pos === 'bottom') {
+        areaY = img.y + img.h
+        areaH = Math.max(lineHeight, geo.h - img.h)
+      } else {
+        areaH = Math.max(lineHeight, geo.h - img.h)
+      }
+    } else if (vpos === 'top' || vpos === 'bottom') {
+      // 水平居中但垂直贴外：给图留中间，字贴顶/底条。
+      const band = Math.max(lineHeight + insets.top + insets.bottom, Math.min(geo.h * 0.35, 28))
+      if (vpos === 'top') areaH = band
+      else {
+        areaY = geo.y + geo.h - band
+        areaH = band
+      }
+    }
+  }
+
+  const w = Math.max(12, labelTextWidth(Object.assign({}, node, { w: areaW, h: areaH }), areaW))
+  const cols = labelWraps(node) ? wrapLabel(text, w, fontSize).length : String(text).split('\n').length
+  const h = Math.max(lineHeight * cols, lineHeight)
+
+  const innerX = areaX + insets.left
+  const innerRight = areaX + areaW - insets.right
+  const innerY = areaY + insets.top
+  const innerBottom = areaY + areaH - insets.bottom
+  let x
+  if (insets.align === 'left') x = innerX
+  else if (insets.align === 'right') x = innerRight - w
+  else x = (innerX + innerRight - w) / 2
+  let y
+  if (insets.verticalAlign === 'top') y = innerY
+  else if (insets.verticalAlign === 'bottom') y = innerBottom - h
+  else y = (innerY + innerBottom - h) / 2
+
+  return {
+    x: x,
+    y: y,
+    w: w,
+    h: h,
+    fontSize: fontSize,
+    lineHeight: lineHeight,
+    align: insets.align,
+    verticalAlign: insets.verticalAlign,
+  }
+}
+
+/** 标签的字号与行高（就地编辑框要按它画字，否则输入时和输完后大小不一样）。 */
+function nodeEditorTextSize(node, text) {
+  const fontSize = styleNumber(typeof node.style === 'string' ? node.style : '', 'fontSize', FSIZE)
+  const lineHeight = labelLineHeight(fontSize)
+  // 不换行的标签（whiteSpace=nowrap）在编辑框里也不该换行 —— 否则一打字就换行、
+  // 一提交又缩回一行，正是"输入时/输完后不一致"。
+  const wraps = labelWraps(node)
+  const cols = wraps ? wrapLabel(typeof text === 'string' ? text : '', Math.max(12, labelTextWidth(node, numberOr(node.w, FALLBACK_NODE_W))), fontSize).length : String(text || '').split('\n').length
+  return { fontSize: fontSize, lineHeight: lineHeight, lines: cols, wraps: wraps }
+}
+
+/**
+ * 这个节点"装得下自己的文字"需要多高（含上下各半行留白）。
+ *
+ * 需求："节点内文字过多时，节点要纵向自动拉伸，避免文字溢出或被截断"。
+ * 这是**纯函数**：渲染（`buildGeometry` 用它算有效高度）、就地编辑框的尺寸、
+ * 以及落盘那一次自适应写回，三处都调它 —— 于是"看到的高度"和"盘上的高度"必然一致。
+ *
+ * 不适用/不打算拉伸的情形一律返回 0（= 不用长）：
+ *   · 不换行的标签（nowrap）—— 它本来就横向溢出，纵向拉伸解决不了；
+ *   · 独立文字（drawio 的 `text` 形状）—— 没有边框底色，拉高只是把透明命中框撑大。
+ */
+function nodeTextFitHeight(node) {
+  if (node === null || node === undefined || typeof node !== 'object') return 0
+  if (!labelWraps(node)) return 0
+  const shape = shapeOf(node)
+  if (shape === 'text' || shape === 'section' || shape === 'swimlane' || shape === 'image' || shape === 'svg' || shape === 'video') return 0
+  const w = numberOr(node.w, FALLBACK_NODE_W)
+  const label = typeof node.label === 'string' ? node.label : ''
+  if (label.length === 0) return 0
+  const fontSize = styleNumber(typeof node.style === 'string' ? node.style : '', 'fontSize', FSIZE)
+  const lines = wrapLabel(label, labelTextWidth(node, w), fontSize).length
+  if (lines <= 1) return 0
+  return (lines + 1) * labelLineHeight(fontSize)
+}
+
+/**
+ * 节点几何：文档里的高度，与"装得下文字所需的高度"取大者，再吸到整格。
+ *
+ * 取大不取小：用户把节点拉大了就保持大（拉伸只解决溢出，不做"自动缩回去"——
+ * 那会把用户特意留出的空白吃掉）。`h > stored` 就是"这一帧被文字撑高了"，
+ * 盘上的高度由 autoHeightPass 写回（见那里的说明）。
+ */
+function nodeBoxOf(node) {
+  const w = numberOr(node.w, FALLBACK_NODE_W)
+  const stored = numberOr(node.h, FALLBACK_NODE_H)
+  const x = numberOr(node.x, 0)
+  const y = numberOr(node.y, 0)
+  const need = nodeTextFitHeight(node)
+  if (need > stored) return { x: x, y: y, w: w, h: snapTo(need, GRID), stored: stored }
+  return { x: x, y: y, w: w, h: stored, stored: stored }
+}
+
+// ---- 正交折线路由：6 个候选 + 包围盒避让 ----
+//
+// 单位规则：**路由器自己选出来的坐标一律吸附到半格（EDGE_GRID = 5px）**，而贴着节点边框的
+// 那一轴保持精确（不能为了对齐把线从边框上挪开）。于是每条线段所在的线都落在整格或半格上，
+// 而不是"某个节点的中心"（56 高的节点中心在 y+28 —— 那正是自动路由线段不在格线上的来源）。
+// 用户手摆的折点不碰：那是用户数据，改它就等于擅自重排别人的图。
+
+/** 半格吸附（路由专用别名，读起来更清楚）。 */
+function snapFree(value) {
+  return snapTo(value, EDGE_GRID)
+}
+
+function orthoH(from, to) {
+  const fcy = snapFree(from.y + from.h / 2)
+  const tcy = snapFree(to.y + to.h / 2)
+  const east = to.x + to.w / 2 >= from.x + from.w / 2
+  const sx = east ? from.x + from.w : from.x
+  const ex = east ? to.x : to.x + to.w
+  const midX = snapFree((sx + ex) / 2)
+  return [{ x: sx, y: fcy }, { x: midX, y: fcy }, { x: midX, y: tcy }, { x: ex, y: tcy }]
+}
+
+function orthoV(from, to) {
+  const fcx = snapFree(from.x + from.w / 2)
+  const tcx = snapFree(to.x + to.w / 2)
+  const south = to.y + to.h / 2 >= from.y + from.h / 2
+  const sy = south ? from.y + from.h : from.y
+  const ey = south ? to.y : to.y + to.h
+  const midY = snapFree((sy + ey) / 2)
+  return [{ x: fcx, y: sy }, { x: fcx, y: midY }, { x: tcx, y: midY }, { x: tcx, y: ey }]
+}
+
+function viaY(from, to, yc) {
+  const fcx = snapFree(from.x + from.w / 2)
+  const tcx = snapFree(to.x + to.w / 2)
+  const sy = yc < from.y + from.h / 2 ? from.y : from.y + from.h
+  const ty = yc < to.y + to.h / 2 ? to.y : to.y + to.h
+  return [{ x: fcx, y: sy }, { x: fcx, y: yc }, { x: tcx, y: yc }, { x: tcx, y: ty }]
+}
+
+function viaX(from, to, xc) {
+  const fcy = snapFree(from.y + from.h / 2)
+  const tcy = snapFree(to.y + to.h / 2)
+  const sx = xc < from.x + from.w / 2 ? from.x : from.x + from.w
+  const tx = xc < to.x + to.w / 2 ? to.x : to.x + to.w
+  return [{ x: sx, y: fcy }, { x: xc, y: fcy }, { x: xc, y: tcy }, { x: tx, y: tcy }]
+}
+
+function segmentHitsBox(a, b, box, margin) {
+  const x1 = Math.min(a.x, b.x)
+  const x2 = Math.max(a.x, b.x)
+  const y1 = Math.min(a.y, b.y)
+  const y2 = Math.max(a.y, b.y)
+  return x1 < box.x + box.w + margin && x2 > box.x - margin && y1 < box.y + box.h + margin && y2 > box.y - margin
+}
+
+/**
+ * 一条候选路径的代价：先比穿模数，再比拐弯数，最后比长度。
+ *
+ * 加入拐弯数是有原因的：只比长度的话，一条"短但扭三下"的路径会赢过
+ * "略长但干净"的路径。draw.io 的观感来自**少拐弯**，不是最短。
+ */
+function pathCost(points, boxes, skip) {
+  let hits = 0
+  for (let i = 0; i < points.length - 1; i += 1) {
+    for (let k = 0; k < boxes.length; k += 1) {
+      const box = boxes[k]
+      if (skip[box.id] === true) continue
+      if (segmentHitsBox(points[i], points[i + 1], box.geo, 8)) {
+        hits += 1
+        break
+      }
+    }
+  }
+  let length = 0
+  let bends = 0
+  for (let i = 0; i < points.length - 1; i += 1) {
+    length += Math.abs(points[i + 1].x - points[i].x) + Math.abs(points[i + 1].y - points[i].y)
+    if (i > 0) {
+      const prevHorizontal = Math.abs(points[i].x - points[i - 1].x) > 0.5
+      const curHorizontal = Math.abs(points[i + 1].x - points[i].x) > 0.5
+      if (prevHorizontal !== curHorizontal) bends += 1
+    }
+  }
+  return { hits: hits, bends: bends, length: length }
+}
+
+function pathCostBetter(cost, best) {
+  if (cost.hits !== best.hits) return cost.hits < best.hits
+  if (cost.bends !== best.bends) return cost.bends < best.bends
+  return cost.length < best.length
+}
+
+/**
+ * 近似平手时允许的长度差（用户单位）。
+ *
+ * 为什么需要它：代价是 `{hits, bends, length}` 的字典序，而"走上面"和"走下面"两条绕行
+ * 候选常常 **hits 与 bends 完全相同、长度只差几像素**。拖动节点时这两条长度每挪一步就
+ * 互相反超一次 —— 于是端点每帧都在 n↔s 之间跳（实测：斜向拖 120 步，端点切换 49 次，
+ * 用户看到的就是"连线自己在换端点"）。
+ *
+ * 有了这个容差，落在这个范围内的候选一律按**固定优先级**取（正交 → 上 → 下 → 左 → 右），
+ * 于是近似平手的结果是稳定的；只有另一条**明显**更优时才会换。
+ */
+const ROUTE_LENGTH_SLACK = 24
+
+/** 这条候选是否"不比最优差多少"（同一档 hits / bends，长度差在容差内）。 */
+function withinSlack(cost, bestCost) {
+  if (cost.hits > bestCost.hits) return false
+  if (cost.bends > bestCost.bends) return false
+  return cost.length <= bestCost.length + ROUTE_LENGTH_SLACK
+}
+
+/**
+ * 去掉连续重复点。
+ *
+ * 刻意**不做共线点消除** —— 折点必须原样留在路径顶点上。
+ * 之前的实现会把共线折点吃掉，于是 points[] 和路径顶点对不上，
+ * "在第几段插入"只能靠弧长投影去猜，整套折点逻辑就是从这里开始乱的。
+ */
+function dedupePoints(points) {
+  const out = []
+  for (let i = 0; i < points.length; i += 1) {
+    const p = points[i]
+    if (p === null || p === undefined || !Number.isFinite(p.x) || !Number.isFinite(p.y)) continue
+    const last = out[out.length - 1]
+    if (last !== undefined && Math.abs(last.x - p.x) < 0.5 && Math.abs(last.y - p.y) < 0.5) continue
+    out.push({ x: p.x, y: p.y })
+  }
+  return out
+}
+
+/**
+ * 两个中心差多少以内就视为"其实对齐"。
+ *
+ * 取 4（不到半个网格）：节点宽 130~300px，没有人会把两个节点"故意"对齐到 4px 精度的错位上；
+ * 反过来，差 1~3px 在前端就是**看得见的斜台阶**。实测 demo 里 doc/fs 差 1.5、fs/check 差 3.5，
+ * 都是自动布局取整留下的零头，两种都得并掉。
+ */
+const AXIS_EPS = 4
+
+/**
+ * 把两个盒子的**中心**对齐：当它们差得极小时视为同一个值。
+ *
+ * 为什么必须在**路由之前**做，而不是事后清理折线：
+ * 竖直连接（orthoV）在"起点中心 x"和"终点中心 x"之间会**主动**走一步台阶 ——
+ * doc 中心 153、fs 中心 151.5 时它生成
+ * `(153,476) (153,528) (151.5,528) (151.5,580)`：视觉上是一条竖线，实际是两条错开 1.5px 的线段，
+ * 于是各自长出一个段把手，叠起来看就是「一条线段上有两个点」。
+ *
+ * 事后清理是错的方向：把 (151.5,528) 并到 (153,528) 会凭空造出一条"水平线"，
+ * 再被共线消除吃掉，路径就断成半截（试过，e5 会退化成从 y=528 起的 2 点线）。
+ * 在**输入端**统一中心值，台阶根本不会产生，后续所有几何推理都还按原来的精确比较走。
+ *
+ * 容差取 2px：比它大就是有意为之的错位，不该吞掉。
+ */
+function snapNearAxis(fromGeo, toGeo) {
+  const dx = Math.abs(fromGeo.x + fromGeo.w / 2 - (toGeo.x + toGeo.w / 2))
+  const dy = Math.abs(fromGeo.y + fromGeo.h / 2 - (toGeo.y + toGeo.h / 2))
+  if (dx >= AXIS_EPS || dx === 0) return { from: fromGeo, to: toGeo }
+  // 用较长那个节点的中心当基准：它更可能是"作者本意"的位置，短的那个挪过去不容易看出来。
+  const anchor = fromGeo.w >= toGeo.w ? fromGeo.x + fromGeo.w / 2 : toGeo.x + toGeo.w / 2
+  return {
+    from: { x: anchor - fromGeo.w / 2, y: fromGeo.y, w: fromGeo.w, h: fromGeo.h },
+    to: { x: anchor - toGeo.w / 2, y: toGeo.y, w: toGeo.w, h: toGeo.h },
+  }
+}
+
+/**
+ * 消除折线里"一两像素的台阶"。
+ *
+ * 判据：相邻两点**严格**垂直（x 相等）却又有 <2px 的 y 差（或反之）——
+ * 那种 ±90° 折返不可能是人有意的弯，只可能是两个节点中心差了 1.5px 带出来的。
+ *
+ * `preserve` 里的点一律不动：端点和用户折点是**人的意图**，宁可留一点错位也不能改。
+ * 只收拾夹在它们中间的那些中间顶点。参考点用"上一次输出的点 + 两个位置之后的点"，
+ * 因为被跳过的点可能还会被后面的判断修剪（simplifyCollinear 会再收一次）。
+ */
+/**
+ * 这个点是不是"人的意图"（首尾端点或用户折点），收尾时一律不许动/不许消。
+ *
+ * 按**坐标**比而不是按对象身份：路由过程中会给折点生成新的点对象
+ * （connectOrtho 推的是 `{x: b.x, y: b.y}`），身份比较会全部落空。
+ */
+function isPreservedPoint(point, preserve) {
+  if (preserve === undefined || preserve === null || point === undefined || point === null) return false
+  const list = preserve instanceof Set ? [...preserve] : preserve
+  for (let i = 0; i < list.length; i += 1) {
+    const p = list[i]
+    if (p !== null && p !== undefined && Math.abs(p.x - point.x) < 0.5 && Math.abs(p.y - point.y) < 0.5) return true
+  }
+  return false
+}
+
+function snapNearAxisInPath(points, preserve) {
+  const out = []
+  for (let i = 0; i < points.length; i += 1) {
+    const p = { x: points[i].x, y: points[i].y }
+    const locked = i === 0 || i === points.length - 1 || isPreservedPoint(points[i], preserve)
+    if (!locked && i >= 1) {
+      const prev = out[out.length - 1]
+      const next = points[i + 1]
+      if (prev !== undefined && next !== undefined) {
+        const toPrevX = Math.abs(prev.x - p.x)
+        const toPrevY = Math.abs(prev.y - p.y)
+        const toNextX = Math.abs(next.x - points[i].x)
+        const toNextY = Math.abs(next.y - points[i].y)
+        // 出入这点的两段几乎同向，且这一小段几乎是纯垂直/纯水平 → 把横/纵坐标对齐过去。
+        if (toNextY < 0.5 && toPrevX < AXIS_EPS && toPrevY > 0.5) p.x = prev.x
+        else if (toNextX < 0.5 && toPrevY < AXIS_EPS && toPrevX > 0.5) p.y = prev.y
+      }
+    }
+    out.push(p)
+  }
+  return out
+}
+
+/**
+ * 去掉共线冗余顶点（**保首尾**）。
+ *
+ * **只能用在自动路径上** —— 手动路径里的折点必须原样保留，
+ * 消除它们会让 points[] 与路径顶点失去一一对应。
+ *
+ * 这个函数写过两版都是错的，记在这里免得再踩：
+ *  - 用 `points[i+1]` 当 next：连续三个共线点时会因下标错位漏掉一个，路径上多出一段；
+ *  - 从后往前扫、用 `out` 里最后两个当邻居：**首点永远凑不齐两个邻居，于是被判成共线删掉** ——
+ *    表现是 l 型或 z 型路径整段少掉一截（起笔点凭空移到中间）。
+ *
+ * 现在的写法：先反复删"正好夹在两邻居中间"的点（这个判据只看输入、不受删除影响），
+ * 再跑一次栈式清理处理级联。首尾由 i>0 / i<len-1 明确排除。
+ *
+ * `preserve`（用户折点）**一个都不许消**：折点会让路径"折出去又折回来"，
+ * 三个点落在同一条线上，消掉中间那个等于把用户摆的那个来回整个吃掉 ——
+ * 实测踩过：自环里摆一个折点，路径直接少一段，看起来像没生效。
+ */
+function simplifyCollinear(points) {
+  /** 中间那个点能不能消：共线**且夹在两邻居之间**。
+   *
+   * "夹在中间"这一条是关键：折出去再折回来的那个点同样共线，但它在两邻居之外，
+   * 消掉它就等于把用户摆的那个来回整段吃掉（实测：自环里摆折点，路径直接少一段）。
+   * 反过来，真的落在直线中间的点必须消 —— 留着它会在同一条线上挂两个段把手；
+   * 而"这条线经过用户折点"这件事并没有丢：折点仍然落在那一段**里面**。
+   * （用户折点若被消，只可能是这种情况；消掉折返尖点的那一关由 removeRetraces 把关，
+   * 那里对用户折点有名单保护。） */
+  const isRemovable = (prev, current, next) => {
+    if (prev === undefined || next === undefined) return false
+    const sameX = Math.abs(prev.x - current.x) < 0.5 && Math.abs(current.x - next.x) < 0.5
+    const sameY = Math.abs(prev.y - current.y) < 0.5 && Math.abs(current.y - next.y) < 0.5
+    if (sameX && (current.y - prev.y) * (current.y - next.y) <= 0) return true
+    if (sameY && (current.x - prev.x) * (current.x - next.x) <= 0) return true
+    return false
+  }
+  let cur = points
+  for (;;) {
+    const kept = []
+    for (let i = 0; i < cur.length; i += 1) {
+      if (i > 0 && i < cur.length - 1 && isRemovable(cur[i - 1], cur[i], cur[i + 1])) continue
+      kept.push(cur[i])
+    }
+    if (kept.length === cur.length) break
+    cur = kept
+  }
+  const out = []
+  for (let i = 0; i < cur.length; i += 1) {
+    const current = cur[i]
+    if (i > 0 && i < cur.length - 1 && isRemovable(out[out.length - 1], current, cur[i + 1])) continue
+    out.push(current)
+  }
+  return out
+}
+
+/** 三点共线、且**方向在中间那一点掉头**（两侧方向相反）= 折返的发夹尖。
+ *
+ * 和 `simplifyCollinear` 的判据正好互补：那里消的是"夹在两邻居之间"的多余点，
+ * 这里处理的是"伸到两邻居之外"的那个尖 —— 路径先走出去、再原路描回来。 */
+function isFoldApex(a, b, c) {
+  const sameX = Math.abs(a.x - b.x) < 0.5 && Math.abs(b.x - c.x) < 0.5
+  if (sameX) return (b.y - a.y) * (c.y - b.y) < 0
+  const sameY = Math.abs(a.y - b.y) < 0.5 && Math.abs(b.y - c.y) < 0.5
+  if (sameY) return (b.x - a.x) * (c.x - b.x) < 0
+  return false
+}
+
+/**
+ * 消掉路径里的**折返段**（先折出去、再原路描回来，也就是头发夹形状）。
+ *
+ * 起因是真机截图：把右侧节点从右往左拖，右下角那条线变成"出去 44px 再原路回来"——
+ * 同一个 y 上两段重合，`pathOf` 还会在尖点处画出一个 6px 的小鼓包，
+ * 用户看到的就是"本来只有一条线段，现在画了两条"。
+ *
+ * 为什么该消：折返段在**可见像素上是零信息**（回程完全压在去程上，同色同宽看不出来），
+ * 它带来的只有两样东西 —— 重合的线段和那个小鼓包。消法是丢掉尖点本身：
+ * `a → b → c`（b 是尖点）等价于 `a → c`，去程伸出去的那一截随之不见。
+ *
+ * 尖点若是**人摆的折点**就绝不动（`preserve`）——那和"折点原样成为路径顶点"的约定冲突，
+ * 会连带把 points[] 与路径顶点的一一对应关系弄丢（段把手会找不到折点、拖不动）。
+ * 路由器自己加的桩点/拐点不在 preserve 里，正是这里要收拾的对象。
+ */
+function removeRetraces(points, preserve) {
+  let cur = points
+  for (;;) {
+    const out = []
+    let changed = false
+    for (let i = 0; i < cur.length; i += 1) {
+      const point = cur[i]
+      const prev = out[out.length - 1]
+      const next = cur[i + 1]
+      if (prev !== undefined && next !== undefined && isFoldApex(prev, point, next) && !isPreservedPoint(point, preserve)) {
+        changed = true
+        continue
+      }
+      // 丢掉尖点后可能出现重复点（例如 a=(0,0) b=(10,0) c=(0,0)）：顺手去重。
+      if (prev !== undefined && Math.abs(prev.x - point.x) < 0.5 && Math.abs(prev.y - point.y) < 0.5) continue
+      out.push(point)
+    }
+    if (!changed) return out
+    cur = out
+  }
+}
+
+/**
+ * 两条路径在**几何上**是否一致。
+ *
+ * 必须先消掉共线冗余再比 —— 这是"一条线段上挂了两个把手"的直接原因：
+ * 少一个共线顶点时顶点数不同，逐点比较就判成"路径变了"，
+ * 于是那个共线折点被当成有用的东西留下来，一条直线永远被切成两段。
+ * 几何上它们本来就是同一条线。
+ */
+function samePath(a, b) {
+  if (a === null || b === null) return false
+  const sa = simplifyCollinear(a)
+  const sb = simplifyCollinear(b)
+  if (sa.length !== sb.length) return false
+  for (let i = 0; i < sa.length; i += 1) {
+    if (Math.abs(sa[i].x - sb[i].x) > 0.5 || Math.abs(sa[i].y - sb[i].y) > 0.5) return false
+  }
+  return true
+}
+
+/**
+ * 回收"删掉也不改变路径"的折点。
+ *
+ * 拖动线段时会把该段两端就地钉成折点（那是让段可移动的手段），
+ * 但这些内部记录会越积越多 —— 每多一个就多切出一段、多一个段把手。
+ * 这里逐个试删：删完路径不变就丢掉。于是界面上永远只看到必要的段。
+ *
+ * 判定用"重新路由后逐点比对"，而不是去推理拐角规则 —— 规则会变，比对不会骗人。
+ */
+function prunePoints(doc, edge) {
+  const points = Array.isArray(edge.points) ? edge.points : null
+  if (points === null || points.length === 0) return null
+  const before = edgeRoutePoints(doc, edge)
+  if (before === null) return null
+  let current = points.slice()
+  for (let i = 0; i < points.length; i += 1) {
+    if (current.indexOf(points[i]) < 0) continue
+    const trial = current.filter((p) => p !== points[i])
+    const after = edgeRoutePoints(doc, Object.assign({}, edge, { points: trial }))
+    if (samePath(before, after)) current = trial
+  }
+  return current
+}
+
+/**
+ * 形状边框上朝向 target 的落点，连同它落在哪条边（n/s/e/w）。
+ *
+ * 侧的选择按 |dx| 与 |dy| 比大小；落点**原则上仍取该侧中点**（v1 的行为，别顺手改）——
+ * 但有一个例外：当 target 几乎正对该侧中点（偏差 ≤ AXIS_EPS，不到半个网格）时，把落点
+ * **投影**过去。
+ *
+ * 为什么要这个例外：真机报过"两条线段差一像素、合不成一条"。用户拖出的折点在 x=244，
+ * 而侧中点算出来是 x=245，于是最后一跳凭空多出 `244→245` 的 1px 横跳，竖线上就出现一个小台阶。
+ * 自动分支有中心对齐（snapNearAxis）兜着，手动分支里折点是**用户数据不许动**，这 1px 便一直留着。
+ * 偏差大时不投影：那种情况下"接在侧中点"是 v1 有意的几何，改了会连带挪动几十像素。
+ */
+function borderPointToward(geo, target) {
+  const cx = geo.x + geo.w / 2
+  const cy = geo.y + geo.h / 2
+  const dx = target.x - cx
+  const dy = target.y - cy
+  if (Math.abs(dx) >= Math.abs(dy)) {
+    // 贴边那一轴（x）保持精确；垂直方向默认取侧中点，但**吸附到半格** ——
+    // 否则线段会落在"节点中心"这种非格线坐标上（56 高的节点中心 = y+28）。
+    const y = Math.abs(target.y - cy) <= AXIS_EPS ? target.y : snapFree(cy)
+    if (dx >= 0) return { x: geo.x + geo.w, y: y, side: 'e' }
+    return { x: geo.x, y: y, side: 'w' }
+  }
+  const x = Math.abs(target.x - cx) <= AXIS_EPS ? target.x : snapFree(cx)
+  if (dy >= 0) return { x: x, y: geo.y + geo.h, side: 's' }
+  return { x: x, y: geo.y, side: 'n' }
+}
+
+/**
+ * 从 a 直角走到 b，把需要的新顶点推进 points，返回抵达 b 后所在的轴。
+ * `axis` 是"进来时的方向"：上一段是横的就先横后竖，是竖的就先竖后横。
+ *
+ * 两条 L 的曼哈顿长度永远是同一个数（|dx|+|dy|），差别只在**先走哪一轴**，
+ * 而这一顺序决定了会不会出现"原路折返"—— 见下面的判据。
+ *
+ * `next`（可选）是**这一步之后还要去的点**：用来看出另一头的折返。不传就少一条判据。
+ */
+function connectOrtho(points, a, b, axis, next) {
+  const sameX = Math.abs(a.x - b.x) < 0.5
+  const sameY = Math.abs(a.y - b.y) < 0.5
+  if (sameX && sameY) return axis
+  if (sameX) {
+    points.push({ x: b.x, y: b.y })
+    return 'v'
+  }
+  if (sameY) {
+    points.push({ x: b.x, y: b.y })
+    return 'h'
+  }
+  // 两条 L 都能连到 b，取**短的那条**。
+  //
+  // 这里原本是"上一段是横的就先横后竖"，即无条件沿用 axis。它会画出这种线：
+  // 起点在 (246,433)、目标折点在 (153,366) 时先往右跑到 x=466 再折回左边 ——
+  // 视觉上就是"绕出去一大圈再回来"，而不是最简洁路径。
+  //
+  // 判据：**先走跨度更大的那一轴**。
+  //
+  // 两条 L 的曼哈顿总长完全一样（走的是同样的 dx、dy），差别只在于拐点落在哪个角：
+  //   · 先横后竖 → 拐点 (b.x, a.y)，与 a 同高、与 b 同列；
+  //   · 先竖后横 → 拐点 (a.x, b.y)。
+  // 取"同高"那个（先横）等价于让**较长的那一段先走完**，于是短的那一段最后走，
+  // 路径不会在拐点处先出去再折回来。反过来先走短的那一轴，就会多一个来回 ——
+  // 实测：起点 (60,433)、折点 (100,460) 时先竖（27px）会让路径从 595 涨到 649，
+  // 因为那 27px 走到 y=460 后，下一段又得往北回到 y=178。
+  //
+  // 这里相等时取"先横"，即 `<=`：平手时两种拐点对称，任选一个总长一样，
+  // 但 x 方向先走完更符合"从西侧出来"的直觉（且与旧的 axis 行为在多数情况下一致）。
+  const dx = b.x - a.x
+  const dy = b.y - a.y
+  const defaultH = Math.abs(dx) <= Math.abs(dy)
+
+  // 但"先走长的那一轴"只知道 dx/dy 谁大，两点它都看不见：**我们从哪儿来**、**接下来去哪**。
+  // 于是它会挑出一条原路折返的 L —— 出去再回来，画面上就是两段重合的线（真机报过两次）。
+  // 两条 L 一样长，所以这里按"哪条的**重合段最短**"挑，完全平手才用上面的默认判据：
+  const last = points.length > 0 ? points[points.length - 1] : null
+  const before = points.length > 1 ? points[points.length - 2] : null
+  const atLast = last !== null && Math.abs(last.x - a.x) < 0.5 && Math.abs(last.y - a.y) < 0.5
+  const inHorizontal = atLast && before !== null && Math.abs(before.y - a.y) < 0.5 && Math.abs(before.x - a.x) > 0.5
+  const inVertical = atLast && before !== null && Math.abs(before.x - a.x) < 0.5 && Math.abs(before.y - a.y) > 0.5
+
+  /** 第一步压着**上一段**走回去的长度（先横先竖决定第一步走哪一轴）。 */
+  const firstOverlap = (horizontalFirst) => {
+    if (inHorizontal && horizontalFirst === true && dx * (a.x - before.x) < 0) {
+      return Math.min(Math.abs(dx), Math.abs(a.x - before.x))
+    }
+    if (inVertical && horizontalFirst === false && dy * (a.y - before.y) < 0) {
+      return Math.min(Math.abs(dy), Math.abs(a.y - before.y))
+    }
+    return 0
+  }
+  /** 到站方向被**下一段**立刻顶回来的长度：先横后竖时到站是竖的，先竖后横时到站是横的。
+   *  只有下一段是"直的"（同轴）时才必然折返 —— 不直的时候下一段自己会按 firstOverlap 避开。 */
+  const arrivalOverlap = (horizontalFirst) => {
+    if (next === null || next === undefined) return 0
+    const departH = Math.abs(next.y - b.y) < 0.5 && Math.abs(next.x - b.x) > 0.5
+    const departV = Math.abs(next.x - b.x) < 0.5 && Math.abs(next.y - b.y) > 0.5
+    if (horizontalFirst === true && departV && (next.y - b.y) * dy < 0) {
+      return Math.min(Math.abs(dy), Math.abs(next.y - b.y))
+    }
+    if (horizontalFirst === false && departH && (next.x - b.x) * dx < 0) {
+      return Math.min(Math.abs(dx), Math.abs(next.x - b.x))
+    }
+    return 0
+  }
+  // 用**长度**而不是"有没有"：两边都躲不开时，重合 24px 总好过 44px
+  // （真机那条正是如此：44px 的重合压在**用户折点**上，removeRetraces 不许动它，
+  //   而 24px 那条压在目标侧桩点上，顺手就被消干净了）。
+  const overlapOf = (horizontalFirst) => firstOverlap(horizontalFirst) + arrivalOverlap(horizontalFirst)
+  const useHorizontalFirst = overlapOf(!defaultH) < overlapOf(defaultH) ? !defaultH : defaultH
+  if (useHorizontalFirst) {
+    points.push({ x: b.x, y: a.y })
+    points.push({ x: b.x, y: b.y })
+    return 'v'
+  }
+  points.push({ x: a.x, y: b.y })
+  points.push({ x: b.x, y: b.y })
+  return 'h'
+}
+
+/** 形状中心指向 target 的主轴 —— 决定连线第一段先横还是先竖。 */
+function axisToward(geo, target) {
+  const cx = geo.x + geo.w / 2
+  const cy = geo.y + geo.h / 2
+  return Math.abs(target.x - cx) >= Math.abs(target.y - cy) ? 'h' : 'v'
+}
+
+/**
+ * 从某一侧引出连线时，先在那一侧外面放一个折点。
+ *
+ * 这是"从哪边出来"的**几何表达**：桩点位于那一侧的正外方，borderPointToward 就会选中那条边。
+ *
+ * v1 把桩点直接写进 edge.points（于是"端点约束"和"折点"混成了一锅，AI 一重排就散架）；
+ * v1.1 起端点约束存在 style 的 `exitX/exitY`、`entryX/entryY` 里，桩点只活在路由内部。
+ */
+function stubPointFor(geo, side, jetty) {
+  // 长度取文档里的 `jettySize`（drawio 的键），没写就用缺省 24px。
+  const inset = Number.isFinite(jetty) && jetty > 0 ? jetty : 24
+  // 垂直方向吸附到半格：桩点是路由的必经点，它决定首/末段所在的那条线。
+  const cx = snapFree(geo.x + geo.w / 2)
+  const cy = snapFree(geo.y + geo.h / 2)
+  if (side === 'n') return { x: cx, y: geo.y - inset }
+  if (side === 's') return { x: cx, y: geo.y + geo.h + inset }
+  if (side === 'w') return { x: geo.x - inset, y: cy }
+  return { x: geo.x + geo.w + inset, y: cy }
+}
+
+/**
+ * 从一条边的 style 串读出两端约束与桩点长度。
+ *
+ * 「从哪一侧进出」在 v1.1 起就是文档里的 `exitX/exitY`（源端）与 `entryX/entryY`（目标端）——
+ * 不再是把一个贴在边框外的桩点混进 edge.points（v1 的老办法）。缺省样式 = 两端都不钉。
+ */
+function sidesFromStyle(style) {
+  const text = typeof style === 'string' ? style : DEFAULT_EDGE_STYLE
+  return {
+    source: sideFromStyle(text, 'source'),
+    target: sideFromStyle(text, 'target'),
+    jetty: jettyFromStyle(text, undefined),
+  }
+}
+
+/** 某一端在文档里钉住的侧（没有约束返回 null = 由路由器自己挑）。 */
+function pinnedSideOf(edge, end) {
+  return sideFromStyle(typeof edge.style === 'string' ? edge.style : DEFAULT_EDGE_STYLE, end)
+}
+
+/**
+ * 把「两端约束 + 用户折点」拼成 routeThroughWaypoints 的必经点链。
+ *
+ * 顺序就是边的真实方向（fromBox → toBox）：源端桩点、用户折点、目标端桩点。
+ * **预览与落盘都走这一个函数** —— 于是"看到接哪边"和"存下来接哪边"是同一件事，
+ * 不会出现"松手瞬间整条线跳掉"。
+ */
+function chainForRoute(fromBox, toBox, waypoints, sides) {
+  const chain = []
+  const source = sides === undefined || sides === null ? null : sides.source
+  const target = sides === undefined || sides === null ? null : sides.target
+  const jetty = sides === undefined || sides === null ? null : sides.jetty
+  if (typeof source === 'string' && source.length > 0) chain.push(stubPointFor(fromBox.geo, source, jetty))
+  if (Array.isArray(waypoints)) {
+    for (let i = 0; i < waypoints.length; i += 1) chain.push({ x: waypoints[i].x, y: waypoints[i].y })
+  }
+  if (typeof target === 'string' && target.length > 0) chain.push(stubPointFor(toBox.geo, target, jetty))
+  return chain
+}
+
+/**
+ * 手动路径：必须逐个经过用户摆下的折点。
+ *
+ * 三条约定，这套折点逻辑之所以不再乱就靠它们：
+ *
+ *  1. **折点原样成为路径顶点，绝不被消除。** 于是 points[i] ↔ 路径顶点一一对应，
+ *     "在第几段插入"可以精确算出，不需要弧长近似。
+ *
+ *  2. **拐弯方向跟着行进方向走，不是隔一段翻一次。** 之前用 horizontalFirst = !horizontalFirst
+ *     交替，拖动一个折点会让整条线忽然翻面 —— 那正是"混乱"的来源。
+ *     现在：上一段是横的 → 先横后竖；上一段是竖的 → 先竖后横。形状连续变化。
+ *
+ *  3. **进出形状的最后一段垂直于落点所在的边**（从左边进就横着进）。
+ *     否则线会贴着边框斜切进去，看起来像画错了。
+ */
+function routeThroughWaypoints(fromBox, toBox, waypoints, obstacleBoxes, userWaypoints) {
+  // 折点可能落在某个节点**内部**（用户拖到节点上、或节点移动后把它吞进去了）。
+  // 照直连过去线就穿进节点里，所以先推到外面 —— 只改路由用的副本，不动用户数据。
+  const safe = []
+  for (let i = 0; i < waypoints.length; i += 1) {
+    const toward = i + 1 < waypoints.length ? waypoints[i + 1] : { x: toBox.geo.x + toBox.geo.w / 2, y: toBox.geo.y + toBox.geo.h / 2 }
+    const holder = boxContaining(obstacleBoxes, waypoints[i], null)
+    safe.push(holder === null ? waypoints[i] : pushOutOfBox(waypoints[i], holder.geo, toward))
+  }
+
+  /** 从起点出发，依次穿过折点、进入目标——返回折线。 */
+  function build(start) {
+    const pts = [{ x: start.x, y: start.y }]
+    let axis = axisToward(fromBox.geo, safe[0])
+    let prev = start
+    // 最后的落点先算出来（它只取决于最后一个折点）：它也是最后一个折点的"下一站"，
+    // 传给 connectOrtho 用于判断"到站方向会不会被下一段顶回来"。
+    const end = borderPointToward(toBox.geo, safe[safe.length - 1])
+    for (let i = 0; i < safe.length; i += 1) {
+      const next = i + 1 < safe.length ? safe[i + 1] : end
+      axis = connectOrtho(pts, prev, safe[i], axis, next)
+      prev = safe[i]
+    }
+    // 落点在左右边 → 最后一段要横着进 → 先竖后横，所以传 'v'；上下边反之。
+    const approach = end.side === 'e' || end.side === 'w' ? 'v' : 'h'
+    connectOrtho(pts, prev, end, approach)
+    return pts
+  }
+
+  const start = borderPointToward(fromBox.geo, safe[0])
+  // `keep` 只装**人摆的折点**（不含路由器加的桩点）：折返的发夹尖要能消，
+  // 但尖点若是用户折点就必须留着 —— 见 removeRetraces 的注释。
+  const keep = Array.isArray(userWaypoints) ? keepOf(safe, userWaypoints) : safe
+  return finalizePath(build(start), safe, keep)
+}
+
+/** 从 safe（已推出的折点序列，含桩点）里挑出"对应人摆的那些点"。
+ *
+ * 按**坐标**配对而不是按下标：桩点与折点在 chain 里混在一起，下标要另算一遍首尾桩点个数，
+ * 而坐标配对在 chainForRoute 把用户折点原样搬进 chain 之后是精确的。 */
+function keepOf(safe, userWaypoints) {
+  const keep = []
+  for (let i = 0; i < safe.length; i += 1) {
+    for (let j = 0; j < userWaypoints.length; j += 1) {
+      if (Math.abs(safe[i].x - userWaypoints[j].x) < 0.5 && Math.abs(safe[i].y - userWaypoints[j].y) < 0.5) {
+        keep.push(safe[i])
+        break
+      }
+    }
+  }
+  return keep
+}
+
+/**
+ * 收尾：保折点与两端落点、消 1.5px 台阶、消折返、去共线冗余。
+ *
+ * `snapWaypoints`（含引出桩点）只用于**防吸附**：桩点是路由的必经点，不该被对齐挪走。
+ * `keepPoints` 是**折返消不掉**的保护名单（人摆的折点），不传就退回 snapWaypoints。
+ */
+function finalizePath(pts, snapWaypoints, keepPoints) {
+  const snapList = Array.isArray(snapWaypoints) ? snapWaypoints : []
+  const keepList = keepPoints === undefined || keepPoints === null ? snapList : keepPoints
+  const forSnap = new Set()
+  forSnap.add(pts[0])
+  forSnap.add(pts[pts.length - 1])
+  for (let i = 0; i < snapList.length; i += 1) forSnap.add(snapList[i])
+  // 最后收一次共线冗余：路径里的桩点常常是共线的
+  // （比如"+24px 的引出桩点"和"真正落点"在同一竖直线上）。
+  // 不收的话，路径上会多出不在 points[] 里的顶点 ——
+  //   · 渲染出来的段比预览多，同一条线上又能挂两个把手；
+  //   · ensurePinned 用 pathIndexOf 在 points 里找路径顶点，找不到就返回 -1，
+  //     拖动那一段会直接没反应（"点了段把手不动"）。
+  // 折返要在共线化简**之前**消：消掉发夹尖之后，旁边那两点往往就共线了。
+  // keepList 只喂给 removeRetraces —— 共线化简那遍**故意不吃保护名单**：
+  // 用户折点若变成"夹在一条直线中间"的点，消掉它不改变画面（线照样经过它），
+  // 而且下一次手势的 prunePoints 会把这条已经没有几何意义的折点从文档里清掉；
+  // 反过来留着它，就会在一条直线上多挂一个段把手（见 simplifyCollinear 的注释）。
+  return simplifyCollinear(removeRetraces(dedupePoints(snapNearAxisInPath(pts, forSnap)), keepList))
+}
+
+/** 折点是路径上的精确顶点（见上面的约定 1），直接找下标即可。 */
+function pathIndexOf(pts, point) {
+  for (let i = 0; i < pts.length; i += 1) {
+    if (Math.abs(pts[i].x - point.x) < 0.5 && Math.abs(pts[i].y - point.y) < 0.5) return i
+  }
+  return -1
+}
+
+/** 在第 segmentIndex 段上插新折点时，它排在 points[] 的第几位：数该段起点之前有几个折点。 */
+function insertIndexForPath(pts, waypoints, segmentIndex) {
+  let count = 0
+  for (let i = 0; i < waypoints.length; i += 1) {
+    const at = pathIndexOf(pts, waypoints[i])
+    if (at >= 0 && at <= segmentIndex) count += 1
+  }
+  return count
+}
+
+/**
+ * 把路径顶点 vertexIndex 就地钉成折点，返回它在 points 里的下标；已经是折点就直接复用。
+ *
+ * 在**原有位置**补折点不会改变路径（它本来就是路径顶点），
+ * 所以"拖动某一段"可以在不产生任何跳变的前提下，把这一段的两个端点变成可移动的。
+ */
+function ensurePinned(pts, points, vertexIndex) {
+  const target = pts[vertexIndex]
+  if (target === undefined) return -1
+  const existing = pathIndexOf(points, target)
+  if (existing >= 0) return existing
+  const at = insertIndexForPath(pts, points, vertexIndex - 1)
+  points.splice(at, 0, { x: target.x, y: target.y })
+  return at
+}
+
+/**
+ * 连线路径的唯一入口。
+ *
+ * 两种模式：
+ *   有折点 → 手动：逐个穿过折点，人摆的优先级高于算法
+ *   没折点 → 自动：从候选里挑一条（不穿节点 → 拐弯少 → 尽量短）
+ *
+ * `bounds` 不再参与绕行 —— 那是之前"边绕整个画布一圈"的来源。
+ */
+/**
+ * 顺时针的下一个侧。
+ *
+ * 自环的进出口**不能是同一个侧**：从一边出去又原路回来，线会原地折返、看起来什么都没有
+ * （drawio 也不允许同侧自环，它会自动换一个侧）。
+ */
+function nextSideOf(side) {
+  const order = ['e', 's', 'w', 'n']
+  const at = order.indexOf(side)
+  return order[(at < 0 ? 0 : at + 1) % order.length]
+}
+
+/** 盒子某一侧**边框上**的接入点：切向坐标吸附半格，贴边那一轴保持精确。 */
+function sideBorderPoint(geo, side) {
+  const cx = snapFree(geo.x + geo.w / 2)
+  const cy = snapFree(geo.y + geo.h / 2)
+  if (side === 'n') return { x: cx, y: geo.y }
+  if (side === 's') return { x: cx, y: geo.y + geo.h }
+  if (side === 'w') return { x: geo.x, y: cy }
+  return { x: geo.x + geo.w, y: cy }
+}
+
+/** 侧的法线是横的还是竖的（决定它外推出来的那个坐标能不能当拐点用）。*/
+function sideIsHorizontal(side) {
+  return side === 'e' || side === 'w'
+}
+
+/**
+ * 自环：从 source 侧出去、绕到 target 侧回来。
+ *
+ * 与普通边的区别只在**中间怎么绕**：两个端点桩点都在同一个盒子外面，
+ * 所以拐点必须取"两个外推坐标"的组合 —— 直接连 s.x/t.y 会在某些侧对上穿进盒子里
+ * （例如 n → e 时 s.x 还在盒子宽度以内）。判据：
+ *   · 一个侧的法线是横的（e/w）→ 它的桩点 x 在盒子外，可以当拐点的 x；
+ *   · 另一个侧的法线是竖的（n/s）→ 它的桩点 y 在盒子外，可以当拐点的 y。
+ * 两侧相对（e/w 或 n/s）时没有这种组合，就从盒子上下（或左右）绕一圈过去。
+ *
+ * 用户摆过折点（`waypoints`）时不走这条固定形状：老老实实穿过去 —— 与普通边同一套规则，
+ * 人摆的永远优先。
+ */
+function selfLoopPath(geo, sourceSide, targetSide, jetty, waypoints) {
+  const source = typeof sourceSide === 'string' && sourceSide.length > 0 ? sourceSide : 'e'
+  let target = typeof targetSide === 'string' && targetSide.length > 0 ? targetSide : nextSideOf(source)
+  if (target === source) target = nextSideOf(source)
+  // 环的"外扩"距离：文档里的 jettySize，缺省 35（配合半格吸附）。
+  const inset = snapFree(Number.isFinite(jetty) && jetty > 0 ? jetty : 35)
+  const p0 = sideBorderPoint(geo, source)
+  const p1 = sideBorderPoint(geo, target)
+  const s = stubPointFor(geo, source, inset)
+  const t = stubPointFor(geo, target, inset)
+  const chain = Array.isArray(waypoints) ? waypoints : []
+  const pts = [p0, s]
+
+  if (chain.length > 0) {
+    let prev = s
+    let axis = axisToward(geo, chain[0])
+    for (let i = 0; i < chain.length; i += 1) {
+      const next = i + 1 < chain.length ? chain[i + 1] : t
+      axis = connectOrtho(pts, prev, chain[i], axis, next)
+      prev = chain[i]
+    }
+    connectOrtho(pts, prev, t, axis)
+  } else if (sideIsHorizontal(source) !== sideIsHorizontal(target)) {
+    // 垂直的一对（例如 e → s）：拐点 = 横向那个侧的桩点 x + 纵向那个侧的桩点 y。
+    const horizontal = sideIsHorizontal(source) ? s : t
+    const vertical = sideIsHorizontal(source) ? t : s
+    pts.push({ x: horizontal.x, y: vertical.y })
+  } else if (sideIsHorizontal(source)) {
+    // 相对的左右两侧：从盒子上下绕过去（e → w 走上边，w → e 走下边）。
+    const viaY = source === 'e' ? geo.y - inset : geo.y + geo.h + inset
+    pts.push({ x: s.x, y: viaY })
+    pts.push({ x: t.x, y: viaY })
+  } else {
+    // 相对的上下两侧：从盒子左右绕过去（n → s 走右边，s → n 走左边）。
+    const viaX = source === 'n' ? geo.x + geo.w + inset : geo.x - inset
+    pts.push({ x: viaX, y: s.y })
+    pts.push({ x: viaX, y: t.y })
+  }
+  pts.push(t)
+  pts.push(p1)
+  // 折点、两个接入点都要保住（finalizePath 只做去共线、消台阶与消折返）。
+  // 自环的桩点不在 chain 里，所以折返那一遍可以收拾到它、却动不了用户的折点。
+  return finalizePath(pts, chain, chain)
+}
+
+/** 某个点是否正好落在盒子某一侧的**中点**上（容差 0.6）。 */
+function isSideMidpoint(geo, point) {
+  for (let i = 0; i < SIDES.length; i += 1) {
+    const mid = sideBorderPoint(geo, SIDES[i])
+    if (Math.abs(mid.x - point.x) < 0.6 && Math.abs(mid.y - point.y) < 0.6) return true
+  }
+  return false
+}
+
+/** 一条路径的两端是否都落在**侧的中点**上。 */
+function hasMidpointEnds(points, fromGeo, toGeo) {
+  if (points.length < 2) return false
+  return isSideMidpoint(fromGeo, points[0]) && isSideMidpoint(toGeo, points[points.length - 1])
+}
+
+/**
+ * 自动路由的候选集合（手动路径与自环不走这里）。
+ *
+ * 抽出来是为了**能被断言与调试**：端点抖动到底是哪两条候选在抢，看候选表最直接
+ * （之前只能靠猜，猜错过两次）。
+ */
+function routeCandidates(fromBox, toBox) {
+  const axis = snapNearAxis(fromBox.geo, toBox.geo)
+  const candFrom = axis.from
+  const candTo = axis.to
+  const top = snapFree(Math.min(candFrom.y, candTo.y) - 60)
+  const bottom = snapFree(Math.max(candFrom.y + candFrom.h, candTo.y + candTo.h) + 60)
+  const left = snapFree(Math.min(candFrom.x, candTo.x) - 60)
+  const right = snapFree(Math.max(candFrom.x + candFrom.w, candTo.x + candTo.w) + 60)
+  return [
+    { name: 'orthoH', points: orthoH(candFrom, candTo) },
+    { name: 'orthoV', points: orthoV(candFrom, candTo) },
+    { name: 'above', points: viaY(candFrom, candTo, top) },
+    { name: 'below', points: viaY(candFrom, candTo, bottom) },
+    { name: 'left', points: viaX(candFrom, candTo, left) },
+    { name: 'right', points: viaX(candFrom, candTo, right) },
+  ]
+}
+
+/**
+ * 从候选里挑一条。纯函数 —— 抽出来是为了能断言"这一步为什么换侧"，
+ * 也因为这段判据连续踩过两次坑（近似平手来回抢、落点风格不一致）。
+ *
+ * 顺序：
+ *   1. 先按代价找出最优（hits → bends → length）；
+ *   2. 在"不比最优差多少"（withinSlack）的候选里，优先**两端都落在侧中点**的那条 ——
+ *      我们的四个端点圆点、exitX/exitY 的语义都指中点；滑动的落点与它们不一致时，
+ *      两者代价接近就会来回抢；
+ *   3. 仍没有就退回按优先级取第一条 withinSlack 的（固定优先级 = 稳定）。
+ *
+ * @returns { index, bestIndex, costs }
+ */
+function pickCandidate(candidates, boxes, skip, fromGeo, toGeo) {
+  const costs = candidates.map((pts) => pathCost(pts, boxes, skip))
+  let bestIndex = 0
+  for (let i = 1; i < costs.length; i += 1) if (pathCostBetter(costs[i], costs[bestIndex])) bestIndex = i
+  const bestCost = costs[bestIndex]
+  let pick = -1
+  for (let i = 0; i < candidates.length; i += 1) {
+    if (!withinSlack(costs[i], bestCost)) continue
+    if (!hasMidpointEnds(candidates[i], fromGeo, toGeo)) continue
+    pick = i
+    break
+  }
+  if (pick < 0) {
+    for (let i = 0; i < candidates.length; i += 1) {
+      if (!withinSlack(costs[i], bestCost)) continue
+      pick = i
+      break
+    }
+  }
+  return { index: pick < 0 ? bestIndex : pick, bestIndex: bestIndex, costs: costs }
+}
+
+/**
+ * 新选择要**连续稳定**这么多帧才被采纳（见 applyRouteHysteresis）。
+ *
+ * 取 3：一次拖动每帧挪几个像素，3 帧 ≈ 几十毫秒 —— 用户察觉不到延迟，
+ * 而避让边界上那种"一两帧的合法窗口"会被它滤掉。
+ */
+const ROUTE_SETTLE_FRAMES = 3
+
+/**
+ * 路由迟滞：**端点侧不能一帧一变**。
+ *
+ * 实测的病：拖动节点时，直连路线的合法性会在避让边界（8px 余量）上反复翻转 ——
+ * 穿过一个节点 → 干净 → 又穿过另一个 → 又干净。于是路由在"绕上面"和"直连"之间来回切，
+ * 端点侧跟着 `n→n` ↔ `e→w` 跳，用户看到的就是"连线自己换端点"（120 步里跳 4 次）。
+ *
+ * 这类抖动只有迟滞能治：
+ *   · 记着的那条**只要还合法**（不穿模、拐弯数不比最优多）就先用它；
+ *   · 想换，必须新选择连续 `ROUTE_SETTLE_FRAMES` 帧都是最优 —— 一两帧的窗口换不动它；
+ *   · 记着的那条一旦**不合法**（开始穿模），立刻换，安全优先。
+ *
+ * 没有 memory 时（自测、一次性路由）行为与以前完全一致。
+ *
+ * @param hint { memory, key } —— memory 是 Map，key 是边 id
+ */
+function applyRouteHysteresis(candidates, picked, hint) {
+  const memory = hint === undefined || hint === null ? undefined : hint.memory
+  const key = hint === undefined || hint === null || typeof hint.key !== 'string' ? null : hint.key
+  if (memory === undefined || memory === null || key === null) return picked.index
+  const bestCost = picked.costs[picked.bestIndex]
+  const remembered = memory.get(key)
+  let keepIndex = -1
+  if (remembered !== undefined && remembered !== null && typeof remembered.pick === 'string') {
+    for (let i = 0; i < candidates.length; i += 1) {
+      if (candidates[i].name === remembered.pick) {
+        keepIndex = i
+        break
+      }
+    }
+  }
+  if (keepIndex >= 0) {
+    const cost = picked.costs[keepIndex]
+    const legal = cost.hits <= bestCost.hits && cost.bends <= bestCost.bends
+    if (!legal) keepIndex = -1
+  }
+  const desiredName = candidates[picked.index].name
+  if (keepIndex >= 0 && keepIndex !== picked.index) {
+    const pending = remembered.pending === desiredName ? remembered.pendingCount + 1 : 1
+    if (pending < ROUTE_SETTLE_FRAMES) {
+      memory.set(key, { pick: remembered.pick, pending: desiredName, pendingCount: pending })
+      return keepIndex
+    }
+    memory.set(key, { pick: desiredName, pending: null, pendingCount: 0 })
+    return picked.index
+  }
+  memory.set(key, { pick: desiredName, pending: null, pendingCount: 0 })
+  return picked.index
+}
+
+function routeEdge(fromBox, toBox, boxes, bounds, waypoints, sides, straight, hint) {
+  // 入参是 box（{ id, node, geo, label }），几何在 .geo 上。
+  // 这里曾经直接读 from.x / from.y —— box 上没有这些字段，于是 NaN 一路传染：
+  // 连线 d="M NaN NaN" 被浏览器丢弃（边全部消失），边标签 x="NaN" 被忽略（全部塌到原点重叠）。
+  // pathCost 用的是 box.geo（对的），所以这个函数一半对一半错，看着像没问题。
+  const from = fromBox.geo
+  const to = toBox.geo
+  if (fromBox.id === toBox.id) {
+    // 自环：出边/回边的侧来自文档（exitX/exitY 与 entryX/entryY），没写就东出南下。
+    const seed = sides === undefined || sides === null ? null : sides
+    return selfLoopPath(from, seed === null ? null : seed.source, seed === null ? null : seed.target, seed === null ? null : seed.jetty, waypoints)
+  }
+  // 有端点约束或有用户折点 → 手动：逐个穿过必经点，人摆的优先级高于算法。
+  const chain = chainForRoute(fromBox, toBox, waypoints, sides)
+  if (chain.length > 0) {
+    return routeThroughWaypoints(fromBox, toBox, chain, boxes, Array.isArray(waypoints) ? waypoints : [])
+  }
+  // edgeStyle=none = 直线（drawio 的语义）：两端各取朝向对方的边框点，中间一条直线。
+  if (straight === true) {
+    const a = borderPointToward(from, { x: to.x + to.w / 2, y: to.y + to.h / 2 })
+    const b = borderPointToward(to, { x: a.x, y: a.y })
+    return [{ x: a.x, y: a.y }, { x: b.x, y: b.y }]
+  }
+  void bounds
+  const skip = {}
+  skip[fromBox.id] = true
+  skip[toBox.id] = true
+  const raw = routeCandidates(fromBox, toBox)
+  const picked = pickCandidate(
+    raw.map((c) => c.points),
+    boxes,
+    skip,
+    fromBox.geo,
+    toBox.geo,
+  )
+  const index = applyRouteHysteresis(raw, picked, hint)
+  // 自动候选理论上不会折返，这里照样过一遍：折返在画面上只有坏处（重合线 + 尖点鼓包），
+  // 而"每条边上都没有折返"是能在自测里断言的硬不变量。
+  return simplifyCollinear(removeRetraces(dedupePoints(raw[index].points)))
+}
+
+
+/**
+ * 以 anchor 为锚点缩放视野：**锚点在缩放前后必须停在同一位置**（这是滚轮手感的关键）。
+ *
+ * 抽成纯函数是为了能被断言 —— 这段数学错一点，表现就是"缩放时图往一边跑"，
+ * 而这种毛病在浏览器里只能靠手感发现，命令行验不了。
+ * 注意 h 必须**按同一个 k 缩放**，不能另算 —— 否则宽高比变化会让画面整体位移。
+ */
+function zoomViewAt(current, anchor, factor) {
+  const w = Math.max(VIEW_MIN_W, Math.min(VIEW_MAX_W, current.w * factor))
+  const k = w / current.w
+  return { x: anchor.x - (anchor.x - current.x) * k, y: anchor.y - (anchor.y - current.y) * k, w: w, h: current.h * k }
+}
+
+/**
+ * 折线 → SVG path。
+ *
+ * `curved` 走 drawio 的 `mxPolyline.paintCurvedLine`（curved=1）：从起点出发，每个中间点
+ * 作为**二次曲线的控制点**、收在下一点与它的中点，最后一段收在终点上 —— 于是整条线是平滑
+ * 的曲线而不是硬拐角。注意 drawio 里 curved 与 rounded 是**互斥**的（painCurvedLine 优先），
+ * 所以这里 curved 时不带圆角半径。
+ * 两点 + curved：控制点落在起点上 → 退化成直线（与 drawio 完全一致，不会凭空鼓起来）。
+ */
+function pathOf(rawPoints, radius, curved) {
+  const pts = []
+  for (let i = 0; i < rawPoints.length; i += 1) {
+    const p = rawPoints[i]
+    const last = pts[pts.length - 1]
+    if (last !== undefined && Math.abs(last.x - p.x) < 0.01 && Math.abs(last.y - p.y) < 0.01) continue
+    pts.push(p)
+  }
+  if (pts.length < 2) return ''
+  if (curved === true) {
+    const parts = ['M ' + fmt(pts[0].x) + ' ' + fmt(pts[0].y)]
+    for (let i = 1; i < pts.length - 2; i += 1) {
+      const p0 = pts[i]
+      const p1 = pts[i + 1]
+      parts.push('Q ' + fmt(p0.x) + ' ' + fmt(p0.y) + ' ' + fmt((p0.x + p1.x) / 2) + ' ' + fmt((p0.y + p1.y) / 2))
+    }
+    const p0 = pts[pts.length - 2]
+    const p1 = pts[pts.length - 1]
+    parts.push('Q ' + fmt(p0.x) + ' ' + fmt(p0.y) + ' ' + fmt(p1.x) + ' ' + fmt(p1.y))
+    return parts.join(' ')
+  }
+  const parts = ['M ' + fmt(pts[0].x) + ' ' + fmt(pts[0].y)]
+  for (let i = 1; i < pts.length - 1; i += 1) {
+    const prev = pts[i - 1]
+    const cur = pts[i]
+    const next = pts[i + 1]
+    const d1 = Math.abs(cur.x - prev.x) + Math.abs(cur.y - prev.y)
+    const d2 = Math.abs(next.x - cur.x) + Math.abs(next.y - cur.y)
+    if (d1 < 0.01 || d2 < 0.01) continue
+    const r = Math.min(radius, d1 / 2, d2 / 2)
+    const a = { x: cur.x - ((cur.x - prev.x) / d1) * r, y: cur.y - ((cur.y - prev.y) / d1) * r }
+    const b = { x: cur.x + ((next.x - cur.x) / d2) * r, y: cur.y + ((next.y - cur.y) / d2) * r }
+    parts.push('L ' + fmt(a.x) + ' ' + fmt(a.y))
+    parts.push('Q ' + fmt(cur.x) + ' ' + fmt(cur.y) + ' ' + fmt(b.x) + ' ' + fmt(b.y))
+  }
+  const last = pts[pts.length - 1]
+  parts.push('L ' + fmt(last.x) + ' ' + fmt(last.y))
+  return parts.join(' ')
+}
+
+function shapeElement(node, geo, palette, mode) {
+  const x = geo.x
+  const y = geo.y
+  const w = geo.w
+  const h = geo.h
+  const style = typeof node.style === 'string' ? node.style : ''
+  const stroke = palette.stroke
+  const shape = shapeOf(node)
+  const fill = palette.fill
+  // 顶点也吃 drawio 的描边参数：strokeWidth / dashed / dashPattern 都在文档里。
+  const strokeWidth = styleNumber(style, 'strokeWidth', 1)
+  const pattern = dashPatternFromStyle(style)
+  const common = { fill: fill, stroke: stroke, strokeWidth: strokeWidth,
+    fillOpacity: clampNumber(styleNumber(style, 'fillOpacity', 100), 0, 100) / 100,
+    strokeOpacity: clampNumber(styleNumber(style, 'strokeOpacity', 100), 0, 100) / 100,
+  }
+  if (pattern !== null) common.strokeDasharray = pattern
+  // 独立文字：**不画任何边框/底色**，只留一个透明命中框。
+  // 为什么还要那个 rect：节点组靠子元素的命中测试接收指针事件（形状 + 标签同组），
+  // 而标签是 pointerEvents:none 的 —— 少了它，文字元素点不到、拖不动、也双击不了。
+  // `fill="transparent"` 在 SVG 里是"有填充但全透明"，照样参与命中测试；
+  // 导出 SVG 时它也是不可见的（不是 `fill="none"` —— 那个不参与命中测试）。
+  if (shape === 'text') {
+    return React.createElement('rect', { x: x, y: y, width: w, height: h, fill: 'transparent', stroke: 'none', pointerEvents: 'all' })
+  }
+  // 分区：淡底 + 虚线框（飞书分区 / drawio group 的观感），标题画在框顶（见 renderDiagram）。
+  if (shape === 'section') {
+    return React.createElement('rect', {
+      x: x,
+      y: y,
+      width: w,
+      height: h,
+      rx: 4,
+      ry: 4,
+      fill: fill === undefined || fill === null || fill === '' ? '#f5f5f5' : fill,
+      stroke: stroke,
+      strokeWidth: strokeWidth,
+      fillOpacity: common.fillOpacity,
+      strokeOpacity: common.strokeOpacity,
+      strokeDasharray: pattern !== null ? pattern : '6 3',
+    })
+  }
+  // swimlane：外框 + 顶栏标题带（startSize）；标题文字由 labelTextBox 画在带内。
+  if (shape === 'swimlane') {
+    const header = Math.min(h, swimlaneStartSize(node))
+    const bodyFill = fill === undefined || fill === null || fill === '' ? '#ffffff' : fill
+    const headerFill = styleGet(style, 'swimlaneFillColor', null) || bodyFill
+    return React.createElement(
+      'g',
+      null,
+      React.createElement('rect', Object.assign({}, common, { x: x, y: y, width: w, height: h, fill: bodyFill })),
+      React.createElement('rect', {
+        x: x,
+        y: y,
+        width: w,
+        height: header,
+        fill: headerFill,
+        stroke: 'none',
+        fillOpacity: common.fillOpacity,
+        pointerEvents: 'none',
+      }),
+      React.createElement('line', {
+        x1: x,
+        y1: y + header,
+        x2: x + w,
+        y2: y + header,
+        stroke: stroke,
+        strokeWidth: strokeWidth,
+        strokeOpacity: common.strokeOpacity,
+        pointerEvents: 'none',
+      }),
+    )
+  }
+  // 图片内容节点（svg 标记 / 位图 data URI）：节点框里画的就是 `image=` 那一段。
+  //
+  // 为什么用 <image href="data:..."> 而不是把标记内联进画布 DOM：
+  //   · <image> 里的 SVG 是**独立文档**：脚本不执行、外部资源不加载，等于天然的沙箱；
+  //     内联（dangerouslySetInnerHTML / DOMParser）则会把任意标记塞进页面 DOM。
+  //   · 导出的 SVG 里它同样是自包含的（data URI 就写在属性上），PNG 那条路（序列化 → Image
+  //     → canvas）也走得通 —— 内部图片是内嵌的，不涉及任何外部请求。
+  // imageAspect=1 = 等比缩放居中（drawio 的缺省语义），0/缺省 = 拉伸铺满节点框。
+  // 位图缺省写 imageAspect=1；svg 缺省写 0 —— 见 style-kernel。
+  // 有标签且 labelPosition 非中心时，图只画在对侧区域，避免与字叠在一起。
+  if (shape === 'svg' || shape === 'image') {
+    const href = imageValueFromStyle(style)
+    const imgRect = imageContentRect(node, geo)
+    const ix = imgRect.x
+    const iy = imgRect.y
+    const iw = imgRect.w
+    const ih = imgRect.h
+    const hasLabel = nodeShowsLabel(node) && typeof node.label === 'string' && node.label.length > 0
+    // svg：百分号编码解得开、或 base64 交给浏览器；image：必须是认得出的位图 data URI。
+    // 会掉进占位分支的是**写坏的那种**：编码截断 / 空 image= —— 空白不如给个可点占位框。
+    const usable =
+      href !== null &&
+      (shape === 'image'
+        ? isRasterDataUri(href)
+        : svgMarkupFromStyle(style) !== null || href.indexOf(';base64,') > 0)
+    if (usable === false) {
+      const kids = [
+        React.createElement('rect', { key: 'hit', x: x, y: y, width: w, height: h, fill: 'transparent', stroke: 'none', pointerEvents: 'all' }),
+        React.createElement('rect', {
+          key: 'frame',
+          x: ix + 0.5,
+          y: iy + 0.5,
+          width: Math.max(1, iw - 1),
+          height: Math.max(1, ih - 1),
+          fill: 'none',
+          stroke: stroke,
+          strokeWidth: 1,
+          strokeDasharray: '3 3',
+          pointerEvents: 'none',
+        }),
+      ]
+      // 有真实标签时不画"图片/SVG"占位字，免得与标签叠字。
+      if (!hasLabel) {
+        kids.push(
+          React.createElement(
+            'text',
+            {
+              key: 'ph',
+              x: ix + iw / 2,
+              y: iy + ih / 2,
+              textAnchor: 'middle',
+              dominantBaseline: 'middle',
+              fontSize: Math.max(8, Math.min(12, ih / 4)),
+              fill: stroke,
+              pointerEvents: 'none',
+            },
+            shape === 'image' ? '图片' : 'SVG',
+          ),
+        )
+      }
+      return React.createElement('g', null, kids)
+    }
+    const fit = styleGet(style, 'imageAspect', shape === 'image' ? '1' : '0') === '1'
+    return React.createElement(
+      'g',
+      null,
+      // 透明命中框垫在下面：图形自己有透明区域时，整块节点框仍然是可点/可拖的。
+      React.createElement('rect', { x: x, y: y, width: w, height: h, fill: 'transparent', stroke: 'none', pointerEvents: 'all' }),
+      React.createElement('image', {
+        x: ix,
+        y: iy,
+        width: iw,
+        height: ih,
+        href: href,
+        // 两个都写：现代浏览器认 SVG2 的 href，老一点的 SVG 渲染器（以及某些导出工具）
+        // 只认 xlink:href。少写一个的代价是"导出的 SVG 在别处打开时图没了"。
+        xlinkHref: href,
+        preserveAspectRatio: fit ? 'xMidYMid meet' : 'none',
+        pointerEvents: 'none',
+      }),
+    )
+  }
+  if (shape === 'ellipse') {
+    return React.createElement('ellipse', Object.assign({}, common, { cx: x + w / 2, cy: y + h / 2, rx: w / 2, ry: h / 2 }))
+  }
+  if (shape === 'diamond') {
+    return React.createElement('polygon', Object.assign({}, common, { points: [x + w / 2, y, x + w, y + h / 2, x + w / 2, y + h, x, y + h / 2].join(' ') }))
+  }
+  if (shape === 'parallelogram') {
+    const s = Math.min(w * 0.2, 24)
+    return React.createElement('polygon', Object.assign({}, common, { points: [x + s, y, x + w, y, x + w - s, y + h, x, y + h].join(' ') }))
+  }
+  if (shape === 'hexagon') {
+    const s = Math.min(w * 0.15, 20)
+    return React.createElement(
+      'polygon',
+      Object.assign({}, common, { points: [x + s, y, x + w - s, y, x + w, y + h / 2, x + w - s, y + h, x + s, y + h, x, y + h / 2].join(' ') }),
+    )
+  }
+  if (shape === 'cylinder') {
+    const ry = Math.min(h * 0.18, 14)
+    return React.createElement(
+      'g',
+      null,
+      React.createElement(
+        'path',
+        Object.assign({}, common, {
+          d: ['M', fmt(x), fmt(y + ry), 'A', fmt(w / 2), fmt(ry), 0, 0, 1, fmt(x + w), fmt(y + ry), 'L', fmt(x + w), fmt(y + h - ry), 'A', fmt(w / 2), fmt(ry), 0, 0, 1, fmt(x), fmt(y + h - ry), 'Z'].join(' '),
+        }),
+      ),
+      React.createElement(
+        'path',
+        Object.assign({}, common, {
+          d: ['M', fmt(x), fmt(y + ry), 'A', fmt(w / 2), fmt(ry), 0, 0, 0, fmt(x + w), fmt(y + ry)].join(' '),
+          fill: 'none',
+        }),
+      ),
+    )
+  }
+  if (shape === 'document') {
+    const d = ['M', fmt(x), fmt(y), 'L', fmt(x + w), fmt(y), 'L', fmt(x + w), fmt(y + h * 0.82), 'C', fmt(x + w * 0.75), fmt(y + h * 1.06), fmt(x + w * 0.25), fmt(y + h * 0.58), fmt(x), fmt(y + h * 0.86), 'Z'].join(' ')
+    return React.createElement('path', Object.assign({}, common, { d: d }))
+  }
+  // 圆角：drawio 是 `rounded=1` + `arcSize`（百分比，缺省 15%）；stadium 就是 arcSize=50。
+  let rx = 0
+  if (shape === 'rounded' || shape === 'stadium') {
+    // arcSize 缺省 = 15%（drawio 的矩形圆角比例）。**不能**写成 Number(styleGet(...)) —— 缺省时
+    // 那会得到 0，于是 rounded=1 被画成直角（同一个 null→0 陷阱）。
+    const arc = styleNumber(style, 'arcSize', null)
+    rx = shape === 'stadium' ? h / 2 : Math.min(w, h) * (arc === null ? 0.15 : arc / 100)
+  }
+  return React.createElement('rect', Object.assign({}, common, { x: x, y: y, width: w, height: h, rx: rx, ry: rx }))
+}
+
+function clampNumber(value, lo, hi) {
+  if (!Number.isFinite(value)) return lo
+  if (value < lo) return lo
+  if (value > hi) return hi
+  return value
+}
+
+/**
+ * 标签**画出来**的包围盒（用户单位）—— 与 `renderDiagram` 同一套文字区、断行与行高。
+ *
+ * 为什么标签要单独算：**节点框装不下文字是常态** ——
+ *   · `whiteSpace=nowrap` 的标签**天生横向溢出**（drawio 的语义就是不换行）；
+ *   · 字号调大、或单个宽字（一个汉字就是 12px 宽）比 `labelTextWidth` 还宽；
+ *   · 独立文字（`shape=text`）没有边框底色，既不换行也**不会**自动长高。
+ * 只算节点框的话，这些字会顶在导出图外面被切掉。
+ *
+ * 竖向按**行盒**算（行数 × 行高，首行基线上下各半行）：比字形实际高度略大一点，这是有意的 ——
+ * 宁可多留几像素，也不要"以为够了、其实切了半个字"。
+ *
+ * @returns {{minX:number,minY:number,maxX:number,maxY:number}|null} 没有文字就是 null
+ */
+function labelPaintBounds(node, geo) {
+  if (!nodeShowsLabel(node)) return null
+  const label = typeof node.label === 'string' ? node.label : ''
+  if (label.length === 0) return null
+  const style = typeof node.style === 'string' ? node.style : ''
+  const fontSize = styleNumber(style, 'fontSize', FSIZE)
+  const lineHeight = labelLineHeight(fontSize)
+  const box = labelTextBox({ node: node, geo: geo, fontSize: fontSize })
+  // 与渲染同一处断行：maxWidth 就是那一个 labelTextWidth（nowrap = 一行到底）。
+  const lines = labelWraps(node) ? wrapLabel(label, box.w, fontSize) : label.split('\n')
+  let widest = 0
+  for (let i = 0; i < lines.length; i += 1) {
+    const w = textWidth(lines[i], fontSize)
+    if (w > widest) widest = w
+  }
+  // 与 renderDiagram 同一套锚点：align=left 从 box.x 起算，center/right 对称。
+  const align = box.align === 'left' || box.align === 'right' ? box.align : 'center'
+  const cx = align === 'left' ? box.x : align === 'right' ? box.x + box.w : box.x + box.w / 2
+  const first = box.y + lineHeight / 2
+  return {
+    minX: align === 'left' ? cx : align === 'right' ? cx - widest : cx - widest / 2,
+    maxX: align === 'left' ? cx + widest : align === 'right' ? cx : cx + widest / 2,
+    minY: first - lineHeight / 2,
+    maxY: first + (lines.length - 1) * lineHeight + lineHeight / 2,
+  }
+}
+
+/**
+ * 文档内容的包围盒（不含留白）：**节点框（渲染几何） ∪ 标签文字 ∪ 连线的几何**。
+ *
+ * 连线必须算进来：**独立线**（两端都是自由点）、**伸出节点外的折点**、悬空端的自由点，
+ * 都属于"内容"。只算节点框的话，导出/看图会按节点框把线裁掉（实测：画好的猫，胡须与尾巴
+ * 被切成贴着画框的两截，看图的人/AI 都会以为"线断了"），「视图 → 适应内容」也会看不全。
+ *
+ * 文字同样算进来（见 `labelPaintBounds`），节点高度用**渲染几何** `nodeBoxOf`
+ * （被多行文字撑高的那一份）而不是盘上的 `h` —— 否则多行标签的下半截就在框外。
+ *
+ * 边自己的文字位置（labelX/labelY 是**沿边相对量**）这里仍算不出来 —— 它得先有走线；
+ * 导出那一路由 `paintedBounds` 兜住：它把渲染器**这一刻真会算出来的走线**也算进去
+ * （见 `buildExportSvg`）。
+ */
+function contentBounds(doc) {
+  let minX = Infinity
+  let minY = Infinity
+  let maxX = -Infinity
+  let maxY = -Infinity
+  const hidden = hiddenLayerIds(doc)
+  const nodes = Array.isArray(doc.nodes) ? doc.nodes : []
+  for (let i = 0; i < nodes.length; i += 1) {
+    const n = nodes[i]
+    if (n === null || n === undefined || typeof n !== 'object') continue
+    // 隐藏图层里的单元**不画**：框里也就不该为它留白（否则「适应内容」会缩得很小、
+    // 导出会白留一圈 —— 与 `paintedBounds` 同一个口径）。
+    if (isHiddenCell(hidden, n)) continue
+    const geo = nodeBoxOf(n)
+    if (geo.x < minX) minX = geo.x
+    if (geo.y < minY) minY = geo.y
+    if (geo.x + geo.w > maxX) maxX = geo.x + geo.w
+    if (geo.y + geo.h > maxY) maxY = geo.y + geo.h
+    const text = labelPaintBounds(n, geo)
+    if (text !== null) {
+      if (text.minX < minX) minX = text.minX
+      if (text.minY < minY) minY = text.minY
+      if (text.maxX > maxX) maxX = text.maxX
+      if (text.maxY > maxY) maxY = text.maxY
+    }
+  }
+  const edges = Array.isArray(doc.edges) ? doc.edges : []
+  const grow = (point) => {
+    if (point === null || point === undefined || typeof point !== 'object') return
+    const px = Number(point.x)
+    const py = Number(point.y)
+    if (Number.isFinite(px) === false || Number.isFinite(py) === false) return
+    if (px < minX) minX = px
+    if (py < minY) minY = py
+    if (px > maxX) maxX = px
+    if (py > maxY) maxY = py
+  }
+  for (let i = 0; i < edges.length; i += 1) {
+    const e = edges[i]
+    if (e === null || typeof e !== 'object') continue
+    if (isHiddenCell(hidden, e)) continue
+    const points = Array.isArray(e.points) ? e.points : []
+    for (let k = 0; k < points.length; k += 1) grow(points[k])
+    grow(e.sourcePoint)
+    grow(e.targetPoint)
+  }
+  if (!Number.isFinite(minX)) return { minX: 0, minY: 0, maxX: 1, maxY: 1 }
+  return { minX: minX, minY: minY, maxX: maxX, maxY: maxY }
+}
+
+/**
+ * **这一刻真会画出来**的东西的包围盒：节点框 ∪ 节点标签 ∪ 每条边的**实际走线** ∪ 线上的文字。
+ *
+ * 与 `contentBounds` 的分工：
+ *   · `contentBounds` 便宜、只认文档（盘上的折点、自由端点），用于「适应内容」与兜底；
+ *   · 这一份把渲染器**同一批函数**跑一遍（`buildGeometry` + `routeEdgeStyled`），
+ *     于是自动路由怎么绕、线上的文字被拖到了哪儿（`labelX/labelY` 是沿边相对量，
+ *     得先有走线才算得出）都算得出来 —— 导出的框和画出来的东西**同一个口径**。
+ *
+ * 为什么不用 `getBBox()` 量 DOM：那是"另一条真相"。实测过一次教训 —— 量出来的框
+ * 变成了**当前视口**（网格纸铺满视口，比内容大得多），导出图于是白留一大圈。
+ * 几何从同一份文档算，就不存在"量到的"和"画出来的"两套口径。
+ *
+ * 隐藏图层的内容**不算**（画布不画它，导出也就不该为它留白）；算不出来（空文档）返回 null。
+ */
+function paintedBounds(doc) {
+  if (doc === null || doc === undefined || typeof doc !== 'object') return null
+  const geometry = buildGeometry(doc)
+  let minX = Infinity
+  let minY = Infinity
+  let maxX = -Infinity
+  let maxY = -Infinity
+  const put = (x, y) => {
+    const px = Number(x)
+    const py = Number(y)
+    if (Number.isFinite(px) === false || Number.isFinite(py) === false) return
+    if (px < minX) minX = px
+    if (py < minY) minY = py
+    if (px > maxX) maxX = px
+    if (py > maxY) maxY = py
+  }
+  // 两种盒子形状别混：`labelPaintBounds` 给 minX/maxX/minY/maxY，`labelBox` 给 x/y/w/h。
+  const putBounds = (box) => {
+    if (box === null || box === undefined) return
+    put(box.minX, box.minY)
+    put(box.maxX, box.maxY)
+  }
+  const putRect = (rect) => {
+    if (rect === null || rect === undefined) return
+    put(rect.x, rect.y)
+    put(rect.x + rect.w, rect.y + rect.h)
+  }
+  for (let i = 0; i < geometry.boxes.length; i += 1) {
+    const box = geometry.boxes[i]
+    put(box.geo.x, box.geo.y)
+    put(box.geo.x + box.geo.w, box.geo.y + box.geo.h)
+    putBounds(labelPaintBounds(box.node, box.geo))
+  }
+  const hidden = hiddenLayerIds(doc)
+  const edges = Array.isArray(doc.edges) ? doc.edges : []
+  for (let i = 0; i < edges.length; i += 1) {
+    const edge = edges[i]
+    if (edge === null || edge === undefined || typeof edge !== 'object') continue
+    if (isHiddenCell(hidden, edge)) continue
+    const from = endpointBoxOf(geometry.byId, edge, 'source')
+    const to = endpointBoxOf(geometry.byId, edge, 'target')
+    if (from === null || to === null) continue
+    const pts = routeEdgeStyled(from, to, geometry.boxes, geometry.bounds, edge, undefined)
+    if (Array.isArray(pts) === false || pts.length === 0) continue
+    for (let k = 0; k < pts.length; k += 1) put(pts[k].x, pts[k].y)
+    // 线上的文字：位置与渲染**同一套**（edgeLabelPosition + labelBox），字号也取同一个缺省。
+    const edgeStyle = typeof edge.style === 'string' ? edge.style : ''
+    if (typeof edge.label === 'string' && edge.label.length > 0) {
+      const at = edgeLabelPosition(pts, edge)
+      const pos = at === null ? { x: pts[0].x, y: pts[0].y } : at
+      putRect(labelBox(pos, edge.label, styleNumber(edgeStyle, 'fontSize', 10)))
+    }
+    // drawio 的独立边标签单元（画布只读显示，但导出会画出来）。
+    const attached = Array.isArray(doc.labels) ? doc.labels : []
+    for (let L = 0; L < attached.length; L += 1) {
+      const item = attached[L]
+      if (item === null || item === undefined || item.edgeId !== edge.id) continue
+      const text = typeof item.text === 'string' ? item.text : ''
+      if (text.length === 0) continue
+      const pos = edgeLabelPointAt(pts, item.x, item.y, item.offsetX, item.offsetY)
+      if (pos === null) continue
+      putRect(labelBox(pos, text, styleNumber(item.style, 'fontSize', 10)))
+    }
+  }
+  if (Number.isFinite(minX) === false || Number.isFinite(minY) === false) return null
+  return { minX: minX, minY: minY, maxX: maxX, maxY: maxY }
+}
+
+/**
+ * 把内容装进一个宽高比等于容器的视口。
+ *
+ * 宽高比必须一致：SVG 的 preserveAspectRatio 默认是 meet，视口比例与容器不符时会被
+ * letterbox（画面留黑边，指针坐标也跟着偏）。所以先按宽度试，装不下再按高度试。
+ */
+function computeFitView(bounds, aspect) {
+  const pad = 40
+  const cw = Math.max(1, bounds.maxX - bounds.minX)
+  const ch = Math.max(1, bounds.maxY - bounds.minY)
+  // 空画布：没有任何节点 → 外接框是 1×1 的退化值，按它算出来的视口只有几十单位宽，
+  // 于是状态栏显示"缩放 185%"这种荒唐数字（实测过），而且一点滚轮就飞出可视区。
+  // 空画布给一个固定的、合理的初始视口（约 900×900 用户单位，大致等于一屏）。
+  if (cw <= 1 && ch <= 1) return { x: -450, y: -450, w: 900, h: 900 * aspect }
+  let w = cw + pad * 2
+  let h = w * aspect
+  if (h < ch + pad * 2) {
+    h = ch + pad * 2
+    w = h / aspect
+  }
+  const cx = bounds.minX + cw / 2
+  const cy = bounds.minY + ch / 2
+  // 一并把高返回：调用方不必再拿 w * aspect 推一遍 ——
+  // "视野矩形"只在这一处算出来，居中才永远是同一个中心。
+  return { x: cx - w / 2, y: cy - h / 2, w: w, h: h }
+}
+
+/** 视口宽度范围（用户单位）：太小看不见，太大没意义。 */
+const VIEW_MIN_W = 80
+const VIEW_MAX_W = 40000
+
+/**
+ * 字号档位（菜单里可点的那几个；「默认」不在表里，它等于删掉 fontSize 键）。
+ * 落盘是 drawio 的 `fontSize`，所以档位只是 UI 的便利值，不限制用户/AI 写别的数。
+ */
+const FONT_SIZE_PRESETS = [10, 12, 14, 18, 24]
+
+/** 手动输入字号的允许范围（档位之外的任意整数都行，但太小/太大没有意义）。 */
+const FONT_SIZE_MIN = 8
+const FONT_SIZE_MAX = 72
+
+/**
+ * 手工输入的字号 → 可用的整数；认不出或超范围就夹到边界；空/非法返回 null（调用方忽略）。
+ *
+ * 纯函数：命令行自测能直接断言"输入 0 会变成 8、输入 999 会变成 72、输入 abc 直接忽略"，
+ * 而不是只在浏览器里试。小数四舍五入到整数（drawio 的字号是整数）。
+ */
+function clampFontSize(value) {
+  if (value === null || value === undefined) return null
+  const text = String(value).trim()
+  if (text.length === 0) return null
+  const n = Number(text)
+  if (!Number.isFinite(n)) return null
+  return Math.min(FONT_SIZE_MAX, Math.max(FONT_SIZE_MIN, Math.round(n)))
+}
+
+/** 元素库：draw.io 那套形状词汇的可用子集。分区是飞书式可插入区块，不是"编辑→成组"。 */
+const SHAPE_LIBRARY = [
+  { shape: 'rect', label: '矩形' },
+  { shape: 'rounded', label: '圆角矩形' },
+  { shape: 'text', label: '文字' },
+  { shape: 'section', label: '分区' },
+  { shape: 'stadium', label: '胶囊 / 起止' },
+  { shape: 'ellipse', label: '椭圆' },
+  { shape: 'diamond', label: '判定' },
+  { shape: 'parallelogram', label: '数据' },
+  { shape: 'cylinder', label: '数据库' },
+  { shape: 'document', label: '文档' },
+  { shape: 'hexagon', label: '六边形' },
+  // 内容是一段**内嵌 SVG 标记**的节点（不是标签文字）：图标/logo/示意图这类
+  // 流程图词汇表里没有的东西用它画。落盘是 drawio 原生的图片形状，桌面版也看得见。
+  { shape: 'svg', label: 'SVG 图形' },
+  // 内嵌位图（png/jpeg/gif/webp）：复制粘贴 / 拖放进画布；落盘同样是 shape=image + data URI。
+  { shape: 'image', label: '图片' },
+  // 视频播放器：海报落盘为 svg image；帧/源片在旁路 *.media/<clip>/。
+  { shape: 'video', label: '视频' },
+]
+
+/**
+ * 形状族：飞书侧栏"悬停/选中后只换同类型"。
+ * 基础图形（矩形/圆角/菱形…）互相对换，算一族；文字 / 分区 / SVG / 图片 / 线条各自成族。
+ * 注意：线条的 kind（rounded/sharp…）与节点 shape 名会撞车，线条族只用 EDGE_LINE_LIBRARY，
+ * 不要靠 shapeFamilyOf('rounded') 判断（那永远是图形族）。
+ */
+function shapeFamilyOf(shape) {
+  if (shape === 'text') return 'text'
+  if (shape === 'section' || shape === 'swimlane') return 'section'
+  if (shape === 'svg') return 'svg'
+  if (shape === 'image') return 'image'
+  if (shape === 'video') return 'video'
+  return 'shape'
+}
+
+/** 外链图片虽然按矩形占位显示，也不能作为基础图形换形。 */
+function isBasicShapeStyle(style) {
+  return shapeFamilyOf(nodeShapeFromStyle(style)) === 'shape' &&
+    imageValueFromStyle(style) === null && styleGet(style, 'shape', null) !== 'image'
+}
+
+function shapesInFamily(family) {
+  if (family === 'edge') {
+    const out = []
+    for (let i = 0; i < EDGE_LINE_LIBRARY.length; i += 1) {
+      out.push({ shape: EDGE_LINE_LIBRARY[i].kind, label: EDGE_LINE_LIBRARY[i].label })
+    }
+    return out
+  }
+  const out = []
+  for (let i = 0; i < SHAPE_LIBRARY.length; i += 1) {
+    if (shapeFamilyOf(SHAPE_LIBRARY[i].shape) === family) out.push(SHAPE_LIBRARY[i])
+  }
+  return out
+}
+
+function shapeLabelOf(shape) {
+  for (let i = 0; i < SHAPE_LIBRARY.length; i += 1) {
+    if (SHAPE_LIBRARY[i].shape === shape) return SHAPE_LIBRARY[i].label
+  }
+  return String(shape)
+}
+
+/**
+ * 线条族的四种线型（与内核 styleWithLineKind 的 kind 对齐）。
+ * 落成独立线时两端都不接节点；选中已有连线时换这一族 = 改线型。
+ */
+const EDGE_LINE_LIBRARY = [
+  { kind: 'rounded', label: '折线' },
+  { kind: 'sharp', label: '直角折线' },
+  { kind: 'straight', label: '直线' },
+  { kind: 'curved', label: '曲线' },
+]
+
+function isEdgeLineKind(kind) {
+  for (let i = 0; i < EDGE_LINE_LIBRARY.length; i += 1) {
+    if (EDGE_LINE_LIBRARY[i].kind === kind) return true
+  }
+  return false
+}
+
+function edgeLineLabelOf(kind) {
+  for (let i = 0; i < EDGE_LINE_LIBRARY.length; i += 1) {
+    if (EDGE_LINE_LIBRARY[i].kind === kind) return EDGE_LINE_LIBRARY[i].label
+  }
+  return String(kind)
+}
+
+/**
+ * 右侧元素条只放**族入口**（图形 / 文字 / 分区 / SVG / 图片 / 线条），同族变体进侧面板。
+ * `shape` 是该族落下时的缺省子形状（线条族里是缺省线型）；`icon` 见 railIcon。
+ */
+const RAIL_FAMILIES = [
+  { family: 'shape', shape: 'rounded', label: '图形', icon: 'shape' },
+  { family: 'text', shape: 'text', label: '文字', icon: 'text' },
+  { family: 'section', shape: 'section', label: '分区', icon: 'section' },
+  { family: 'svg', shape: 'svg', label: 'SVG 图形', icon: 'image' },
+  { family: 'image', shape: 'image', label: '图片', icon: 'photo' },
+  { family: 'video', shape: 'video', label: '视频', icon: 'video' },
+  { family: 'edge', shape: 'rounded', label: '线条', icon: 'edge' },
+]
+
+/**
+ * 元素条线稿图标（描边 currentColor，与飞书侧栏同一套观感）。
+ * @param {'shape'|'text'|'section'|'image'|'photo'|'edge'|'line-rounded'|'line-sharp'|'line-straight'|'line-curved'} kind
+ */
+function railIcon(kind) {
+  const svg = (children) =>
+    React.createElement(
+      'svg',
+      {
+        width: 22,
+        height: 22,
+        viewBox: '0 0 24 24',
+        fill: 'none',
+        stroke: 'currentColor',
+        strokeWidth: 1.75,
+        strokeLinecap: 'round',
+        strokeLinejoin: 'round',
+        'aria-hidden': true,
+      },
+      children,
+    )
+  if (kind === 'shape') {
+    return svg(React.createElement('rect', { x: 4, y: 6, width: 16, height: 12, rx: 3 }))
+  }
+  if (kind === 'text') {
+    return svg(React.createElement('path', { d: 'M6 6.5h12M12 6.5V18' }))
+  }
+  if (kind === 'tasks') {
+    return svg([
+      React.createElement('path', { key: 'checks', d: 'M3 6l1 1 2-2M3 12l1 1 2-2M3 18l1 1 2-2' }),
+      React.createElement('path', { key: 'rows', d: 'M10 6h11M10 12h11M10 18h11' }),
+    ])
+  }
+  if (kind === 'section') {
+    // 叠框：分区 / 容器（对应飞书侧栏的重叠矩形）。
+    return svg([
+      React.createElement('rect', { key: 'a', x: 3.5, y: 4.5, width: 12, height: 10, rx: 1.5 }),
+      React.createElement('rect', { key: 'b', x: 8.5, y: 9.5, width: 12, height: 10, rx: 1.5 }),
+    ])
+  }
+  if (kind === 'image') {
+    // SVG 图形族：矢量笔迹 + 锚点（别做成风景相框，免得和「图片」撞车）。
+    return svg([
+      React.createElement('path', { key: 'p', d: 'M5 16.5C8 10 11 7.5 14.5 7.5c2.2 0 4 .8 5.5 2.2' }),
+      React.createElement('circle', { key: 'a', cx: 5, cy: 16.5, r: 1.5 }),
+      React.createElement('circle', { key: 'b', cx: 14.5, cy: 7.5, r: 1.5 }),
+      React.createElement('path', { key: 'pen', d: 'M16.2 4.2l3.6 3.6-1.1 1.1-3.6-3.6z' }),
+    ])
+  }
+  if (kind === 'photo') {
+    // 位图/粘贴图片：相框 + 山峦（侧栏「图片」入口）。
+    return svg([
+      React.createElement('rect', { key: 'f', x: 4, y: 4, width: 16, height: 16, rx: 2 }),
+      React.createElement('circle', { key: 's', cx: 9.5, cy: 9, r: 1.6 }),
+      React.createElement('path', { key: 'm', d: 'M5 17l4.5-5 3 3.5 2-2.5L19 17' }),
+    ])
+  }
+  if (kind === 'video') {
+    // 视频：圆角屏 + 播放三角。
+    return svg([
+      React.createElement('rect', { key: 'f', x: 3, y: 6, width: 18, height: 12, rx: 2 }),
+      React.createElement('path', { key: 'p', d: 'M10 9.5 L10 14.5 L15 12 Z', fill: 'currentColor', stroke: 'none' }),
+    ])
+  }
+  if (kind === 'edge') {
+    // 线条族入口：对齐参考图的直角折线 + 开叉箭头。
+    return svg([
+      React.createElement('path', { key: 'p', d: 'M3.5 16.5 H9.5 V7.5 H16' }),
+      React.createElement('path', { key: 'a', d: 'M13.2 5.2 L17.2 7.5 L13.2 9.8' }),
+    ])
+  }
+  return svg(React.createElement('circle', { cx: 12, cy: 12, r: 6 }))
+}
+
+/**
+ * 线条族气泡里的线型缩略图（44×30 视口）。
+ * 画法对齐参考图：等宽描边、开叉 V 箭头（不是实心三角）。
+ */
+function railLineKindIcon(kind) {
+  const common = {
+    fill: 'none',
+    stroke: 'currentColor',
+    strokeWidth: 1.75,
+    strokeLinecap: 'round',
+    strokeLinejoin: 'round',
+  }
+  // 开叉箭头朝右（尖在 tip）。
+  const arrowRight = (tipX, tipY) =>
+    React.createElement('path', Object.assign({ key: 'a' }, common, {
+      d: 'M' + (tipX - 5) + ' ' + (tipY - 3.2) + ' L' + tipX + ' ' + tipY + ' L' + (tipX - 5) + ' ' + (tipY + 3.2),
+    }))
+  // 开叉箭头朝右上（直线用）。
+  const arrowNE = (tipX, tipY) =>
+    React.createElement('path', Object.assign({ key: 'a' }, common, {
+      d: 'M' + (tipX - 5.2) + ' ' + (tipY + 1) + ' L' + tipX + ' ' + tipY + ' L' + (tipX - 1) + ' ' + (tipY + 5.2),
+    }))
+  if (kind === 'straight') {
+    // 参考图上：左下 → 右上对角线 + 箭头
+    return [
+      React.createElement('path', Object.assign({ key: 'p' }, common, { d: 'M7 24 L33.5 10.5' })),
+      arrowNE(36, 9),
+    ]
+  }
+  if (kind === 'sharp') {
+    // 参考图中：右 → 上 → 右，直角折 + 箭头
+    return [
+      React.createElement('path', Object.assign({ key: 'p' }, common, { d: 'M5 21 H15 V10 H32' })),
+      arrowRight(36, 10),
+    ]
+  }
+  if (kind === 'curved') {
+    // 参考图下：上走再平滑拐到右 + 箭头
+    return [
+      React.createElement('path', Object.assign({ key: 'p' }, common, { d: 'M11 25 V15 Q11 10 16 10 H32' })),
+      arrowRight(36, 10),
+    ]
+  }
+  // rounded / 折线：正交折线，拐角更圆（与直角折线区分）
+  return [
+    React.createElement('path', Object.assign({ key: 'p' }, common, { d: 'M5 21 H13 Q18 21 18 16 V13 Q18 10 23 10 H32' })),
+    arrowRight(36, 10),
+  ]
+}
+
+function defaultShapeOfFamily(family, preferred) {
+  const pref = typeof preferred === 'string' ? preferred : ''
+  if (pref.length > 0 && shapeFamilyOf(pref) === family) return pref
+  for (let i = 0; i < RAIL_FAMILIES.length; i += 1) {
+    if (RAIL_FAMILIES[i].family === family) return RAIL_FAMILIES[i].shape
+  }
+  return 'rounded'
+}
+
+function familyLabelOf(family) {
+  for (let i = 0; i < RAIL_FAMILIES.length; i += 1) {
+    if (RAIL_FAMILIES[i].family === family) return RAIL_FAMILIES[i].label
+  }
+  return String(family)
+}
+
+/** 新放的 SVG 节点边长（正方形：图形多半是方的）。 */
+const NEW_SVG_SIZE = 80
+/** 粘贴/拖入位图时，较长边最多压到这么大（用户单位）；再大拖动手感差、文件也胖。 */
+const IMAGE_PASTE_MAX_SIDE = 480
+/** 单张粘贴图片的体积上限（原始字节）；超了就拒，避免一次 Ctrl+V 把 .drawio 撑爆。 */
+const IMAGE_PASTE_MAX_BYTES = 8 * 1024 * 1024
+
+/**
+ * 按原图比例缩到 IMAGE_PASTE_MAX_SIDE 以内，再吸到网格。
+ * 纯函数：粘贴 / 拖入 / 侧栏选文件三处共用，尺寸口径一致。
+ * （定义在常量之后：依赖 NEW_SVG_SIZE / IMAGE_PASTE_MAX_SIDE；MIN_NODE_* 在下方，
+ *  调用时才读 —— 函数体延迟求值，不踩 TDZ。）
+ */
+function fitImageNodeSize(naturalW, naturalH, maxSide) {
+  const cap = Number.isFinite(Number(maxSide)) && Number(maxSide) > 0 ? Number(maxSide) : IMAGE_PASTE_MAX_SIDE
+  const nw = Number.isFinite(Number(naturalW)) && Number(naturalW) > 0 ? Number(naturalW) : NEW_SVG_SIZE
+  const nh = Number.isFinite(Number(naturalH)) && Number(naturalH) > 0 ? Number(naturalH) : NEW_SVG_SIZE
+  const scale = Math.min(1, cap / Math.max(nw, nh))
+  const minW = typeof MIN_NODE_W === 'number' ? MIN_NODE_W : GRID * 6
+  const minH = typeof MIN_NODE_H === 'number' ? MIN_NODE_H : GRID * 4
+  const w = Math.max(minW, Math.round(nw * scale))
+  const h = Math.max(minH, Math.round(nh * scale))
+  return { w: snapTo(w, GRID), h: snapTo(h, GRID) }
+}
+
+/** 新放的分区默认尺寸（要能一眼看出是区块，而不是普通小节点）。 */
+const NEW_SECTION_W = 280
+const NEW_SECTION_H = 180
+
+/**
+ * 点「SVG 图形」时，一个**还没有内容**的节点该画什么 —— 给一张现成的占位图。
+ *
+ * 为什么要给：svg 节点的内容是"文档里那段标记"，形状本身决定不了画什么。
+ * 不给的话用户拿到的是一个看不见的空框（点了形状却什么都没出现，像是坏了）。
+ * 这张图刻意画成"一张照片"的样子：一眼能看出"这里是个图形，双击/右键可以换内容"。
+ */
+const DEFAULT_SVG_MARKUP =
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">' +
+  '<rect x="6" y="16" width="84" height="64" rx="8" fill="#dae8fc" stroke="#6c8ebf" stroke-width="4"/>' +
+  '<circle cx="31" cy="38" r="8" fill="#f8cecc" stroke="#b85450" stroke-width="3"/>' +
+  '<path d="M12 72 L36 48 L52 64 L66 50 L84 72 Z" fill="#d5e8d4" stroke="#82b366" stroke-width="4" stroke-linejoin="round"/>' +
+  '</svg>'
+
+/**
+ * 换形状时用的样式（右键里的形状格、与「改成某个形状」共用）。
+ *
+ * svg 是唯一一个"形状决定不了内容"的形状：手上没有内容就先塞一张占位图，
+ * 否则换过去只会得到一个空框。
+ */
+function styleForShapePick(style, shape) {
+  const next = styleWithNodeShape(style, shape)
+  if (shape === 'svg' && svgMarkupFromStyle(next) === null) return styleWithSvgMarkup(next, DEFAULT_SVG_MARKUP)
+  return next
+}
+
+// 调色板（8 个经典色）由样式内核的 PALETTE 提供，见文件顶部从 styleKernel 的解构 ——
+// 这里不再留第二份"颜色名 → 十六进制"的表，否则两边迟早会漂移。
+
+/**
+ * 菜单里"当前值"要用到的几个中文名。与选项行用的是**同一份表**（下面那些 row 也读它），
+ * 所以"当前值显示什么"和"下拉里有什么"不会各说一套。
+ */
+const PALETTE_LABELS = { plain: '默认', blue: '蓝', green: '绿', orange: '橙', yellow: '黄', red: '红', purple: '紫', grey: '灰' }
+const LINE_KIND_LABELS = { straight: '直线', sharp: '直角折线', rounded: '圆角折线', curved: '曲线' }
+const DASH_LABELS = { solid: '实线', dashed: '虚线', dotted: '点线' }
+const ARROW_LABELS = { end: '→ 单向', both: '↔ 双向', none: '— 无箭头', start: '← 反向' }
+
+/**
+ * 右键菜单里每一类的**当前值**文字。
+ *
+ * 菜单不再把每一类的全部选项铺出来（形状 10 个缩略图 + 配色 8 个色块 + 字号 6 个 +
+ * 线型 4 个 + 样式 3 个 + 箭头 4 个 —— 一屏全是按钮），改成"一类一行、只显示当前值 ▾"，
+ * 点开才铺选项。这里只负责算那行文字：纯函数，能被命令行自测直接断言。
+ *
+ * @param {string} style 节点的或连线的 style 串
+ * @param {string} kind 'shape' | 'color' | 'fontSize' | 'line' | 'dash' | 'arrow'
+ */
+function styleSummary(style, kind) {
+  const s = typeof style === 'string' ? style : ''
+  if (kind === 'shape') {
+    const shape = nodeShapeFromStyle(s)
+    for (let i = 0; i < SHAPE_LIBRARY.length; i += 1) if (SHAPE_LIBRARY[i].shape === shape) return SHAPE_LIBRARY[i].label
+    return shape
+  }
+  if (kind === 'color') {
+    // 独立文字没有填充/描边：它的"配色"就是字色（见 styleWithTextColorName）。
+    const isText = nodeShapeFromStyle(s) === 'text'
+    const name = isText ? textColorNameFromStyle(s) : colorNameFromStyle(s)
+    if (name !== null) return PALETTE_LABELS[name] === undefined ? name : PALETTE_LABELS[name]
+    // 认不出的颜色（drawio 文件里本来就只有十六进制）：把那个值原样给人看，别显示"未知"。
+    const hex = isText ? styleGet(s, 'fontColor', null) : styleGet(s, 'fillColor', null) !== null ? styleGet(s, 'fillColor', null) : styleGet(s, 'strokeColor', null)
+    return hex === null ? '默认' : String(hex)
+  }
+  if (kind === 'fontColor') {
+    // 字色：命中调色板给中文名，认不出的十六进制把那个值给人看（drawio 文件里本来就只有十六进制）。
+    const name = textColorNameFromStyle(s)
+    if (name !== null) return PALETTE_LABELS[name] === undefined ? name : PALETTE_LABELS[name]
+    const hex = styleGet(s, 'fontColor', null)
+    return hex === null ? '默认' : String(hex)
+  }
+  if (kind === 'fontSize') {
+    const n = styleNumber(s, 'fontSize', null)
+    return n === null ? '默认' : String(n)
+  }
+  if (kind === 'line') return LINE_KIND_LABELS[lineKindFromStyle(s)]
+  if (kind === 'dash') return DASH_LABELS[dashFromStyle(s)]
+  if (kind === 'arrow') return ARROW_LABELS[arrowFromStyle(s)]
+  return ''
+}
+
+/**
+ * 从节点集合算出 box / 索引 / 包围盒。渲染与命中都走它，避免两处算法漂移。
+ *
+ * **隐藏图层的节点不进来** —— 这里是"什么可见"的唯一咽喉：渲染、命中（`hitNodeAt`）、
+ * 框选、路由障碍全都读它，于是"隐藏一层"在这些地方自动一致（不会出现
+ * "看不见却能点到/线还绕着它走"）。
+ *
+ * 高度走 `nodeBoxOf`：**文字多的节点在这一层就被撑高**。放在这里而不是只在渲染里加高，
+ * 是因为渲染、命中、连线落点、框选读的都是这一份几何 —— 只改渲染会出现
+ * "线接在文字溢出前的旧边框上"，那正是要修掉的不一致。
+ */
+function buildGeometry(doc) {
+  const hidden = hiddenLayerIds(doc)
+  const boxes = []
+  const byId = {}
+  let minX = Infinity
+  let minY = Infinity
+  let maxX = -Infinity
+  let maxY = -Infinity
+  for (let i = 0; i < doc.nodes.length; i += 1) {
+    const n = doc.nodes[i]
+    if (isHiddenCell(hidden, n)) continue
+    const geo = nodeBoxOf(n)
+    const box = { id: n.id, node: n, geo: geo, label: nodeShowsLabel(n) && typeof n.label === 'string' ? n.label : nodeShowsLabel(n) ? n.id : '', storedH: geo.stored }
+    boxes.push(box)
+    byId[n.id] = box
+    if (geo.x < minX) minX = geo.x
+    if (geo.y < minY) minY = geo.y
+    if (geo.x + geo.w > maxX) maxX = geo.x + geo.w
+    if (geo.y + geo.h > maxY) maxY = geo.y + geo.h
+  }
+  if (!Number.isFinite(minX)) return { boxes: boxes, byId: byId, bounds: { minX: 0, minY: 0, maxX: 1, maxY: 1 } }
+  return { boxes: boxes, byId: byId, bounds: { minX: minX, minY: minY, maxX: maxX, maxY: maxY } }
+}
+
+/**
+ * 隐藏的图层 id 集合：**渲染、命中、框选、对齐候选**都拿它判断"这一层现在看不见"。
+ *
+ * 隐藏是**文档里的属性**（drawio 就写在图层单元上：`visible="0"`），不是客户端本地开关 ——
+ * 于是它会被保存、能被 drawio 看见、也进撤销历史。这里只把它翻成便于查的集合。
+ */
+function hiddenLayerIds(doc) {
+  const set = new Set()
+  const layers = doc === null || doc === undefined || Array.isArray(doc.layers) === false ? [] : doc.layers
+  for (let i = 0; i < layers.length; i += 1) {
+    const layer = layers[i]
+    if (layer !== null && layer !== undefined && typeof layer.id === 'string' && layer.visible === false) set.add(layer.id)
+  }
+  return set
+}
+
+/** 这个单元属于的层是不是隐藏的（没有层信息 = 可见）。 */
+function isHiddenCell(hidden, cell) {
+  return cell !== null && cell !== undefined && typeof cell.layer === 'string' && hidden.has(cell.layer)
+}
+
+/**
+ * 锁定的图层 id 集合。
+ *
+ * 锁定 ≠ 隐藏：锁定层**仍然画出来**（也参与避让），但命中/拖动/删除/改样式都跳过。
+ * 与隐藏一样写在文档的图层单元上（`locked="1"`），会进撤销历史。
+ */
+function lockedLayerIds(doc) {
+  const set = new Set()
+  const layers = doc === null || doc === undefined || Array.isArray(doc.layers) === false ? [] : doc.layers
+  for (let i = 0; i < layers.length; i += 1) {
+    const layer = layers[i]
+    if (layer !== null && layer !== undefined && typeof layer.id === 'string' && layer.locked === true) set.add(layer.id)
+  }
+  return set
+}
+
+/** 这个单元属于的层是不是锁定的（没有层信息 = 未锁定）。 */
+function isLockedCell(locked, cell) {
+  return cell !== null && cell !== undefined && typeof cell.layer === 'string' && locked.has(cell.layer)
+}
+
+/**
+ * 从一组 id 里剔掉锁定层上的单元（以及文档里已经不存在的）。
+ * 选区拖动 / 删除 / 微移 / 改样式都走它，避免误改锁住的东西。
+ */
+function filterEditableIds(doc, ids) {
+  const out = []
+  if (doc === null || doc === undefined || Array.isArray(ids) === false) return out
+  const locked = lockedLayerIds(doc)
+  const nodes = Array.isArray(doc.nodes) ? doc.nodes : []
+  const edges = Array.isArray(doc.edges) ? doc.edges : []
+  for (let i = 0; i < ids.length; i += 1) {
+    const id = ids[i]
+    let cell = null
+    for (let n = 0; n < nodes.length; n += 1) if (nodes[n].id === id) { cell = nodes[n]; break }
+    if (cell === null) {
+      for (let e = 0; e < edges.length; e += 1) if (edges[e].id === id) { cell = edges[e]; break }
+    }
+    if (cell === null) continue
+    if (isLockedCell(locked, cell)) continue
+    out.push(id)
+  }
+  return out
+}
+
+/** 图层是否锁定（按 id；找不到 = 未锁定）。 */
+function layerIsLocked(doc, layerId) {
+  const layers = doc === null || doc === undefined || Array.isArray(doc.layers) === false ? [] : doc.layers
+  for (let i = 0; i < layers.length; i += 1) {
+    if (layers[i] !== null && layers[i] !== undefined && layers[i].id === layerId) return layers[i].locked === true
+  }
+  return false
+}
+
+/** 就地改层名（空串允许 —— 与 drawio 一致，显示时走「第 N 层」兜底）。 */
+function renameLayerInDoc(doc, layerId, name) {
+  if (doc === null || Array.isArray(doc.layers) === false) return false
+  const text = typeof name === 'string' ? name : ''
+  for (let i = 0; i < doc.layers.length; i += 1) {
+    if (doc.layers[i] === null || doc.layers[i] === undefined || doc.layers[i].id !== layerId) continue
+    doc.layers[i].name = text
+    return true
+  }
+  return false
+}
+
+/** 就地切换 / 设置锁定。 */
+function setLayerLockedInDoc(doc, layerId, locked) {
+  if (doc === null || Array.isArray(doc.layers) === false) return false
+  for (let i = 0; i < doc.layers.length; i += 1) {
+    if (doc.layers[i] === null || doc.layers[i] === undefined || doc.layers[i].id !== layerId) continue
+    doc.layers[i].locked = locked === true
+    return true
+  }
+  return false
+}
+
+/**
+ * 删除一层：层内单元**合并到下一层**（删的是最后一层则并到上一层）。
+ * 不许删最后一层（文件里必须有能挂单元的层）。
+ *
+ * @returns {{ ok:true, mergeInto:string } | { ok:false, error:string }}
+ */
+function deleteLayerInDoc(doc, layerId) {
+  if (doc === null || Array.isArray(doc.layers) === false) return { ok: false, error: '没有图层表' }
+  if (doc.layers.length <= 1) return { ok: false, error: '不能删除最后一层' }
+  let idx = -1
+  for (let i = 0; i < doc.layers.length; i += 1) {
+    if (doc.layers[i] !== null && doc.layers[i] !== undefined && doc.layers[i].id === layerId) {
+      idx = i
+      break
+    }
+  }
+  if (idx < 0) return { ok: false, error: '找不到层 ' + layerId }
+  const mergeInto =
+    idx < doc.layers.length - 1
+      ? doc.layers[idx + 1].id
+      : doc.layers[idx - 1].id
+  const nodes = Array.isArray(doc.nodes) ? doc.nodes : []
+  for (let i = 0; i < nodes.length; i += 1) {
+    if (nodes[i].layer === layerId) nodes[i].layer = mergeInto
+  }
+  const edges = Array.isArray(doc.edges) ? doc.edges : []
+  for (let i = 0; i < edges.length; i += 1) {
+    if (edges[i].layer === layerId) edges[i].layer = mergeInto
+  }
+  const labels = Array.isArray(doc.labels) ? doc.labels : []
+  for (let i = 0; i < labels.length; i += 1) {
+    if (labels[i].layer === layerId) labels[i].layer = mergeInto
+  }
+  doc.layers.splice(idx, 1)
+  return { ok: true, mergeInto: mergeInto }
+}
+
+/** 把一组单元移到指定层（只改 layer 字段；写回时 mxfile 会改 parent）。 */
+function moveCellsToLayerInDoc(doc, ids, layerId) {
+  if (doc === null || Array.isArray(ids) === false || typeof layerId !== 'string') return 0
+  let layersOk = false
+  const layers = Array.isArray(doc.layers) ? doc.layers : []
+  for (let i = 0; i < layers.length; i += 1) {
+    if (layers[i] !== null && layers[i] !== undefined && layers[i].id === layerId) {
+      layersOk = true
+      break
+    }
+  }
+  if (layersOk === false) return 0
+  const set = new Set(ids)
+  let count = 0
+  const nodes = Array.isArray(doc.nodes) ? doc.nodes : []
+  for (let i = 0; i < nodes.length; i += 1) {
+    if (set.has(nodes[i].id) === false) continue
+    if (nodes[i].layer === layerId) continue
+    nodes[i].layer = layerId
+    count += 1
+  }
+  const edges = Array.isArray(doc.edges) ? doc.edges : []
+  for (let i = 0; i < edges.length; i += 1) {
+    if (set.has(edges[i].id) === false) continue
+    if (edges[i].layer === layerId) continue
+    edges[i].layer = layerId
+    count += 1
+  }
+  return count
+}
+
+/**
+ * 方向键微移：节点整体平移；连线的折点与自由端点跟同一个位移
+ * （与选区拖动同一套几何语义）。跳过锁定层上的单元。
+ *
+ * @returns 实际被挪动的 id 数
+ */
+function nudgeSelectionInDoc(doc, ids, dx, dy) {
+  if (doc === null || !Number.isFinite(dx) || !Number.isFinite(dy) || (dx === 0 && dy === 0)) return 0
+  const editable = filterEditableIds(doc, ids)
+  if (editable.length === 0) return 0
+  const idSet = new Set(editable)
+  let count = 0
+  const nodes = Array.isArray(doc.nodes) ? doc.nodes : []
+  for (let i = 0; i < nodes.length; i += 1) {
+    const n = nodes[i]
+    if (idSet.has(n.id) === false) continue
+    n.x = numberOr(n.x, 0) + dx
+    n.y = numberOr(n.y, 0) + dy
+    count += 1
+  }
+  const edges = Array.isArray(doc.edges) ? doc.edges : []
+  for (let i = 0; i < edges.length; i += 1) {
+    const e = edges[i]
+    if (idSet.has(e.id) === false) continue
+    let touched = false
+    if (Array.isArray(e.points)) {
+      for (let p = 0; p < e.points.length; p += 1) {
+        e.points[p] = { x: e.points[p].x + dx, y: e.points[p].y + dy }
+      }
+      touched = e.points.length > 0
+    }
+    if (e.sourcePoint !== undefined && e.sourcePoint !== null) {
+      e.sourcePoint = { x: e.sourcePoint.x + dx, y: e.sourcePoint.y + dy }
+      touched = true
+    }
+    if (e.targetPoint !== undefined && e.targetPoint !== null) {
+      e.targetPoint = { x: e.targetPoint.x + dx, y: e.targetPoint.y + dy }
+      touched = true
+    }
+    if (touched) count += 1
+  }
+  return count
+}
+
+/**
+ * 按标签 / id 子串查找节点与连线（隐藏层也搜，锁定层也能跳过去看）。
+ * @returns {{ id:string, kind:'node'|'edge', label:string }[]}
+ */
+function findInDoc(doc, query) {
+  const out = []
+  if (doc === null || doc === undefined) return out
+  const q = String(query === undefined || query === null ? '' : query).trim().toLowerCase()
+  if (q.length === 0) return out
+  const nodes = Array.isArray(doc.nodes) ? doc.nodes : []
+  for (let i = 0; i < nodes.length; i += 1) {
+    const n = nodes[i]
+    const label = typeof n.label === 'string' ? n.label : ''
+    const id = String(n.id)
+    if (label.toLowerCase().indexOf(q) >= 0 || id.toLowerCase().indexOf(q) >= 0) {
+      out.push({ id: id, kind: 'node', label: label })
+    }
+  }
+  const edges = Array.isArray(doc.edges) ? doc.edges : []
+  for (let i = 0; i < edges.length; i += 1) {
+    const e = edges[i]
+    const label = typeof e.label === 'string' ? e.label : ''
+    const id = String(e.id)
+    if (label.toLowerCase().indexOf(q) >= 0 || id.toLowerCase().indexOf(q) >= 0) {
+      out.push({ id: id, kind: 'edge', label: label })
+    }
+  }
+  return out
+}
+
+/**
+ * 容器节点：分区（section / group）或 style 带 swimlane/container，或文档里有别的节点 parent===它。
+ * 拖动容器时要把子节点一起带走。
+ */
+function isContainerNode(doc, node) {
+  if (node === null || node === undefined) return false
+  if (nodeShapeFromStyle(typeof node.style === 'string' ? node.style : '') === 'section') return true
+  const style = typeof node.style === 'string' ? node.style : ''
+  if (/(^|;)(group|swimlane|container)(=|;|$)/.test(style)) return true
+  const id = node.id
+  const nodes = doc !== null && Array.isArray(doc.nodes) ? doc.nodes : []
+  for (let i = 0; i < nodes.length; i += 1) {
+    if (nodes[i].parent === id) return true
+  }
+  return false
+}
+
+/** 点 (x,y) 落在哪个分区里（面积最小的那个，便于嵌套时命中内层）。 */
+function sectionAtPoint(doc, x, y, excludeIds) {
+  if (doc === null || Array.isArray(doc.nodes) === false) return null
+  const skip = excludeIds instanceof Set ? excludeIds : new Set(Array.isArray(excludeIds) ? excludeIds : [])
+  let best = null
+  let bestArea = Infinity
+  for (let i = 0; i < doc.nodes.length; i += 1) {
+    const n = doc.nodes[i]
+    if (skip.has(n.id)) continue
+    if (nodeShapeFromStyle(typeof n.style === 'string' ? n.style : '') !== 'section') continue
+    const nx = numberOr(n.x, 0)
+    const ny = numberOr(n.y, 0)
+    const nw = numberOr(n.w, FALLBACK_NODE_W)
+    const nh = numberOr(n.h, FALLBACK_NODE_H)
+    if (x < nx || y < ny || x > nx + nw || y > ny + nh) continue
+    const area = nw * nh
+    if (area < bestArea) {
+      bestArea = area
+      best = n
+    }
+  }
+  return best
+}
+
+/** 选区拖动时展开：容器的直接子节点一并进位移集合（不递归多层，与 drawio 一次拖一层一致）。 */
+function expandDragIds(doc, ids) {
+  const out = []
+  const seen = new Set()
+  const list = Array.isArray(ids) ? ids : []
+  for (let i = 0; i < list.length; i += 1) {
+    const id = list[i]
+    if (seen.has(id)) continue
+    seen.add(id)
+    out.push(id)
+  }
+  if (doc === null || Array.isArray(doc.nodes) === false) return out
+  for (let i = 0; i < list.length; i += 1) {
+    const id = list[i]
+    const node = doc.nodes.find((n) => n.id === id)
+    if (node === undefined || isContainerNode(doc, node) === false) continue
+    for (let j = 0; j < doc.nodes.length; j += 1) {
+      const child = doc.nodes[j]
+      if (child.parent !== id) continue
+      if (seen.has(child.id)) continue
+      seen.add(child.id)
+      out.push(child.id)
+    }
+  }
+  return out
+}
+
+/**
+ * 画序：节点与边交错的 id 列表。缺省 = 先全部边再全部节点（旧行为）；
+ * 有 drawOrder 时按它画，于是边可以压在节点上面。
+ */
+function drawOrderOf(doc) {
+  if (doc !== null && Array.isArray(doc.drawOrder) && doc.drawOrder.length > 0) return doc.drawOrder.slice()
+  const out = []
+  const edges = doc !== null && Array.isArray(doc.edges) ? doc.edges : []
+  const nodes = doc !== null && Array.isArray(doc.nodes) ? doc.nodes : []
+  for (let i = 0; i < edges.length; i += 1) out.push(edges[i].id)
+  for (let i = 0; i < nodes.length; i += 1) out.push(nodes[i].id)
+  return out
+}
+
+/** 保证 drawOrder 覆盖现有节点/边（新加的补到末尾，已删的剔掉）。 */
+function ensureDrawOrder(doc) {
+  if (doc === null || doc === undefined) return
+  const known = new Set()
+  const nodes = Array.isArray(doc.nodes) ? doc.nodes : []
+  const edges = Array.isArray(doc.edges) ? doc.edges : []
+  for (let i = 0; i < nodes.length; i += 1) known.add(nodes[i].id)
+  for (let i = 0; i < edges.length; i += 1) known.add(edges[i].id)
+  const prev = Array.isArray(doc.drawOrder) ? doc.drawOrder : []
+  const next = []
+  const seen = new Set()
+  for (let i = 0; i < prev.length; i += 1) {
+    if (known.has(prev[i]) === false || seen.has(prev[i])) continue
+    seen.add(prev[i])
+    next.push(prev[i])
+  }
+  for (let i = 0; i < edges.length; i += 1) {
+    if (seen.has(edges[i].id)) continue
+    seen.add(edges[i].id)
+    next.push(edges[i].id)
+  }
+  for (let i = 0; i < nodes.length; i += 1) {
+    if (seen.has(nodes[i].id)) continue
+    seen.add(nodes[i].id)
+    next.push(nodes[i].id)
+  }
+  doc.drawOrder = next
+}
+
+/** 在 drawOrder 里移动一个 id（front/back/up/down）。 */
+function reorderDrawOrder(doc, id, mode) {
+  ensureDrawOrder(doc)
+  const list = doc.drawOrder
+  let at = list.indexOf(id)
+  if (at < 0) {
+    list.push(id)
+    at = list.length - 1
+  }
+  const item = list.splice(at, 1)[0]
+  if (mode === 'front') list.push(item)
+  else if (mode === 'back') list.unshift(item)
+  else if (mode === 'up') list.splice(Math.min(at + 1, list.length), 0, item)
+  else list.splice(Math.max(at - 1, 0), 0, item)
+}
+
+/**
+ * 只保留 ids 里的单元，用于「导出选中」。边若在选区则保留；若两端节点都在选区也保留。
+ */
+function docFilteredToIds(doc, ids) {
+  if (doc === null) return null
+  const set = new Set(Array.isArray(ids) ? ids : [])
+  if (set.size === 0) return null
+  const next = cloneDoc(doc)
+  next.nodes = next.nodes.filter((n) => set.has(n.id))
+  next.edges = next.edges.filter((e) => {
+    if (set.has(e.id)) return true
+    const hasFrom = typeof e.from === 'string'
+    const hasTo = typeof e.to === 'string'
+    if (hasFrom && hasTo) return set.has(e.from) && set.has(e.to)
+    return false
+  })
+  ensureDrawOrder(next)
+  return next
+}
+
+/** 本机偏好（不进文件）：网格、默认形状/配色。 */
+const DRAWAI_PREFS_KEY = 'dsh-drawai.prefs'
+const DEFAULT_DRAWAI_PREFS = { showGrid: true, showTaskList: false, defaultShape: 'rounded', defaultColor: 'blue' }
+
+const STANDARD_COLORS = [
+  ['#ffffff', '白'], ['#f5f5f5', '浅灰'], ['#e1d5e7', '浅紫'], ['#eff4ff', '冰蓝'],
+  ['#d7def4', '浅靛蓝'], ['#d5e8d4', '浅绿'], ['#fff2cc', '浅黄'], ['#f8cecc', '浅红'],
+  ['#000000', '黑'], ['#6b7280', '灰'], ['#bcc0c7', '银灰'], ['#8567c9', '紫'],
+  ['#517bc8', '蓝'], ['#5364aa', '靛蓝'], ['#4e9a66', '绿'], ['#d8b953', '金黄'], ['#ef4444', '红'],
+  ['#ffe6cc', '浅橙'], ['#ccfbf1', '浅青绿'], ['#cffafe', '浅青'], ['#f97316', '橙'],
+  ['#14b8a6', '青绿'], ['#ec4899', '粉'], ['#92400e', '棕'],
+]
+
+function normalizeCustomColor(value) {
+  const text = String(value || '').trim().toLowerCase()
+  if (/^#[0-9a-f]{6}$/.test(text)) return text
+  if (/^#[0-9a-f]{3}$/.test(text)) return '#' + text.slice(1).split('').map((c) => c + c).join('')
+  return null
+}
+
+function customColorList(value) {
+  return Array.isArray(value) ? Array.from(new Set(value.map(normalizeCustomColor).filter((color) => color !== null))) : []
+}
+
+/** 色板默认展示标准颜色，自定义取色仅作为添加入口。 */
+function ColorPalette(props) {
+  const [draft, setDraft] = React.useState(() => normalizeCustomColor(props.value) || '#3b82f6')
+  const [customOpen, setCustomOpen] = React.useState(false)
+  const detailsRef = React.useRef(null)
+  const panelRef = React.useRef(null)
+  const closeTimerRef = React.useRef(null)
+  const custom = customColorList(props.customColors)
+  const normalized = normalizeCustomColor(draft)
+  const positionPanel = () => {
+    const details = detailsRef.current
+    const panel = panelRef.current
+    if (details === null || panel === null || !details.open) return
+    if (typeof panel.showPopover === 'function' && !panel.matches(':popover-open')) panel.showPopover()
+    const anchor = details.getBoundingClientRect()
+    const viewportWidth = document.documentElement.clientWidth
+    const viewportHeight = document.documentElement.clientHeight
+    const preferredWidth = props.options && props.label === '字号' ? 156 : 320
+    panel.style.width = Math.min(preferredWidth, viewportWidth - 24) + 'px'
+    panel.style.maxHeight = Math.max(120, viewportHeight - 24) + 'px'
+    const height = panel.getBoundingClientRect().height
+    panel.style.left = Math.max(12, Math.min(anchor.left - 12, viewportWidth - panel.offsetWidth - 12)) + 'px'
+    const above = anchor.top - height - 12
+    const below = anchor.bottom + 12
+    panel.style.top = Math.max(12, above >= 12 ? above : Math.min(below, viewportHeight - height - 12)) + 'px'
+  }
+  const close = () => {
+    if (closeTimerRef.current !== null) { clearTimeout(closeTimerRef.current); closeTimerRef.current = null }
+    if (detailsRef.current !== null) detailsRef.current.open = false
+    const panel = panelRef.current
+    if (panel !== null && typeof panel.hidePopover === 'function' && panel.matches(':popover-open')) panel.hidePopover()
+  }
+  const keepOpen = () => {
+    if (closeTimerRef.current !== null) { clearTimeout(closeTimerRef.current); closeTimerRef.current = null }
+    if (detailsRef.current !== null) { detailsRef.current.open = true; positionPanel() }
+  }
+  const scheduleClose = () => {
+    const active = document.activeElement
+    if (panelRef.current !== null && active && active.tagName === 'INPUT' && panelRef.current.contains(active)) return
+    if (closeTimerRef.current !== null) clearTimeout(closeTimerRef.current)
+    closeTimerRef.current = setTimeout(close, 220)
+  }
+  React.useEffect(() => {
+    const onOutside = (event) => {
+      if (detailsRef.current !== null && !detailsRef.current.contains(event.target)) close()
+    }
+    document.addEventListener('pointerdown', onOutside, true)
+    window.addEventListener('resize', close)
+    return () => { document.removeEventListener('pointerdown', onOutside, true); window.removeEventListener('resize', close); if (closeTimerRef.current !== null) clearTimeout(closeTimerRef.current) }
+  }, [])
+  React.useEffect(() => { positionPanel() }, [customOpen, custom.length])
+  const choose = (color, event) => {
+    props.onPick(color)
+  }
+  const swatch = (color, name) => React.createElement('button', {
+    key: color, type: 'button', className: 'drawai-palette-swatch',
+    'aria-label': props.label + '：' + name, 'aria-pressed': (color === 'none' ? props.value === 'none' : normalizeCustomColor(props.value) === color),
+    title: name + ' ' + color, style: { background: color },
+    onClick: (event) => choose(color, event),
+  })
+  return React.createElement('details', { ref: detailsRef, className: 'drawai-color-palette', name: props.group,
+    onPointerEnter: keepOpen, onPointerLeave: scheduleClose,
+    onToggle: (event) => {
+      if (event.target !== event.currentTarget) return
+      if (event.currentTarget.open) { if (typeof props.onOpen === 'function') props.onOpen(); positionPanel() }
+      else close()
+    },
+  },
+    React.createElement('summary', { 'aria-label': props.label,
+      onClick: (event) => { event.preventDefault(); keepOpen() }, onFocus: keepOpen,
+    },
+      React.createElement('span', { className: 'drawai-tool-icon' },
+        props.icon || (props.kind === 'font' ? React.createElement('span', { className: 'drawai-font-icon', style: { borderColor: normalizeCustomColor(props.value) || 'currentColor' } }, 'A')
+          : React.createElement('span', { className: 'drawai-color-preview' + (props.value === 'none' ? ' none' : '') + (props.kind === 'stroke' ? ' stroke' : ''),
+            style: props.kind === 'stroke' ? { borderColor: normalizeCustomColor(props.value) || 'currentColor' } : { background: normalizeCustomColor(props.value) || undefined },
+          })),
+        React.createElement('span', { className: 'drawai-color-caret' }, '⌃')),
+      React.createElement('span', { className: 'drawai-color-label' }, props.label)),
+    React.createElement('div', { ref: panelRef, popover: 'manual', className: 'drawai-palette-panel', role: 'group', 'aria-label': props.label + '面板',
+      onPointerEnter: keepOpen, onPointerLeave: scheduleClose,
+      onKeyDown: (event) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); close() } },
+    },
+      props.options ? React.createElement(React.Fragment, null,
+        React.createElement('div', { className: 'drawai-popover-title' }, props.label === '形状' ? '更改图形' : props.label),
+        React.createElement('div', { className: props.label === '形状' ? 'drawai-shape-options' : 'drawai-choice-options' },
+          props.options.map(([value, label, icon]) => React.createElement('button', {
+            key: value, type: 'button', className: 'drawai-choice-button' + (props.value === value ? ' on' : ''),
+            'aria-label': props.label + '：' + label, 'aria-pressed': props.value === value, title: label,
+            onClick: () => props.onChange(value),
+          }, icon || label)),
+        ), props.footer,
+      ) : React.createElement(React.Fragment, null,
+      props.header,
+      React.createElement('div', { className: 'drawai-palette-grid' }, swatch('none', '无颜色'), STANDARD_COLORS.map(([color, name]) => swatch(color, name))),
+      React.createElement('div', { className: 'drawai-palette-grid drawai-palette-custom' }, custom.map((color) => swatch(color, color)),
+        React.createElement('button', { type: 'button', className: 'drawai-palette-plus', 'aria-label': '添加自定义颜色', 'aria-expanded': customOpen,
+          onClick: () => setCustomOpen(!customOpen), title: '添加自定义颜色',
+        }, '+')),
+      customOpen ? React.createElement('div', { className: 'drawai-palette-add' },
+        React.createElement('input', { type: 'color', 'aria-label': '选择自定义颜色', value: normalized || '#3b82f6', onChange: (event) => setDraft(event.target.value) }),
+        React.createElement('input', { type: 'text', 'aria-label': '自定义颜色 HEX', value: draft, placeholder: '#RRGGBB', maxLength: 7,
+          'aria-invalid': normalized === null, onChange: (event) => setDraft(event.target.value),
+          onKeyDown: (event) => { event.stopPropagation(); if (event.key === 'Enter' && !event.isComposing) event.preventDefault() },
+        }),
+        React.createElement('button', { type: 'button', className: 'drawai-btn', disabled: normalized === null,
+          onClick: (event) => { if (normalized !== null) { props.onSaveColor(normalized); choose(normalized, event); setCustomOpen(false) } },
+        }, '添加并应用'),
+      ) : null,
+      customOpen && normalized === null ? React.createElement('div', { className: 'drawai-palette-hint', role: 'status' }, '请输入 #RGB 或 #RRGGBB 格式的颜色') : null,
+      typeof props.onOpacityChange === 'function' ? React.createElement('div', { className: 'drawai-palette-opacity' },
+        React.createElement('div', { className: 'drawai-palette-opacity-label' }, '不透明度', React.createElement('span', null, props.opacity === '' ? '混合' : props.opacity + '%')),
+        React.createElement('input', { type: 'range', min: 0, max: 100, step: 1, 'aria-label': props.label + '不透明度',
+          value: props.opacity === '' ? 100 : Number(props.opacity), onChange: (event) => props.onOpacityChange(Number(event.target.value)),
+          onPointerUp: props.onOpacityEnd, onKeyUp: props.onOpacityEnd,
+        }),
+      ) : null,
+      ),
+    ),
+  )
+}
+
+function loadDrawaiPrefs() {
+  try {
+    if (typeof localStorage === 'undefined' || localStorage === null) return Object.assign({}, DEFAULT_DRAWAI_PREFS)
+    const raw = localStorage.getItem(DRAWAI_PREFS_KEY)
+    if (raw === null || raw === undefined || raw.length === 0) return Object.assign({}, DEFAULT_DRAWAI_PREFS)
+    const parsed = JSON.parse(raw)
+    if (parsed === null || typeof parsed !== 'object') return Object.assign({}, DEFAULT_DRAWAI_PREFS)
+    return Object.assign({}, DEFAULT_DRAWAI_PREFS, parsed)
+  } catch (error) {
+    return Object.assign({}, DEFAULT_DRAWAI_PREFS)
+  }
+}
+
+function saveDrawaiPrefs(prefs) {
+  try {
+    if (typeof localStorage === 'undefined' || localStorage === null) return
+    localStorage.setItem(DRAWAI_PREFS_KEY, JSON.stringify(prefs === undefined || prefs === null ? DEFAULT_DRAWAI_PREFS : prefs))
+  } catch (error) {
+    /* 隐私模式等写不了就算了 */
+  }
+}
+
+/** 图层名（没名字的用"第 N 层"兜底，与 drawio 的面板一致：它也只显示空名字）。 */
+function layerLabelOf(layer, index) {
+  if (layer === null || layer === undefined) return ''
+  const name = typeof layer.name === 'string' ? layer.name : ''
+  return name.length > 0 ? name : '第 ' + (index + 1) + ' 层'
+}
+
+/** 缩略图独立读图层内容；隐藏图层仍有预览，不改变原文档。 */
+function layerPreviewDoc(doc, layerId) {
+  const source = doc || { nodes: [], edges: [], layers: [] }
+  const layers = Array.isArray(source.layers) ? source.layers.filter((layer) => layer && typeof layer.id === 'string') : []
+  const firstId = layers.length > 0 ? layers[0].id : null
+  const belongs = (cell) => (cell.layer || firstId) === layerId
+  const nodes = (source.nodes || []).filter(belongs).map((node) => Object.assign({}, node))
+  const ownIds = new Set(nodes.map((node) => node.id))
+  const allNodes = new Map((source.nodes || []).map((node) => [node.id, node]))
+  const edges = (source.edges || []).filter(belongs).map((edge) => {
+    const copy = Object.assign({}, edge)
+    for (const [end, point] of [['from', 'sourcePoint'], ['to', 'targetPoint']]) {
+      if (copy[end] && !ownIds.has(copy[end])) {
+        const node = allNodes.get(copy[end])
+        if (node) { const box = nodeBoxOf(node); copy[point] = { x: box.x + box.w / 2, y: box.y + box.h / 2 } }
+        delete copy[end]
+      }
+    }
+    return copy
+  })
+  const labels = (source.labels || []).filter(belongs).map((label) => Object.assign({}, label))
+  const ids = new Set(nodes.concat(edges, labels).map((cell) => cell.id))
+  return Object.assign({}, source, { nodes, edges, labels,
+    layers: layers.filter((layer) => layer.id === layerId).map((layer) => Object.assign({}, layer, { visible: true, locked: false })),
+    drawOrder: Array.isArray(source.drawOrder) ? source.drawOrder.filter((id) => ids.has(id)) : undefined,
+  })
+}
+
+function layerActionIcon(kind) {
+  const paths = {
+    eye: 'M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12z M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0',
+    hidden: 'M3 3l18 18 M9 6.4A13 13 0 0 1 12 6c6.5 0 10 6 10 6a19 19 0 0 1-3 3.5 M6 7.5A19 19 0 0 0 2 12s3.5 6 10 6a13 13 0 0 0 5-1',
+    lock: 'M7 10V7a5 5 0 0 1 10 0v3 M6 10h12v11H6z M12 14v3',
+    unlock: 'M7 10V7a5 5 0 0 1 9-3 M6 10h12v11H6z M12 14v3',
+    more: 'M5 12h.01 M12 12h.01 M19 12h.01',
+    edit: 'M4 16l12-12 4 4L8 20H4z M14 6l4 4',
+  }
+  return React.createElement('svg', { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: kind === 'more' ? 4 : 1.6, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true },
+    React.createElement('path', { d: paths[kind] || paths.more }))
+}
+
+function LayerThumbnail(props) {
+  const makePreview = () => layerPreviewDoc(props.doc, props.id)
+  const preview = typeof React.useMemo === 'function' ? React.useMemo(makePreview, [props.doc, props.id]) : makePreview()
+  if (preview.nodes.length + preview.edges.length + preview.labels.length === 0) return React.createElement('span', { className: 'drawai-layer-empty' }, '空图层')
+  return renderDiagram(preview, props.mode, props.uid, { current: null }, { showGrid: false }, computeFitView(contentBounds(preview), 1.4))
+}
+
+function LayersPanel(props) {
+  const [query, setQuery] = React.useState('')
+  const [edit, setEdit] = React.useState(null)
+  const [moreId, setMoreId] = React.useState(null)
+  const editRef = React.useRef(null)
+  const layers = (props.doc && Array.isArray(props.doc.layers) ? props.doc.layers : []).filter((layer) => layer && typeof layer.id === 'string')
+  const startEdit = (id, name) => { editRef.current = { id, name, original: name, done: false }; setEdit({ id, name }); setMoreId(null) }
+  const finishEdit = (name, cancel) => {
+    const current = editRef.current
+    if (current === null || current.done) return
+    current.done = true
+    setEdit(null)
+    if (!cancel && String(name).trim() !== current.original) props.onRename(current.id, String(name).trim())
+  }
+  // 在宿主关闭下拉之前提交草稿；直接卸载输入框不保证触发 blur。
+  React.useEffect(() => {
+    const commitOutside = (event) => {
+      const current = editRef.current
+      if (current === null || current.done) return
+      if (event.target && typeof event.target.closest === 'function' && event.target.closest('.drawai-layer-name-input')) return
+      finishEdit(current.name, false)
+    }
+    document.addEventListener('pointerdown', commitOutside, true)
+    return () => document.removeEventListener('pointerdown', commitOutside, true)
+  }, [])
+  const ownCount = (id) => {
+    const first = layers.length > 0 ? layers[0].id : null
+    return (props.doc.nodes || []).concat(props.doc.edges || []).filter((cell) => (cell.layer || first) === id).length
+  }
+  const rows = layers.map((layer, index) => {
+    const name = layerLabelOf(layer, index)
+    if (!name.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase())) return null
+    const active = layer.id === props.activeId
+    const editing = edit !== null && edit.id === layer.id
+    const nextLayer = layers.length > 1 ? layers[index < layers.length - 1 ? index + 1 : index - 1] : null
+    const iconButton = (label, icon, onClick) => React.createElement('button', { type: 'button', className: 'drawai-layer-icon', 'aria-label': label + ' ' + name, title: label, onClick }, layerActionIcon(icon))
+    return React.createElement('div', { key: layer.id, className: 'drawai-layer-entry' },
+      React.createElement('div', { className: 'drawai-layer-row' + (active ? ' active' : '') + (layer.visible === false ? ' hidden' : '') },
+        React.createElement('button', { type: 'button', className: 'drawai-layer-thumb', 'aria-label': '设为当前图层 ' + name, onClick: () => props.onSelect(layer.id) },
+          React.createElement(LayerThumbnail, { doc: props.doc, id: layer.id, mode: props.mode, uid: props.uid + '-layer-' + index })),
+        React.createElement('div', { className: 'drawai-layer-namebox' },
+          editing ? React.createElement('input', { className: 'drawai-layer-name-input', 'aria-label': '图层名称', autoFocus: true, value: edit.name,
+            onFocus: (event) => event.target.select(), onChange: (event) => { if (editRef.current) editRef.current.name = event.target.value; setEdit({ id: layer.id, name: event.target.value }) },
+            onBlur: (event) => finishEdit(event.target.value, false),
+            onKeyDown: (event) => {
+              event.stopPropagation()
+              if (event.isComposing || event.keyCode === 229) return
+              if (event.key === 'Enter') { event.preventDefault(); finishEdit(event.target.value, false) }
+              if (event.key === 'Escape') { event.preventDefault(); finishEdit(event.target.value, true) }
+            },
+          }) : React.createElement('button', { type: 'button', className: 'drawai-layer-name', title: name, onClick: () => props.onSelect(layer.id), onDoubleClick: () => startEdit(layer.id, name) }, name),
+          React.createElement('span', { className: 'drawai-layer-meta' }, (active ? '当前 · ' : '') + ownCount(layer.id) + ' 个元素'),
+        ),
+        iconButton(layer.visible === false ? '显示' : '隐藏', layer.visible === false ? 'hidden' : 'eye', () => props.onVisible(layer.id)),
+        iconButton(layer.locked ? '解锁' : '锁定', layer.locked ? 'lock' : 'unlock', () => props.onLocked(layer.id)),
+        iconButton('重命名', 'edit', () => startEdit(layer.id, name)),
+        iconButton('更多', 'more', () => setMoreId(moreId === layer.id ? null : layer.id)),
+      ),
+      moreId === layer.id ? React.createElement('div', { className: 'drawai-layer-more' },
+        React.createElement('button', { type: 'button', className: 'drawai-btn', disabled: nextLayer === null, onClick: () => { props.onRemove(layer.id); setMoreId(null) } }, '合并并删除图层'),
+        React.createElement('span', null, nextLayer ? '内容将并入「' + layerLabelOf(nextLayer, layers.indexOf(nextLayer)) + '」' : '保留至少一个图层'),
+      ) : null,
+    )
+  }).filter(Boolean)
+  const selectedCount = filterEditableIds(props.doc, props.selectedIds || []).length
+  return React.createElement('div', { className: 'drawai-layers-panel' },
+    React.createElement('div', { className: 'drawai-panel-heading' }, '图层', React.createElement('span', null, layers.length)),
+    layers.length > 8 ? React.createElement('input', { className: 'drawai-panel-input', type: 'search', 'aria-label': '搜索图层', placeholder: '搜索图层', value: query, onChange: (event) => setQuery(event.target.value) }) : null,
+    React.createElement('div', { className: 'drawai-layer-list' }, rows.length > 0 ? rows : React.createElement('div', { className: 'drawai-note' }, layers.length === 0 ? '打开或新建画布后显示图层' : '没有匹配的图层')),
+    React.createElement('div', { className: 'drawai-layer-footer' },
+      React.createElement('button', { type: 'button', className: 'drawai-btn', disabled: !props.doc, onClick: () => {
+        const id = props.onCreate()
+        if (id) { setQuery(''); startEdit(id, '图层 ' + (layers.length + 1)) }
+      } }, '＋ 新建图层'),
+      selectedCount > 0 ? React.createElement('label', { className: 'drawai-layer-move' }, '移动选中项（' + selectedCount + '）',
+        React.createElement('select', { 'aria-label': '移动到图层', value: '', onChange: (event) => props.onMove(event.target.value) },
+          React.createElement('option', { value: '', disabled: true }, '选择目标图层'),
+          layers.map((layer, index) => React.createElement('option', { key: layer.id, value: layer.id, disabled: layer.locked === true }, layerLabelOf(layer, index) + (layer.locked ? '（已锁定）' : ''))),
+        )) : null,
+    ),
+  )
+}
+
+/** 导出范围独立于当前可见 DOM，显式选层也能导出隐藏层。 */
+function exportDocument(doc, options) {
+  if (!doc) return null
+  const opts = options || {}
+  let result = doc
+  if (Array.isArray(opts.layerIds)) {
+    const layers = new Set(opts.layerIds)
+    if (layers.size === 0) return null
+    const defaultId = doc.layers && doc.layers[0] ? doc.layers[0].id : null
+    const belongs = (cell) => layers.has(cell.layer || defaultId)
+    result = Object.assign({}, doc, {
+      nodes: (doc.nodes || []).filter(belongs), edges: (doc.edges || []).filter(belongs), labels: (doc.labels || []).filter(belongs),
+      layers: (doc.layers || []).filter((layer) => layers.has(layer.id)).map((layer) => Object.assign({}, layer, { visible: true })),
+    })
+  } else if (Array.isArray(opts.ids)) {
+    result = docFilteredToIds(doc, opts.ids)
+    if (!result) return null
+    const ids = new Set(opts.ids)
+    result.labels = (doc.labels || []).filter((label) => ids.has(label.id) || ids.has(label.parent))
+  }
+  if (result !== doc) {
+    const nodes = new Set(result.nodes.map((node) => node.id))
+    const source = new Map((doc.nodes || []).map((node) => [node.id, node]))
+    result = Object.assign({}, result, { edges: result.edges.map((edge) => {
+      const copy = Object.assign({}, edge)
+      for (const [end, point] of [['from', 'sourcePoint'], ['to', 'targetPoint']]) {
+        if (copy[end] && !nodes.has(copy[end])) {
+          const node = source.get(copy[end])
+          if (node) { const box = nodeBoxOf(node); copy[point] = { x: box.x + box.w / 2, y: box.y + box.h / 2 } }
+          delete copy[end]
+        }
+      }
+      return copy
+    }) })
+  }
+  const hidden = hiddenLayerIds(result)
+  if (!result.nodes.concat(result.edges, result.labels || []).some((cell) => !isHiddenCell(hidden, cell))) return null
+  return result
+}
+
+function exportGeometry(doc, options) {
+  const padding = Math.max(0, Math.min(2048, numberOr(options && options.padding, 24)))
+  const bounds = paintedBounds(doc) || contentBounds(doc)
+  return { x: bounds.minX - padding, y: bounds.minY - padding,
+    width: Math.max(1, bounds.maxX - bounds.minX + padding * 2), height: Math.max(1, bounds.maxY - bounds.minY + padding * 2) }
+}
+
+function exportOutputSize(width, height, options) {
+  const opts = options || {}
+  const custom = Number.isFinite(Number(opts.pixelWidth)) && Number(opts.pixelWidth) > 0 && Number.isFinite(Number(opts.pixelHeight)) && Number(opts.pixelHeight) > 0
+  const scale = opts.format === 'svg' ? 1 : Math.max(0.01, numberOr(opts.scale, 4))
+  const requestedWidth = custom ? Number(opts.pixelWidth) : width * scale
+  const requestedHeight = custom ? Number(opts.pixelHeight) : height * scale
+  // 同时限制边长和像素总数，实际尺寸直接显示在面板中。
+  const limit = opts.format === 'svg' ? 1 : Math.min(1, 16384 / Math.max(requestedWidth, requestedHeight), Math.sqrt(32000000 / (requestedWidth * requestedHeight)))
+  return { width: Math.max(1, Math.round(requestedWidth * limit)), height: Math.max(1, Math.round(requestedHeight * limit)),
+    limited: limit < 1, requestedWidth: Math.round(requestedWidth), requestedHeight: Math.round(requestedHeight) }
+}
+
+/** 从现有 SVG 渲染树生成独立文档，避免导出被视口、选区手柄或隐藏状态绑住。 */
+function svgTreeToDom(tree, owner) {
+  const document = owner
+  if (tree === null || tree === undefined || typeof tree === 'boolean') return null
+  if (typeof tree !== 'object') return document.createTextNode(String(tree))
+  if (Array.isArray(tree)) {
+    const fragment = document.createDocumentFragment()
+    for (const item of tree) { const node = svgTreeToDom(item, document); if (node) fragment.appendChild(node) }
+    return fragment
+  }
+  const props = tree.props || {}
+  if (typeof tree.type !== 'string') return svgTreeToDom(props.children || tree.children || [], document)
+  const element = document.createElementNS('http://www.w3.org/2000/svg', tree.type)
+  const attributes = { className: 'class', strokeWidth: 'stroke-width', strokeLinecap: 'stroke-linecap', strokeLinejoin: 'stroke-linejoin',
+    strokeDasharray: 'stroke-dasharray', strokeDashoffset: 'stroke-dashoffset', strokeOpacity: 'stroke-opacity', fillOpacity: 'fill-opacity',
+    fillRule: 'fill-rule', textAnchor: 'text-anchor', dominantBaseline: 'dominant-baseline', fontFamily: 'font-family', fontSize: 'font-size',
+    markerEnd: 'marker-end', markerStart: 'marker-start', pointerEvents: 'pointer-events', clipPath: 'clip-path' }
+  for (const [key, value] of Object.entries(props)) {
+    if (value === null || value === undefined || ['children', 'key', 'ref'].includes(key) || key.startsWith('on')) continue
+    if (key === 'style') { for (const [name, val] of Object.entries(value)) if (val !== null && val !== undefined) element.style[name] = String(val) }
+    else if (key === 'xlinkHref') element.setAttributeNS('http://www.w3.org/1999/xlink', 'xlink:href', String(value))
+    else element.setAttribute(attributes[key] || key, String(value))
+  }
+  const children = svgTreeToDom(props.children !== undefined ? props.children : tree.children || [], document)
+  if (children) element.appendChild(children)
+  return element
+}
+
+function encodeExportPng(node, output) {
+  return new Promise((resolve, reject) => {
+    const markup = new XMLSerializer().serializeToString(node)
+    const url = URL.createObjectURL(new Blob([markup], { type: 'image/svg+xml;charset=utf-8' }))
+    const image = new Image()
+    image.onload = () => {
+      URL.revokeObjectURL(url)
+      try {
+        const canvas = document.createElement('canvas')
+        canvas.width = output.width; canvas.height = output.height
+        const context = canvas.getContext('2d')
+        if (!context) { reject(new Error('无法创建导出画布')); return }
+        context.drawImage(image, 0, 0, output.width, output.height)
+        canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error('PNG 编码失败')), 'image/png')
+      } catch (error) { reject(error) }
+    }
+    image.onerror = () => { URL.revokeObjectURL(url); reject(new Error('导出图像加载失败')) }
+    image.src = url
+  })
+}
+
+/** 将绘制结果落进当前文档：原图保留，在右侧新建 SVG；调用方负责一次撤销记录。 */
+function applyImageTraceToDoc(doc, source, svg) {
+  const node = doc.nodes.find((n) => n.id === source.id)
+  if (!node || imageValueFromStyle(node.style || '') !== source.image) throw new Error('原图已更改或删除，请重新选择图片')
+  if (!filterEditableIds(doc, [node.id]).includes(node.id)) throw new Error('原图所在图层已锁定')
+  const used = new Set(doc.nodes.concat(doc.edges, doc.layers || [], doc.labels || []).map((cell) => String(cell.id)))
+  let index = 1
+  while (used.has('n' + index)) index += 1
+  const output = Object.assign({}, node, { id: 'n' + index, x: node.x + node.w + 24 })
+  output.style = styleWithSvgMarkup(output.style || '', svg, styleGet(node.style || '', 'imageAspect', '1'))
+  doc.nodes.push(output)
+  ensureDrawOrder(doc)
+  return output.id
+}
+
+/** Drawing playback uses actual connected regions; it never changes the saved SVG. */
+function traceDrawingLayers(drawing, count) {
+  const paths = drawing.fills.map(() => '')
+  for (let i = 0; i < Math.min(count, drawing.steps.length); i += 1) {
+    const step = drawing.steps[i]
+    paths[step.layer] += step.d
+  }
+  return paths
+}
+
+function createTraceDrawingPlayback(options) {
+  const total = options.total
+  const duration = options.duration || (total < 8 ? Math.max(800, total * 250) : Math.max(3500, Math.min(14000, 2000 + Math.sqrt(total) * 240)))
+  const raf = options.raf || ((fn) => requestAnimationFrame(fn))
+  const caf = options.caf || ((id) => cancelAnimationFrame(id))
+  const now = options.now || (() => performance.now())
+  let animation = null
+  let anchor = 0
+  let elapsed = 0
+  let count = 0
+  let status = 'paused'
+  let disposed = false
+  let lastPaint = -Infinity
+  // Give the first large regions more screen time, then accelerate through tiny details.
+  const countAt = (time) => Math.floor(total * Math.min(1, time / duration) ** 2)
+  const cancel = () => { if (animation !== null) caf(animation); animation = null }
+  const emit = () => options.onProgress({ count, total, status })
+  function finish() {
+    if (disposed || status === 'complete') return
+    cancel()
+    count = total
+    status = 'complete'
+    emit()
+    options.onComplete()
+  }
+  function tick(ts) {
+    animation = null
+    if (disposed || status !== 'playing') return
+    const time = elapsed + ts - anchor
+    if (time >= duration) { finish(); return }
+    const next = countAt(time)
+    if (next !== count && ts - lastPaint >= 50) {
+      count = next
+      lastPaint = ts
+      emit()
+    }
+    animation = raf(tick)
+  }
+  return {
+    resume() {
+      if (disposed || status === 'playing' || status === 'complete') return
+      anchor = now()
+      status = 'playing'
+      emit()
+      animation = raf(tick)
+    },
+    pause() {
+      if (disposed || status !== 'playing') return
+      elapsed = Math.min(duration, elapsed + now() - anchor)
+      count = countAt(elapsed)
+      status = 'paused'
+      cancel()
+      emit()
+    },
+    finish,
+    dispose() { disposed = true; cancel() },
+  }
+}
+
+function TraceDrawingSurface(props) {
+  const total = props.drawing.steps.length
+  const [progress, setProgress] = React.useState({ count: 0, total, status: 'playing' })
+  React.useEffect(() => {
+    const playback = createTraceDrawingPlayback({ total, onProgress: setProgress, onComplete: props.onComplete })
+    playback.resume()
+    return () => playback.dispose()
+  }, [props.id, props.drawing])
+  const paths = traceDrawingLayers(props.drawing, progress.count)
+  return React.createElement('div', { xmlns: 'http://www.w3.org/1999/xhtml', className: 'drawai-trace-surface' },
+    React.createElement('svg', { width: '100%', height: '100%', viewBox: props.drawing.viewBox.join(' '),
+      preserveAspectRatio: props.aspect === '0' ? 'none' : 'xMidYMid meet', 'aria-label': '复刻图绘制过程',
+    }, paths.map((d, index) => d ? React.createElement('path', { key: index, fill: props.drawing.fills[index], fillRule: 'nonzero', d }) : null)),
+    React.createElement('div', { className: 'drawai-trace-progress' },
+      React.createElement('progress', { value: progress.count, max: total, 'aria-label': '绘制进度' }),
+    ),
+  )
+}
+
+/** 选区工具栏「绘制」面板正文（嵌在悬停悬浮卡片里）。 */
+function VideoTracePanel(props) {
+  const panelRef = React.useRef(null)
+  React.useEffect(() => { if (!props.inline) panelRef.current?.focus() }, [])
+  const [options, setOptions] = React.useState(() => Object.assign({ range: 'clip', from: 0, end: 5, fps: 12, resolution: '480', width: 1024,
+    level: 'medium', preset: 'default', colors: 12, removeBg: false,
+    engine: 'plugin', vtraceLevel: 'hifi', maxLayers: 48 }, props.initialOptions || props.job && props.job.options || {}))
+  const job = props.job
+  const [submitting, setSubmitting] = React.useState(false)
+  const [submitError, setSubmitError] = React.useState('')
+  const busy = submitting || job && job.busy
+  const changeOptions = (patch) => {
+    const next = Object.assign({}, options, patch)
+    setOptions(next)
+    if (props.onOptionsChange) props.onOptionsChange(next)
+  }
+  const field = (key, label, choices, min, max, step) => React.createElement('label', { className: 'drawai-export-field' },
+    React.createElement('span', null, label), React.createElement(choices ? 'select' : 'input', {
+      'aria-label': label, value: options[key], disabled: busy, type: choices ? undefined : 'number', min, max, step,
+      onChange: (event) => changeOptions({ [key]: choices || event.target.value === '' ? event.target.value : Number(event.target.value) }),
+    }, choices ? choices.map(([value, text]) => React.createElement('option', { key: value, value }, text)) : undefined))
+  let estimate = '填写范围后可估算帧数；完整视频的实际时长将在开始时读取。'
+  let invalid = ''
+  try {
+    const knownDuration = Number(props.source && props.source.duration)
+    const end = options.end === '' ? knownDuration : Number(options.end)
+    const duration = knownDuration > 0 ? knownDuration : (options.range === 'clip' && end > 0 ? end : Math.max(1, Number(options.from) + 1))
+    const plan = videoTracePlan(options, duration, Number(props.source?.w) || 1920, Number(props.source?.h) || 1080)
+    if (knownDuration > 0 || (options.range === 'clip' && options.end !== '')) {
+      estimate = '预计 ' + plan.count.toLocaleString() + ' 帧，' + plan.w + '×' + plan.h + 'px。' + (knownDuration > 0 ? '' : '实际以源视频尺寸和时长为准。')
+    }
+  } catch (error) { invalid = error.message }
+  return React.createElement('div', { ref: panelRef, tabIndex: props.inline ? undefined : -1, className: props.inline ? 'drawai-video-trace-inline' : 'drawai-video-preview', role: props.inline ? 'group' : 'dialog', 'aria-modal': props.inline ? undefined : true, 'aria-label': '视频分段复刻',
+    style: props.inline ? undefined : { alignItems: 'center', justifyContent: 'center' },
+    onKeyDown: (event) => { event.stopPropagation(); if (event.key === 'Escape') { if (busy) props.onCancel(); else props.onClose() } },
+    onPointerDown: (event) => event.stopPropagation() },
+    React.createElement('div', { className: 'drawai-export-panel', style: props.inline ? undefined : { padding: '20px', width: '360px', maxWidth: '100%', boxSizing: 'border-box', maxHeight: '100%', overflow: 'auto', borderRadius: '12px' } },
+      React.createElement('div', { className: 'drawai-popover-title' }, '视频分段复刻'),
+      field('range', '复刻范围', [['clip', '指定时间范围'], ['all', '完整视频']]),
+      options.range === 'clip' ? field('from', '开始时间（秒）', null, 0, undefined, 'any') : null,
+      options.range === 'clip' ? field('end', '结束时间（秒，留空到结尾）', null, 0, undefined, 'any') : null,
+      field('fps', '帧率（fps）', null, 0.01, undefined, 'any'),
+      field('resolution', '采样画质', [['480', '快速 · 长边 480px'], ['887', '标准 · 长边 887px'], ['1440', '高清 · 长边 1440px'], ['1920', '原生 · 长边 1920px'], ['0', '原始尺寸'], ['custom', '自定义长边']]),
+      options.resolution === 'custom' ? field('width', '自定义长边（px）', null, 1, 16384, 1) : null,
+      // ── 引擎选择 ─────────────────────────────────────────────────────────────
+      field('engine', '矢量化引擎', [['plugin', '插件自研（快 · 折线轮廓）'], ['vtracer', 'vtracer 高保真（慢 · 贝塞尔样条）']]),
+      options.engine === 'vtracer'
+        ? field('vtraceLevel', '保真档位', [['fast', '快速 · 约 18dB'], ['hifi', '高保真 · 约 38dB（推荐）'], ['pixel', '像素级 · 约 46dB']])
+        : null,
+      options.engine === 'vtracer' && options.vtraceLevel === 'pixel'
+        ? React.createElement('div', { className: 'drawai-export-info' }, '像素级档位轮廓严格贴像素边界，体积约为高保真的 2~3 倍，绘制回放步骤较多。')
+        : null,
+      options.engine === 'vtracer'
+        ? field('maxLayers', '颜色层数上限', [[24, '24 层'], [48, '48 层（推荐）'], [96, '96 层'], [192, '192 层']])
+        : null,
+      options.engine === 'vtracer'
+        ? React.createElement('div', { className: 'drawai-export-info' }, 'vtracer 按分层颜色聚类 + 贝塞尔样条描边，渐变与细线保留更好；颜色层数越多越接近原图，但回放步骤更多。')
+        : null,
+      options.engine === 'plugin' ? field('level', '碎片数量', [['low', '低'], ['medium', '中'], ['high', '高']]) : null,
+      options.engine === 'plugin' ? field('preset', '画风', [['default', '碎片色块'], ['lineart', '保留线稿'], ['photo', '照片色块'], ['simple', '大块简化']]) : null,
+      options.engine === 'plugin' ? field('colors', '颜色数', [[6, '6 色'], [12, '12 色'], [18, '18 色'], [24, '24 色']]) : null,
+      React.createElement('label', { className: 'drawai-export-check' }, React.createElement('input', {
+        type: 'checkbox', checked: options.removeBg, disabled: busy,
+        onChange: (event) => changeOptions({ removeBg: event.target.checked }),
+      }), '去除背景'),
+      React.createElement('div', { className: 'drawai-export-info', role: 'status' }, invalid || estimate),
+      React.createElement('div', { className: 'drawai-export-info' }, '画质、帧率和范围由你决定。提高尺寸、帧率或时长会增加处理时间与文件大小；小视频不放大。原视频保留，结果不含音轨。'),
+      job ? React.createElement('div', { role: job.error ? 'alert' : 'status', 'aria-live': 'polite' }, job.message) : null,
+      submitError ? React.createElement('div', { role: 'alert', className: 'drawai-err' }, submitError) : null,
+      busy ? React.createElement('progress', { value: job.done || 0, max: job.total || 1, 'aria-label': '视频复刻进度', style: { width: '100%' } }) : null,
+      job && job.svg ? React.createElement('img', { src: 'data:image/svg+xml,' + encodeURIComponent(job.svg), alt: '最近完成的 SVG 帧', style: { width: '100%', maxHeight: '180px', objectFit: 'contain' } }) : null,
+      React.createElement('div', { className: 'drawai-layer-footer' },
+        props.inline ? null : React.createElement('button', { type: 'button', className: 'drawai-btn', onClick: busy ? props.onCancel : props.onClose }, busy ? '取消复刻' : '关闭'),
+        React.createElement('button', { type: 'button', className: 'drawai-btn drawai-primary-btn', disabled: busy || !!invalid,
+          onClick: async () => {
+            setSubmitting(true); setSubmitError('')
+            try { await props.onStart(options) }
+            catch (error) { setSubmitError(String(error.message || error)) }
+            finally { setSubmitting(false) }
+          } }, job && job.error ? '重新复刻' : props.queued ? '加入绘制队列' : '让大肥鱼开始画画！'))))
+}
+
+// 安装监听后才触发 load/seek；超时、取消、解码错误均释放监听器。
+function waitForVideoTraceEvent(video, event, signal, trigger) {
+  return new Promise((resolve, reject) => {
+    let timer
+    const cleanup = () => { clearTimeout(timer); video.removeEventListener(event, done); video.removeEventListener('error', failed); signal.removeEventListener('abort', cancelled) }
+    const done = () => { cleanup(); resolve() }
+    const failed = () => { cleanup(); reject(new Error('视频解码失败，请检查浏览器是否支持此格式')) }
+    const cancelled = () => { cleanup(); reject(new Error('已取消复刻')) }
+    video.addEventListener(event, done, { once: true })
+    video.addEventListener('error', failed, { once: true })
+    signal.addEventListener('abort', cancelled, { once: true })
+    timer = setTimeout(() => { cleanup(); reject(new Error('视频解码超时')) }, 20000)
+    if (signal.aborted) { cancelled(); return }
+    try { trigger() } catch (error) { cleanup(); reject(error) }
+  })
+}
+
+function videoTracePlan(options, duration, w, h) {
+  const from = options.range === 'all' ? 0 : Number(options.from)
+  const end = options.range === 'all' || options.end === '' ? duration :
+    options.end !== undefined ? Number(options.end) : from + Number(options.seconds)
+  const fps = Number(options.fps)
+  const width = options.resolution === undefined || options.resolution === 'custom' ? Number(options.width) : Number(options.resolution)
+  const maxBytes = options.level === 'low' ? 60000 : options.level === 'high' ? 248000 : 120000
+  if (!Number.isFinite(duration) || duration <= 0 || !Number.isFinite(from) || from < 0 || from >= duration) throw new Error('开始时间须在视频时长内')
+  if (!Number.isFinite(end) || end <= from) throw new Error('结束时间须晚于开始时间')
+  if (!Number.isFinite(fps) || fps <= 0) throw new Error('帧率须为大于零的数值')
+  if (!Number.isInteger(width) || width < 0 || width > 16384) throw new Error('采样长边须为 1–16384px，原始尺寸选项为 0')
+  if (options.resolution === 'custom' && width === 0) throw new Error('自定义长边须大于零')
+  const rawCount = (Math.min(end, duration) - from) * fps
+  // 浮点乘法误差不能凭空多出最后一帧。
+  const count = Math.max(1, Math.ceil(rawCount - Math.min(1e-7, rawCount * Number.EPSILON * 4)))
+  if (!Number.isSafeInteger(count)) throw new Error('预计帧数超出可表示范围')
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) throw new Error('无法读取视频尺寸')
+  const scale = width === 0 ? 1 : Math.min(1, width / Math.max(w, h))
+  const outW = Math.max(1, Math.round(w * scale)), outH = Math.max(1, Math.round(h * scale))
+  if (Math.max(outW, outH) > 16384 || outW * outH > 16000000) throw new Error('单帧处理上限为 1600 万像素、长边 16384px，请选择较小采样尺寸')
+  return { from, fps, count, w: outW, h: outH, maxBytes }
+}
+
+function applyVideoTraceToDoc(doc, source, result) {
+  const node = doc.nodes.find((n) => n.id === source.id)
+  if (!node || videoMetaOf(node)?.clip !== source.clip || videoMetaOf(node)?.kind !== 'raster') throw new Error('原视频已更改或删除')
+  if (!filterEditableIds(doc, [node.id]).includes(node.id)) throw new Error('原视频所在图层已锁定')
+  const used = new Set(doc.nodes.concat(doc.edges, doc.layers || [], doc.labels || []).map((cell) => String(cell.id)))
+  let index = 1
+  while (used.has('n' + index)) index += 1
+  const id = 'n' + index
+  const output = Object.assign({}, node, { id, x: node.x + node.w + 24, label: (node.label || '视频') + ' · SVG 复刻',
+    data: Object.assign({}, node.data, videoDataForNew(result.clip, result.w, result.h), { mediaFps: String(result.fps) }),
+    style: styleWithSvgMarkup(node.style || '', result.poster, '1') })
+  doc.nodes.push(output)
+  ensureDrawOrder(doc)
+  return id
+}
+
+/** 把当前帧放到原视频右侧，尺寸与视频节点一致，可撤销。SVG 帧保留原标记，避免栅格化缝隙。 */
+function placeVideoStill(doc, sourceId, still) {
+  const node = doc.nodes.find((n) => n.id === sourceId)
+  if (!node || !isVideoNodeData(node.data)) throw new Error('原视频已更改或删除')
+  if (!filterEditableIds(doc, [node.id]).includes(node.id)) throw new Error('原视频所在图层已锁定')
+  const used = new Set(doc.nodes.concat(doc.edges, doc.layers || [], doc.labels || []).map((cell) => String(cell.id)))
+  let index = 1
+  while (used.has('n' + index)) index += 1
+  const output = {
+    id: 'n' + index, label: '', x: node.x + node.w + 24, y: node.y, w: node.w, h: node.h,
+    style: still.kind === 'svg' ? styleWithSvgMarkup('', still.markup, '1') : styleWithImageDataUri('', still.png, '1'),
+  }
+  if (node.layer) output.layer = node.layer
+  if (node.parent) output.parent = node.parent
+  doc.nodes.push(output)
+  ensureDrawOrder(doc)
+  return output.id
+}
+
+function ImageTracePanel(props) {
+  const initial = props.initialOptions || {}
+  const [engine, setEngine] = React.useState(initial.engine || 'plugin')
+  const [vtraceLevel, setVtraceLevel] = React.useState(initial.vtraceLevel || 'hifi')
+  const [level, setLevel] = React.useState(initial.level || 'medium')
+  const [preset, setPreset] = React.useState(initial.preset || 'default')
+  const [colors, setColors] = React.useState(String(initial.colors || 12))
+  const [removeBg, setRemoveBg] = React.useState(initial.removeBg === true)
+  const [state, setState] = React.useState({ busy: false, error: '' })
+  const alive = React.useRef(true)
+  React.useEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
+  const change = (key, setter, value) => {
+    setter(value); setState({ busy: false, error: '' })
+    if (props.onOptionsChange) props.onOptionsChange(Object.assign({ engine, vtraceLevel, level, preset, colors: Number(colors), removeBg }, { [key]: key === 'colors' ? Number(value) : value }))
+  }
+  const keyFor = (label) => ({ '碎片数量': 'level', '画风': 'preset', '颜色数': 'colors' })[label]
+  const choice = (label, value, options, setter) => React.createElement('label', { className: 'drawai-export-field' },
+    React.createElement('span', null, label), React.createElement('select', {
+      'aria-label': label, value, disabled: state.busy, onChange: (event) => change(keyFor(label), setter, event.target.value),
+    }, options.map(([key, text]) => React.createElement('option', { key, value: key }, text))))
+  return React.createElement('div', { className: 'drawai-export-panel' },
+    React.createElement('div', { className: 'drawai-popover-title' }, '图像绘制'),
+    React.createElement('label', { className: 'drawai-export-field' },
+      React.createElement('span', null, '矢量化引擎'), React.createElement('select', {
+        'aria-label': '矢量化引擎', value: engine, disabled: state.busy,
+        onChange: (event) => change('engine', setEngine, event.target.value),
+      }, [['plugin', '插件自研（快 · 折线轮廓）'], ['vtracer', 'vtracer 高保真（慢 · 贝塞尔样条）']]
+        .map(([key, text]) => React.createElement('option', { key, value: key }, text)))),
+    engine === 'vtracer'
+      ? React.createElement('label', { className: 'drawai-export-field' },
+        React.createElement('span', null, '保真档位'), React.createElement('select', {
+          'aria-label': '保真档位', value: vtraceLevel, disabled: state.busy,
+          onChange: (event) => change('vtraceLevel', setVtraceLevel, event.target.value),
+        }, [['fast', '快速 · 约 18dB'], ['hifi', '高保真 · 约 38dB（推荐）'], ['pixel', '像素级 · 约 46dB']]
+          .map(([key, text]) => React.createElement('option', { key, value: key }, text))))
+      : null,
+    engine === 'plugin' ? choice('碎片数量', level, [['low', '低 · 较少碎片'], ['medium', '中 · 适中碎片'], ['high', '高 · 较多碎片']], setLevel) : null,
+    engine === 'plugin' ? choice('画风', preset, [['default', '碎片色块'], ['lineart', '保留线稿'], ['photo', '照片色块'], ['simple', '大块简化']], setPreset) : null,
+    engine === 'plugin' ? choice('颜色数', colors, [['6', '6 色'], ['12', '12 色'], ['18', '18 色'], ['24', '24 色']], setColors) : null,
+    React.createElement('label', { className: 'drawai-export-check' },
+      React.createElement('input', { type: 'checkbox', checked: removeBg, disabled: state.busy, 'aria-label': '去除背景', onChange: (event) => change('removeBg', setRemoveBg, event.target.checked) }), '去除背景'),
+    React.createElement('div', { className: 'drawai-export-info' }, engine === 'vtracer'
+      ? 'vtracer 分层聚类 + 贝塞尔样条描边，渐变与细线保留更好；同样从大色块到细节逐步展示。'
+      : '先分析原图，再从大色块到细节逐步展示复刻过程；原图保留，结果在右侧新建 SVG。'),
+    state.error ? React.createElement('div', { role: 'alert', className: 'drawai-export-info' }, state.error) : null,
+    React.createElement('div', { className: 'drawai-layer-footer' },
+      React.createElement('button', { type: 'button', className: 'drawai-btn drawai-primary-btn', disabled: state.busy, onClick: async () => {
+        if (state.busy) return
+        setState({ busy: true, error: '' })
+        try {
+          const selectedOptions = { engine, vtraceLevel, level, preset, colors: Number(colors), removeBg }
+          if (props.onEnqueue) await props.onEnqueue(selectedOptions)
+          else {
+            const result = await props.onGenerate(selectedOptions)
+            await props.onApply(result)
+          }
+          if (alive.current) setState({ busy: false, error: '' })
+        } catch (error) {
+          if (alive.current) setState({ busy: false, error: String(error.message || error) })
+        }
+      } }, state.busy ? '大肥鱼正在分析原图…' : props.onEnqueue ? '加入绘制队列' : '让大肥鱼开始画画！')),
+  )
+}
+
+/** 选区工具栏的共享悬停卡片：图片绘制、视频绘制和导出复用同一交互。 */
+function ToolbarPopover(props) {
+  const detailsRef = React.useRef(null)
+  const panelRef = React.useRef(null)
+  const closeTimerRef = React.useRef(null)
+  const disabled = props.disabled === true
+  const label = props.label || '绘制'
+  const positionPanel = () => {
+    const details = detailsRef.current
+    const panel = panelRef.current
+    if (details === null || panel === null || !details.open || disabled) return
+    if (typeof panel.showPopover === 'function' && !panel.matches(':popover-open')) panel.showPopover()
+    const anchor = details.getBoundingClientRect()
+    const viewportWidth = document.documentElement.clientWidth
+    const viewportHeight = document.documentElement.clientHeight
+    panel.style.width = Math.min(320, viewportWidth - 24) + 'px'
+    panel.style.maxHeight = Math.max(120, viewportHeight - 24) + 'px'
+    const height = panel.getBoundingClientRect().height
+    panel.style.left = Math.max(12, Math.min(anchor.left - 12, viewportWidth - panel.offsetWidth - 12)) + 'px'
+    const above = anchor.top - height - 12
+    const below = anchor.bottom + 12
+    panel.style.top = Math.max(12, above >= 12 ? above : Math.min(below, viewportHeight - height - 12)) + 'px'
+  }
+  const close = () => {
+    if (closeTimerRef.current !== null) { clearTimeout(closeTimerRef.current); closeTimerRef.current = null }
+    if (detailsRef.current !== null) detailsRef.current.open = false
+    const panel = panelRef.current
+    if (panel !== null && typeof panel.hidePopover === 'function' && panel.matches(':popover-open')) panel.hidePopover()
+  }
+  const keepOpen = () => {
+    if (disabled) return
+    if (closeTimerRef.current !== null) { clearTimeout(closeTimerRef.current); closeTimerRef.current = null }
+    if (detailsRef.current !== null) { detailsRef.current.open = true; positionPanel() }
+  }
+  const scheduleClose = () => {
+    const active = document.activeElement
+    if (props.renderPanel && panelRef.current && active && ['INPUT', 'SELECT', 'TEXTAREA'].includes(active.tagName) && panelRef.current.contains(active)) return
+    if (closeTimerRef.current !== null) clearTimeout(closeTimerRef.current)
+    closeTimerRef.current = setTimeout(close, 220)
+  }
+  React.useEffect(() => {
+    const onOutside = (event) => {
+      if (detailsRef.current !== null && !detailsRef.current.contains(event.target)) close()
+    }
+    document.addEventListener('pointerdown', onOutside, true)
+    window.addEventListener('resize', close)
+    return () => {
+      document.removeEventListener('pointerdown', onOutside, true)
+      window.removeEventListener('resize', close)
+      if (closeTimerRef.current !== null) clearTimeout(closeTimerRef.current)
+    }
+  }, [])
+  const icon = props.icon || React.createElement('svg', { width: 22, height: 22, viewBox: '0 0 24 24', 'aria-hidden': true },
+    React.createElement('path', { d: 'M4 17.5V20h2.5L17 9.5 14.5 7 4 17.5z', fill: 'none', stroke: 'currentColor', strokeWidth: 1.6, strokeLinejoin: 'round' }),
+    React.createElement('path', { d: 'M13.2 8.3l2.5 2.5', fill: 'none', stroke: 'currentColor', strokeWidth: 1.6, strokeLinecap: 'round' }),
+    React.createElement('path', { d: 'M4 4h7M4 8h4', fill: 'none', stroke: 'currentColor', strokeWidth: 1.6, strokeLinecap: 'round' }))
+  return React.createElement('details', {
+    ref: detailsRef, className: 'drawai-color-palette' + (disabled ? ' disabled' : ''), name: props.group,
+    onPointerEnter: keepOpen, onPointerLeave: scheduleClose,
+    onToggle: (event) => {
+      if (event.target !== event.currentTarget) return
+      if (disabled) { event.currentTarget.open = false; return }
+      if (event.currentTarget.open) positionPanel()
+      else close()
+    },
+  },
+    React.createElement('summary', {
+      'aria-label': label, 'aria-disabled': disabled,
+      title: disabled ? props.disabledTitle || '请先导入图片文件后再绘制' : undefined,
+      onClick: (event) => { event.preventDefault(); if (!disabled) { keepOpen() } },
+      onFocus: keepOpen,
+    },
+      React.createElement('span', { className: 'drawai-tool-icon' }, icon,
+        React.createElement('span', { className: 'drawai-color-caret' }, '⌃')),
+      React.createElement('span', { className: 'drawai-color-label' }, label)),
+    disabled ? null : React.createElement('div', {
+      ref: panelRef, popover: 'manual', className: 'drawai-palette-panel', role: 'group', 'aria-label': label + '面板',
+      onPointerEnter: keepOpen, onPointerLeave: scheduleClose,
+      onKeyDown: (event) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); close() } },
+    }, props.renderPanel ? props.renderPanel(close) : React.createElement(ImageTracePanel, {
+      key: props.source && props.source.id, source: props.source,
+      onGenerate: (options) => props.onGenerate(props.source, options),
+      onEnqueue: props.onEnqueue ? async (options) => { const job = await props.onEnqueue(props.source, options); close(); return job } : undefined,
+      onApply: (result) => { props.onApply(props.source, result); close() },
+    })),
+  )
+}
+
+const ImageTraceControl = ToolbarPopover
+
+function VideoTraceStatusCard(props) {
+  const [collapsed, setCollapsed] = React.useState(false)
+  const job = props.job
+  const percent = Math.min(100, Math.round((job.done || 0) / Math.max(1, job.total || 1) * 100))
+  return React.createElement('section', { className: 'drawai-video-task-card', role: 'region', 'aria-label': '视频复刻任务',
+    onPointerDown: (event) => event.stopPropagation(), onDoubleClick: (event) => event.stopPropagation(), onKeyDown: (event) => event.stopPropagation(),
+  }, React.createElement('div', { className: 'drawai-trace-card-heading' },
+    React.createElement('span', null, job.busy ? '视频复刻 · ' + percent + '%' : job.error ? '视频复刻失败' : '视频复刻'),
+    React.createElement('div', { className: 'drawai-trace-card-actions' },
+      job.busy ? React.createElement('button', { type: 'button', className: 'drawai-trace-pin', onClick: props.onCancel }, '取消') :
+        React.createElement('button', { type: 'button', className: 'drawai-trace-pin', onClick: props.onClose }, '关闭'),
+      React.createElement('button', { type: 'button', className: 'drawai-trace-pin', 'aria-label': collapsed ? '展开复刻进度' : '收起复刻进度', 'aria-expanded': !collapsed,
+        onClick: () => setCollapsed(!collapsed) }, collapsed ? '展开' : '收起'))),
+    job.busy ? React.createElement('progress', { value: job.done || 0, max: job.total || 1, 'aria-label': '视频复刻进度' }) : null,
+    collapsed ? null : React.createElement('div', { className: 'drawai-video-task-detail' },
+      React.createElement('div', { role: job.error ? 'alert' : 'status', 'aria-live': 'polite' }, job.message),
+      job.busy && job.total > 1 ? React.createElement('small', null, (job.done || 0).toLocaleString() + ' / ' + job.total.toLocaleString() + ' 帧') : null,
+      job.error && job.options ? React.createElement('button', { type: 'button', className: 'drawai-btn', onClick: props.onRetry }, '重试复刻') : null))
+}
+
+function VideoExportJobs(props) {
+  const [collapsed, setCollapsed] = React.useState(false)
+  if (!props.jobs.length) return null
+  const button = (label, onClick) => React.createElement('button', { type: 'button', className: 'drawai-trace-pin', onClick }, label)
+  return React.createElement('section', { className: 'drawai-video-task-card', role: 'region', 'aria-label': '后台视频导出',
+    style: { top: 68, bottom: 'auto', left: 12, right: 'auto', width: 320, maxHeight: '45%', overflow: 'auto' },
+    onPointerDown: (event) => event.stopPropagation(), onDoubleClick: (event) => event.stopPropagation(), onKeyDown: (event) => event.stopPropagation(),
+  }, React.createElement('div', { className: 'drawai-trace-card-heading' },
+    React.createElement('strong', null, '后台导出 · ' + props.jobs.length),
+    button(collapsed ? '展开' : '收起', () => setCollapsed(!collapsed))),
+  collapsed ? null : props.jobs.map((job) => React.createElement('div', { key: job.token, className: 'drawai-video-task-detail' },
+    React.createElement('strong', null, job.clip + ' · ' + job.format.toUpperCase() + ' · ' +
+      ({ rendering: '正在渲染', encoding: '正在编码', done: '已保存', error: '导出失败' }[job.status] || job.status)),
+    ['rendering', 'encoding'].includes(job.status) ? React.createElement('small', null,
+      (job.status === 'rendering' ? job.received : job.encoded) + (job.count ? '/' + job.count : '') + ' 帧；切换页面后仍会继续') : null,
+    job.path ? React.createElement('small', { style: { overflowWrap: 'anywhere', userSelect: 'text' } }, '已保存：' + job.path) : null,
+    job.error ? React.createElement('div', { className: 'drawai-err', role: 'alert' }, job.error) : null,
+    React.createElement('div', { className: 'drawai-trace-card-actions' },
+      job.error ? button('复制错误', () => writeClipboardText(job.error).catch(() => {})) : null,
+      job.status === 'done' ? button('下载文件', () => props.onDownload(job)) : null,
+      button(['done', 'error'].includes(job.status) ? '移除记录' : '取消导出', () => props.onDiscard(job))))))
+}
+
+function DrawingQueuePanel(props) {
+  const [, refresh] = React.useState(0)
+  const [collapsed, setCollapsed] = React.useState(false)
+  const [error, setError] = React.useState('')
+  React.useEffect(() => drawingQueue.subscribe(() => refresh((value) => value + 1)), [])
+  const jobs = drawingQueue.list(props.sessionId || '')
+  if (!jobs.length) return null
+  const paused = drawingQueue.isPaused(props.sessionId)
+  const labels = { queued: '等待绘制', running: '绘制中', paused: '已暂停', cancelling: '正在取消', ready_to_apply: '等待加入原画布', applied: '正在自动保存', succeeded: '已完成', failed: '失败', cancelled: '已取消' }
+  const button = (label, action, disabled) => React.createElement('button', { key: label, type: 'button', className: 'drawai-trace-pin', disabled, onClick: action }, label)
+  const done = jobs.filter((job) => ['succeeded', 'failed', 'cancelled'].includes(job.status))
+  return React.createElement('section', { className: 'drawai-video-task-card', role: 'region', 'aria-label': '绘制队列',
+    style: { width: 340, maxHeight: '55%', overflow: 'auto' },
+    onPointerDown: (event) => event.stopPropagation(), onDoubleClick: (event) => event.stopPropagation(), onKeyDown: (event) => event.stopPropagation(),
+  }, React.createElement('div', { className: 'drawai-trace-card-heading' },
+    React.createElement('span', null, '绘制队列 · ' + jobs.filter((job) => !['succeeded', 'failed', 'cancelled'].includes(job.status)).length + ' 项待完成'),
+    button(collapsed ? '展开' : '收起', () => setCollapsed(!collapsed))),
+    collapsed ? null : React.createElement('div', null,
+      React.createElement('div', { className: 'drawai-trace-card-actions' },
+        button(paused ? '继续队列' : '暂停队列', () => drawingQueue.pauseQueue(props.sessionId, !paused)),
+        done.length ? button('清除已结束', () => done.forEach((job) => drawingQueue.remove(job.id))) : null),
+      React.createElement('small', null, paused ? '当前任务继续；后续任务暂不启动。' : '依次绘制；切换标签或对话可继续。刷新或重启会中断。'),
+      error ? React.createElement('div', { className: 'drawai-err', role: 'alert' }, error) : null,
+      jobs.map((job) => {
+        const here = job.scope.path === props.path && job.scope.page === props.page
+        const preview = job.kind === 'video' && job.status === 'running' ? canvasSessions.task(job.scope.sessionId, job.scope.path, job.scope.page).job?.svg : null
+        const message = job.error || (job.pauseRequested ? '等待当前在途帧完成后暂停' : job.status === 'running' ? job.message : '')
+        return React.createElement('div', { key: job.id, className: 'drawai-video-task-detail', style: { borderTop: '1px solid #8883', paddingTop: 8 } },
+          React.createElement('strong', null, job.label + ' · ' + (job.status === 'applied' && job.error ? '自动保存失败' : labels[job.status])),
+          React.createElement('small', null, String(job.scope.path).split(/[\\/]/).pop() + ' · 第 ' + (job.scope.page + 1) + ' 页 · ' + job.options.colors + ' 色 / ' + job.options.level),
+          job.status === 'running' && job.total > 1 ? React.createElement('progress', { value: job.done, max: job.total, 'aria-label': job.label + '绘制进度' }) : null,
+          preview ? React.createElement('img', { src: 'data:image/svg+xml,' + encodeURIComponent(preview), alt: '最近完成的绘制帧', style: { width: '100%', maxHeight: 140, objectFit: 'contain' } }) : null,
+          message ? React.createElement('div', { className: job.error ? 'drawai-err' : 'drawai-note', style: { whiteSpace: 'pre-wrap' } }, message) : null,
+          React.createElement('div', { className: 'drawai-trace-card-actions', style: { flexWrap: 'wrap' } },
+            job.status === 'queued' ? [button('上移', () => drawingQueue.move(job.id, -1)), button('下移', () => drawingQueue.move(job.id, 1)), button('暂停', () => drawingQueue.pause(job.id))] : null,
+            job.status === 'running' && job.kind === 'video' ? button('暂停', () => drawingQueue.pause(job.id), job.pauseRequested) : null,
+            job.status === 'paused' ? button('继续', () => drawingQueue.resume(job.id)) : null,
+            ['queued', 'running', 'paused'].includes(job.status) ? button('取消', () => drawingQueue.cancel(job.id)) : null,
+            ['failed', 'cancelled'].includes(job.status) ? button('重试', () => { try { drawingQueue.retry(job.id); setError('') } catch (error) { setError(String(error.message || error)) } }) : null,
+            job.error ? button('复制错误', () => writeClipboardText(job.error).catch(() => {})) : null,
+            job.status === 'applied' && job.error && here ? button('重试自动保存', props.onSave) : null,
+            job.status === 'ready_to_apply' && here ? button('加入画布', props.onApply) : null,
+            job.status === 'ready_to_apply' ? button('放弃结果', () => {
+              const owner = canvasSessions.task(job.scope.sessionId, job.scope.path, job.scope.page)
+              if (owner.result?.taskId === job.id) canvasSessions.update(owner, { result: null })
+              drawingQueue.discardReady(job.id)
+            }) : null,
+            ['ready_to_apply', 'applied'].includes(job.status) && !here ? React.createElement('small', null, '返回原画布页面后会自动接收并保存') : null))
+      })))
+}
+
+function ExportPanel(props) {
+  const saved = props.prefs && props.prefs.exportOptions || {}
+  const [format, setFormat] = React.useState(saved.format === 'svg' ? 'svg' : 'png')
+  const [scope, setScope] = React.useState('all')
+  const [transparent, setTransparent] = React.useState(saved.transparent === true)
+  const [scale, setScale] = React.useState([1, 2, 4].includes(saved.scale) ? saved.scale : 4)
+  const [name, setName] = React.useState(() => String(props.path || 'diagram').split(/[\\/]/).pop().replace(/\.drawio$/i, ''))
+  const [busy, setBusy] = React.useState(false)
+  const [padding, setPadding] = React.useState(numberOr(saved.padding, 24))
+  const [grid, setGrid] = React.useState(saved.grid === true)
+  const [backgroundColor, setBackgroundColor] = React.useState(normalizeCustomColor(saved.backgroundColor) || '#ffffff')
+  const [sizeMode, setSizeMode] = React.useState(saved.sizeMode === 'custom' ? 'custom' : 'scale')
+  const [pixelWidth, setPixelWidth] = React.useState(saved.pixelWidth || 1024)
+  const [pixelHeight, setPixelHeight] = React.useState(saved.pixelHeight || 768)
+  const [lockAspect, setLockAspect] = React.useState(saved.lockAspect !== false)
+  const [chosenLayers, setChosenLayers] = React.useState(props.activeLayerId ? [props.activeLayerId] : [])
+  const [estimate, setEstimate] = React.useState({ status: 'idle' })
+  const selected = Array.isArray(props.selectedIds) ? props.selectedIds : []
+  const selection = scope === 'selection'
+  const layers = props.doc && Array.isArray(props.doc.layers) ? props.doc.layers : []
+  const layerIds = scope === 'current-layer' ? (props.activeLayerId ? [props.activeLayerId] : []) : scope === 'layers' ? chosenLayers.filter((id) => layers.some((layer) => layer.id === id)) : undefined
+  const config = { format, transparent, scale, padding: Math.max(0, Math.min(2048, Number(padding) || 0)), grid, backgroundColor, lockAspect,
+    ...(selection ? { ids: selected.slice() } : {}), ...(layerIds ? { layerIds } : {}),
+    ...(sizeMode === 'custom' ? { pixelWidth: Number(pixelWidth), pixelHeight: Number(pixelHeight) } : {}) }
+  const exportDoc = exportDocument(props.doc, config)
+  const geometry = exportDoc ? exportGeometry(exportDoc, config) : { width: 1, height: 1 }
+  const output = exportOutputSize(geometry.width, geometry.height, config)
+  const ratio = geometry.width / geometry.height
+  const hidden = hiddenLayerIds(exportDoc)
+  const count = exportDoc ? exportDoc.nodes.concat(exportDoc.edges, exportDoc.labels || []).filter((cell) => !isHiddenCell(hidden, cell)).length : 0
+  const invalid = !exportDoc || name.trim().length === 0 || (sizeMode === 'custom' && (!Number.isFinite(Number(pixelWidth)) || !(Number(pixelWidth) > 0) || !Number.isFinite(Number(pixelHeight)) || !(Number(pixelHeight) > 0)))
+  const estimateKey = JSON.stringify(config)
+  React.useEffect(() => {
+    if (invalid || typeof props.onEstimate !== 'function') { setEstimate({ status: 'idle' }); return }
+    let alive = true
+    setEstimate({ status: 'loading' })
+    const timer = setTimeout(() => {
+      Promise.resolve(props.onEstimate(config)).then((result) => { if (alive) setEstimate({ status: 'ready', bytes: result.bytes }) },
+        () => { if (alive) setEstimate({ status: 'error' }) })
+    }, 400)
+    return () => { alive = false; clearTimeout(timer) }
+  }, [estimateKey, props.doc, props.mode, invalid])
+  const field = (label, control) => React.createElement('label', { className: 'drawai-export-field' }, React.createElement('span', null, label), control)
+  const choice = (label, value, options, change) => React.createElement('select', { 'aria-label': label, value, onChange: (event) => change(event.target.value) },
+    options.map(([v, text, disabled]) => React.createElement('option', { key: v, value: v, disabled: disabled === true }, text)))
+  const dimensions = (label, value, change) => React.createElement('label', { className: 'drawai-export-dimension' }, label,
+    React.createElement('input', { type: 'number', min: 1, step: 1, 'aria-label': label, value, onChange: (event) => change(event.target.value), onKeyDown: (event) => event.stopPropagation() }))
+  return React.createElement('div', { className: 'drawai-export-panel' },
+    React.createElement('div', { className: 'drawai-panel-heading' }, '导出'),
+    React.createElement('div', { className: 'drawai-export-fields' },
+      field('范围', choice('导出范围', scope, [['all', '当前页 · 全部可见图层'], ['selection', '当前选区（' + selected.length + '）', selected.length === 0],
+        ['current-layer', '当前图层', !props.activeLayerId], ['layers', '指定图层', layers.length === 0]], setScope)),
+      scope === 'layers' ? React.createElement('div', { className: 'drawai-export-layer-options' }, layers.map((layer, index) => React.createElement('label', { key: layer.id },
+        React.createElement('input', { type: 'checkbox', 'aria-label': '导出图层 ' + layerLabelOf(layer, index), checked: chosenLayers.includes(layer.id),
+          onChange: (event) => setChosenLayers((current) => event.target.checked ? current.concat(layer.id) : current.filter((id) => id !== layer.id)) }), layerLabelOf(layer, index) + (layer.visible === false ? '（隐藏）' : '')))) : null,
+      field('格式', choice('导出格式', format, [['png', 'PNG 图片'], ['svg', 'SVG 矢量图']], setFormat)),
+      field('背景', choice('导出背景', transparent ? 'transparent' : 'paper', [['paper', '保留背景'], ['transparent', '透明']], (value) => setTransparent(value === 'transparent'))),
+      format === 'png' && sizeMode === 'scale' ? field('分辨率', choice('导出分辨率', String(scale), [[1, '1×'], [2, '2×'], [4, '4×']], (value) => setScale(Number(value)))) : null,
+      field('文件名', React.createElement('div', { className: 'drawai-export-filename' },
+        React.createElement('input', { 'aria-label': '导出文件名', value: name, onChange: (event) => setName(event.target.value), onKeyDown: (event) => event.stopPropagation() }),
+        React.createElement('span', null, '.' + format))),
+      React.createElement('details', { className: 'drawai-export-advanced' }, React.createElement('summary', null, '更多设置'),
+        field('尺寸', choice('导出尺寸方式', sizeMode, [['scale', format === 'png' ? '按倍数' : '按内容'], ['custom', '指定宽高']], (value) => {
+          if (value === 'custom' && sizeMode !== 'custom') { setPixelWidth(output.width); setPixelHeight(output.height) }
+          setSizeMode(value)
+        })),
+        sizeMode === 'custom' ? React.createElement('div', { className: 'drawai-export-dimensions' },
+          dimensions('宽度 px', pixelWidth, (value) => { setPixelWidth(value); if (lockAspect && Number(value) > 0) setPixelHeight(Math.max(1, Math.round(Number(value) / ratio))) }),
+          dimensions('高度 px', pixelHeight, (value) => { setPixelHeight(value); if (lockAspect && Number(value) > 0) setPixelWidth(Math.max(1, Math.round(Number(value) * ratio))) }),
+          React.createElement('label', { className: 'drawai-export-check' }, React.createElement('input', { type: 'checkbox', 'aria-label': '保持宽高比', checked: lockAspect, onChange: (event) => {
+            setLockAspect(event.target.checked); if (event.target.checked && Number(pixelWidth) > 0) setPixelHeight(Math.max(1, Math.round(Number(pixelWidth) / ratio)))
+          } }), '保持宽高比'),
+        ) : null,
+        field('留白 px', React.createElement('input', { type: 'number', min: 0, max: 2048, 'aria-label': '四周留白', value: padding, onChange: (event) => setPadding(event.target.value), onKeyDown: (event) => event.stopPropagation() })),
+        React.createElement('label', { className: 'drawai-export-check' }, React.createElement('input', { type: 'checkbox', 'aria-label': '导出网格', checked: grid, onChange: (event) => setGrid(event.target.checked) }), '显示网格'),
+        !transparent ? React.createElement(ColorPalette, { label: '背景色', kind: 'fill', value: backgroundColor, group: 'drawai-export-color', customColors: props.prefs && props.prefs.customColors,
+          onPick: setBackgroundColor, onSaveColor: (color) => props.onPrefs({ customColors: customColorList(customColorList(props.prefs && props.prefs.customColors).concat(color)) }),
+        }) : null,
+      ),
+      React.createElement('div', { className: 'drawai-export-info', 'aria-live': 'polite' },
+        format === 'png' ? output.width + ' × ' + output.height + ' px' : '矢量格式 · ' + output.width + ' × ' + output.height,
+        React.createElement('div', null, count + ' 个对象 · 当前页 ' + (numberOr(props.pageIndex, 0) + 1)),
+        estimate.status === 'ready' ? React.createElement('div', null, '预计文件大小：' + (estimate.bytes < 1048576 ? (estimate.bytes / 1024).toFixed(1) + ' KB' : (estimate.bytes / 1048576).toFixed(2) + ' MB'))
+          : React.createElement('div', null, estimate.status === 'loading' ? '正在编码预估文件大小…' : estimate.status === 'error' ? '暂时无法预估大小' : ''),
+        output.limited ? React.createElement('div', null, '尺寸已按浏览器容量限制等比缩小') : null),
+    ),
+    React.createElement('div', { className: 'drawai-layer-footer' },
+      React.createElement('button', { type: 'button', className: 'drawai-btn drawai-primary-btn', disabled: invalid || busy, onClick: () => {
+        if (invalid || busy) return
+        setBusy(true)
+        props.onPrefs({ exportOptions: { format, transparent, scale, padding: config.padding, grid, backgroundColor, sizeMode, pixelWidth: Number(pixelWidth), pixelHeight: Number(pixelHeight), lockAspect } })
+        const filename = name.trim().replace(/[\\/:*?"<>|]/g, '_').replace(/\.(png|svg)$/i, '') || 'diagram'
+        props.onExport(Object.assign({}, config, { name: filename }))
+      } }, busy ? '正在导出…' : '导出'),
+    ),
+  )
+}
+
+/** 新的图层 id：`L<n>`，避开文档里已经用掉的 id（节点/连线/图层都算）。 */
+function nextLayerIdOf(doc) {
+  const used = new Set()
+  const layers = doc !== null && doc !== undefined && Array.isArray(doc.layers) ? doc.layers : []
+  const nodes = doc !== null && doc !== undefined && Array.isArray(doc.nodes) ? doc.nodes : []
+  const edges = doc !== null && doc !== undefined && Array.isArray(doc.edges) ? doc.edges : []
+  for (const l of layers) if (l !== null && l !== undefined) used.add(String(l.id))
+  for (const n of nodes) if (n !== null && n !== undefined) used.add(String(n.id))
+  for (const e of edges) if (e !== null && e !== undefined) used.add(String(e.id))
+  let n = layers.length + 1
+  while (used.has('L' + n)) n += 1
+  return 'L' + n
+}
+
+/**
+ * 选区拖动的**统一位移**：整个选区用同一个 (dx, dy)，相对位置就完全不变。
+ *
+ * 吸附只做一次 —— 拿"抓起来的那个节点"当基准：它的落点吸到整格，其余成员跟着同一个位移
+ * （所以第二、第三个节点保持它们之间原有的错位，不会被各自吸到同一格上叠起来；
+ * 以前正是逐点各自 snap，实测"两个差 3px 的节点一拖就重合"）。
+ * 选区里没有节点时（只拖连线）按半格吸附 —— 与折点、自由端点同一套单位。
+ */
+/**
+ * 右键菜单里的"样式类"操作该作用于谁：**右键点中的那个若在选区里，就整组生效**。
+ *
+ * 以前无条件只改 `menu.id` —— 于是框选一片之后想统一换色只能一个个点。
+ * 删除、拖动、复制、对齐早就是整组生效的，样式没跟上很不一致。
+ * 只挑**同类型**的（节点菜单不动连线，反之亦然）。
+ */
+function styleTargets(selectedIds, clickedId, isNode) {
+  const ids = Array.isArray(selectedIds) ? selectedIds : []
+  if (ids.indexOf(clickedId) < 0) return [clickedId]
+  const out = []
+  for (let i = 0; i < ids.length; i += 1) if (isNode(ids[i]) === true) out.push(ids[i])
+  return out.length > 0 ? out : [clickedId]
+}
+
+/**
+ * 全选（Ctrl+A，也是「编辑 → 全选」）：节点与连线都选上 —— 与框选同一套语义
+ * （框到线也算选中），所以"全选"之后能整体拖动、整体换样式、Delete 一把清掉。
+ */
+function allIdsOf(doc) {
+  const out = []
+  if (doc === null || doc === undefined) return out
+  const hidden = hiddenLayerIds(doc)
+  const locked = lockedLayerIds(doc)
+  const nodes = Array.isArray(doc.nodes) ? doc.nodes : []
+  const edges = Array.isArray(doc.edges) ? doc.edges : []
+  // 全选跳过隐藏层与锁定层：隐藏的选了也看不见；锁定的选了也改不了。
+  for (let i = 0; i < nodes.length; i += 1) {
+    if (isHiddenCell(hidden, nodes[i]) || isLockedCell(locked, nodes[i])) continue
+    out.push(nodes[i].id)
+  }
+  for (let i = 0; i < edges.length; i += 1) {
+    if (isHiddenCell(hidden, edges[i]) || isLockedCell(locked, edges[i])) continue
+    out.push(edges[i].id)
+  }
+  return out
+}
+
+/**
+ * 拖动时的**对齐辅助线**（drawio 的 guides）：与其它节点的 左/中/右、上/中/下 六条线比，
+ * 差在容差内就吸过去，并把那条线画出来。
+ *
+ * @param boxes 其它节点（**不含正在拖的那些**）的 {id,x,y,w,h}
+ * @param box   正在拖的**选区外接框**（不是单个节点：整组拖动时以组为准，与 drawio 一致）
+ * @returns { dx, dy, guides: [{ axis:'x'|'y', at, from, to }] }
+ */
+function alignGuidesFor(boxes, box, tolerance) {
+  const tol = Number.isFinite(tolerance) && tolerance > 0 ? tolerance : 6
+  const mine = {
+    x: [box.x, box.x + box.w / 2, box.x + box.w],
+    y: [box.y, box.y + box.h / 2, box.y + box.h],
+  }
+  const best = { x: null, y: null }
+  for (let i = 0; i < boxes.length; i += 1) {
+    const other = boxes[i]
+    const theirs = {
+      x: [other.x, other.x + other.w / 2, other.x + other.w],
+      y: [other.y, other.y + other.h / 2, other.y + other.h],
+    }
+    const axisKeys = ['x', 'y']
+    for (let a = 0; a < axisKeys.length; a += 1) {
+      const axis = axisKeys[a]
+      for (let m = 0; m < 3; m += 1) {
+        for (let t = 0; t < 3; t += 1) {
+          const delta = theirs[axis][t] - mine[axis][m]
+          if (Math.abs(delta) > tol) continue
+          const current = best[axis]
+          if (current === null || Math.abs(delta) < Math.abs(current.delta)) {
+            best[axis] = { delta: delta, at: theirs[axis][t], other: other }
+          }
+        }
+      }
+    }
+  }
+  const guides = []
+  const dx = best.x === null ? 0 : best.x.delta
+  const dy = best.y === null ? 0 : best.y.delta
+  if (best.x !== null) {
+    const other = best.x.other
+    guides.push({
+      axis: 'x',
+      at: best.x.at,
+      from: Math.min(box.y + dy, other.y),
+      to: Math.max(box.y + box.h + dy, other.y + other.h),
+    })
+  }
+  if (best.y !== null) {
+    const other = best.y.other
+    guides.push({
+      axis: 'y',
+      at: best.y.at,
+      from: Math.min(box.x + dx, other.x),
+      to: Math.max(box.x + box.w + dx, other.x + other.w),
+    })
+  }
+  return { dx: dx, dy: dy, guides: guides }
+}
+
+/** 一组节点的外接框（整组拖动时对齐辅助线以组为准；空集合返回 null）。 */
+function boxOfBoxes(items) {
+  if (Array.isArray(items) === false || items.length === 0) return null
+  let minX = Infinity
+  let minY = Infinity
+  let maxX = -Infinity
+  let maxY = -Infinity
+  for (let i = 0; i < items.length; i += 1) {
+    const it = items[i]
+    if (it.x < minX) minX = it.x
+    if (it.y < minY) minY = it.y
+    if (it.x + it.w > maxX) maxX = it.x + it.w
+    if (it.y + it.h > maxY) maxY = it.y + it.h
+  }
+  return { x: minX, y: minY, w: maxX - minX, h: maxY - minY }
+}
+
+function dragMoveOf(drag, point) {
+  const dx = point.x - drag.originX
+  const dy = point.y - drag.originY
+  const unit = drag.hasNodes === true ? GRID : EDGE_GRID
+  if (drag.ref === undefined || drag.ref === null) return { x: snapTo(dx, unit), y: snapTo(dy, unit) }
+  return { x: snapTo(drag.ref.x + dx, unit) - drag.ref.x, y: snapTo(drag.ref.y + dy, unit) - drag.ref.y }
+}
+
+/** 选中集合位移后的几何：节点坐标 + 连线自己的那部分几何（折点、自由端点）。
+ *
+ * 纯函数：组件只负责把它写回文档，自测可以直接断言"相对位置没变"。
+ */
+function draggedGeometry(drag, move) {
+  const nodes = drag.starts.map((s) => ({ id: s.id, x: s.x + move.x, y: s.y + move.y }))
+  const edges = []
+  for (let i = 0; i < drag.edgeStarts.length; i += 1) {
+    const e = drag.edgeStarts[i]
+    edges.push({
+      id: e.id,
+      points: e.points === null || e.points === undefined ? null : e.points.map((p) => ({ x: p.x + move.x, y: p.y + move.y })),
+      sourcePoint: e.sourcePoint === null || e.sourcePoint === undefined ? null : { x: e.sourcePoint.x + move.x, y: e.sourcePoint.y + move.y },
+      targetPoint: e.targetPoint === null || e.targetPoint === undefined ? null : { x: e.targetPoint.x + move.x, y: e.targetPoint.y + move.y },
+    })
+  }
+  return { nodes: nodes, edges: edges }
+}
+
+/**
+ * 框选命中：与矩形相交的**节点** + 与矩形相交的**连线**。
+ *
+ * 连线按**段**判定（不是拿整条边的外接矩形去比）：我们的路径每段都是横/竖的，
+ * 段的外接矩形就是它自己，所以"框到线才算选中"是精确的 —— 用整条边的外接框会把
+ * 绕了大弯的边在离得很远的地方也选中（drawio 用的 cell state 外接框正是这个毛病）。
+ *
+ * 抽成纯函数是为了能被断言：之前它只收节点，框住一排线时**一条都不亮**，
+ * 用户报的"批量框选时线段也应该有被选中的提示"就是这个。
+ */
+function marqueeHits(doc, rect, memory) {
+  const hits = []
+  if (doc === null || doc === undefined) return hits
+  const hidden = hiddenLayerIds(doc)
+  const locked = lockedLayerIds(doc)
+  const nodes = Array.isArray(doc.nodes) ? doc.nodes : []
+  for (let i = 0; i < nodes.length; i += 1) {
+    const n = nodes[i]
+    if (isHiddenCell(hidden, n) || isLockedCell(locked, n)) continue
+    const x = numberOr(n.x, 0)
+    const y = numberOr(n.y, 0)
+    const w = numberOr(n.w, FALLBACK_NODE_W)
+    const h = numberOr(n.h, FALLBACK_NODE_H)
+    if (x < rect.x + rect.w && x + w > rect.x && y < rect.y + rect.h && y + h > rect.y) hits.push(n.id)
+  }
+  const edges = Array.isArray(doc.edges) ? doc.edges : []
+  for (let i = 0; i < edges.length; i += 1) {
+    const edge = edges[i]
+    if (isHiddenCell(hidden, edge) || isLockedCell(locked, edge)) continue
+    const pts = edgeRoutePoints(doc, edge, memory)
+    if (pts === null || pts.length < 2) continue
+    for (let s = 0; s < pts.length - 1; s += 1) {
+      if (segmentHitsBox(pts[s], pts[s + 1], rect, 0)) {
+        hits.push(edge.id)
+        break
+      }
+    }
+  }
+  return hits
+}
+
+/**
+ * 批量对齐 / 分布的**纯计算**部分：只算出"谁该挪到哪"，不碰文档、不碰 React。
+ *
+ * 刻意抽成纯函数：这段是"差两个像素也说得过去、但错了很难看出来"的类型，
+ * 放在组件里就只能靠肉眼验；抽出来之后 tools/check-render.mjs 能直接断言坐标。
+ *
+ * kind ∈ left | centerX | right | top | centerY | bottom | distributeX | distributeY
+ * 返回 { id: 新坐标 }，没参与的直接不在表里。
+ *
+ * 两个刻意的决定：
+ *  - 基准取**选中集合整体的外接框**（左对齐 = 都贴到最左那个的左边缘），
+ *    而不是"第一个选中的节点" —— 后者在 Shift 加选时顺序不直观，用户猜不到基准是谁。
+ *  - 结果统一过 snap()：画布把拖动吸附到 10px 网格，对齐若落在网格外，
+ *    下一次拖动会把它吸回去，看起来就像"对齐完又自己跑了两像素"。
+ */
+function computeAlignMoves(doc, ids, kind, grid) {
+  const targets = []
+  for (let i = 0; i < doc.nodes.length; i += 1) {
+    const n = doc.nodes[i]
+    if (ids.indexOf(n.id) < 0) continue
+    targets.push({ id: n.id, x: numberOr(n.x, 0), y: numberOr(n.y, 0), w: numberOr(n.w, FALLBACK_NODE_W), h: numberOr(n.h, FALLBACK_NODE_H) })
+  }
+  if (targets.length < 2) return {}
+  const snapTo = (v) => Math.round(v / grid) * grid
+  let minX = Infinity
+  let maxX = -Infinity
+  let minY = Infinity
+  let maxY = -Infinity
+  for (let i = 0; i < targets.length; i += 1) {
+    const t = targets[i]
+    if (t.x < minX) minX = t.x
+    if (t.x + t.w > maxX) maxX = t.x + t.w
+    if (t.y < minY) minY = t.y
+    if (t.y + t.h > maxY) maxY = t.y + t.h
+  }
+  const moves = {}
+  if (kind === 'distributeX' || kind === 'distributeY') {
+    if (targets.length < 3) return {} // 两个节点之间没有"间距"可均分
+    const horizontal = kind === 'distributeX'
+    const sorted = targets.slice().sort((a, b) => (horizontal ? a.x - b.x : a.y - b.y))
+    const first = horizontal ? sorted[0].x : sorted[0].y
+    const last = horizontal ? sorted[sorted.length - 1].x : sorted[sorted.length - 1].y
+    const step = (last - first) / (sorted.length - 1)
+    // 首尾钉住不动，只摊开中间那些 —— 这才是"分布"的语义。
+    for (let i = 1; i < sorted.length - 1; i += 1) moves[sorted[i].id] = { axis: horizontal ? 'x' : 'y', value: snapTo(first + step * i) }
+    return moves
+  }
+  for (let i = 0; i < targets.length; i += 1) {
+    const t = targets[i]
+    let axis = 'x'
+    let value = 0
+    if (kind === 'left') value = minX
+    else if (kind === 'right') value = maxX - t.w
+    else if (kind === 'centerX') value = (minX + maxX) / 2 - t.w / 2
+    else if (kind === 'top') {
+      axis = 'y'
+      value = minY
+    } else if (kind === 'bottom') {
+      axis = 'y'
+      value = maxY - t.h
+    } else if (kind === 'centerY') {
+      axis = 'y'
+      value = (minY + maxY) / 2 - t.h / 2
+    } else return {}
+    moves[t.id] = { axis: axis, value: snapTo(value) }
+  }
+  return moves
+}
+
+/** 四面引出端点：n/e/s/w。顺序固定，便于稳定比较。 */
+const SIDES = ['n', 'e', 's', 'w']
+
+/**
+ * 一个节点四个**可连接的端点**（贴着边框）以及各自的引出桩点（边框外 24px）。
+ *
+ * 桩点就是 stubPointFor 的产物，也是落盘时写进 edge.points 的那个点 ——
+ * 所以"预览从哪个端点进出"和"松手后从哪个端点进出"用的是同一份坐标。
+ */
+function anchorSidesOf(geo) {
+  // 垂直方向取半格：端点圆点要与路由实际接入的位置重合（否则会看到"线接在圆点旁边"）。
+  const cx = snapFree(geo.x + geo.w / 2)
+  const cy = snapFree(geo.y + geo.h / 2)
+  return {
+    n: { side: 'n', x: cx, y: geo.y, sx: cx, sy: geo.y - 24 },
+    e: { side: 'e', x: geo.x + geo.w, y: cy, sx: geo.x + geo.w + 24, sy: cy },
+    s: { side: 's', x: cx, y: geo.y + geo.h, sx: cx, sy: geo.y + geo.h + 24 },
+    w: { side: 'w', x: geo.x, y: cy, sx: geo.x - 24, sy: cy },
+  }
+}
+
+/**
+ * 按指针位置挑一个端点。
+ *
+ * 与"算法自己挑"的区别在于：这个选择是**看得见的** —— 四个端点会画出来，选中的那个高亮，
+ * 预览线也从它进出。用户想换一个，把指针往那个端点挪近一点即可（判定就是距离最近）。
+ * 平手时先用"进线方向对着源节点"的那个，避免指针落在节点中心时随机挑一边。
+ */
+function pickSides(geo, cursor, toward) {
+  const anchors = anchorSidesOf(geo)
+  let best = anchors.s
+  let bestScore = Infinity
+  for (let i = 0; i < SIDES.length; i += 1) {
+    const a = anchors[SIDES[i]]
+    const d = Math.abs(a.x - cursor.x) + Math.abs(a.y - cursor.y)
+    // 只有"距离完全平手"时才看朝向（指针落在节点正中时四个端点里有两对等距）。
+    // 注意 toward 要取自**源节点的真实中心**，不能用对齐过的中心 ——
+    // 对齐后源中心正好落在目标中心上，朝向判据就永远为真、也就等于没有。
+    const facing = Math.abs(a.x - toward.x) + Math.abs(a.y - toward.y)
+    const score = d * 1000 + facing
+    if (score < bestScore) {
+      bestScore = score
+      best = a
+    }
+  }
+  return best
+}
+
+/**
+ * （已退役）v1 的 `waypointsForRetarget` 在这里：它把"被拖端/固定端的端点约束"折算成
+ * 贴在该侧外面的**桩点**，再混进 edge.points 一起落盘。
+ *
+ * v1.1 起这个函数不需要了：端点约束存在 style 的 `exitX/exitY`、`entryX/entryY` 里，
+ * 由 `chainForRoute` 在**路由时**把桩点拼进必经点链。于是预览与落盘共用同一份拼装，
+ * 而 edge.points 只剩用户真正摆下的折点 —— 两套模型不再互相污染。
+ */
+
+/**
+ * 把一个落在节点内部的点推到该节点外面（推最短的一侧）。
+ *
+ * 为什么必须有：折点、锚点、端点桩点都可能落在某个节点内部（用户把线拖到节点上、
+ * 或者节点移动后原本在外的折点被"吞"进去了）。这时若照直连过去，线就会**穿进节点内部**，
+ * 看起来像画错了。实测过这些:
+ *   · 折点在源节点内部   → 路径从东边出去又折回节点里 80px
+ *   · 折点在目标边框上   → 最后一段沿着边框往下走 30px（贴着内部）
+ *   · 拖线预览的锚点     → 回穿源节点 160px
+ *
+ * 方向 peference：优先沿"这个点相对节点的方位"往外推（哪边距离短走哪边），
+ * 落在正中时按 toward（通常是另一端）决定，避免随便挑一边。
+ * 推出去以后**不动**用户的折点数据 —— 只改路由用的副本。
+ */
+function pushOutOfBox(point, geo, toward) {
+  const pad = 1
+  const inside = point.x > geo.x && point.x < geo.x + geo.w && point.y > geo.y && point.y < geo.y + geo.h
+  if (!inside) return point
+  const left = point.x - geo.x
+  const right = geo.x + geo.w - point.x
+  const top = point.y - geo.y
+  const bottom = geo.y + geo.h - point.y
+  const d = toward === undefined || toward === null ? null : { x: toward.x - point.x, y: toward.y - point.y }
+  // 四个候选出口（各带"这个出口是否朝 toward"的偏好）
+  const options = [
+    { side: 'w', dist: left, toward: d !== null && d.x < 0 },
+    { side: 'e', dist: right, toward: d !== null && d.x > 0 },
+    { side: 'n', dist: top, toward: d !== null && d.y < 0 },
+    { side: 's', dist: bottom, toward: d !== null && d.y > 0 },
+  ]
+  const facing = options.filter((o) => o.toward)
+  const pool = facing.length > 0 ? facing : options
+  let best = pool[0]
+  for (let i = 1; i < pool.length; i += 1) if (pool[i].dist < best.dist) best = pool[i]
+  if (best.side === 'w') return { x: geo.x - pad, y: point.y }
+  if (best.side === 'e') return { x: geo.x + geo.w + pad, y: point.y }
+  if (best.side === 'n') return { x: point.x, y: geo.y - pad }
+  return { x: point.x, y: geo.y + geo.h + pad }
+}
+
+/**
+ * 从一批节点盒里找出 point 落在哪个盒子内部（返回第一个命中的）。
+ */
+function boxContaining(boxes, point, skip) {
+  if (boxes === undefined || boxes === null) return null
+  for (let i = 0; i < boxes.length; i += 1) {
+    const box = boxes[i]
+    if (skip !== undefined && skip !== null && skip[box.id] === true) continue
+    const geo = box.geo
+    if (point.x > geo.x && point.x < geo.x + geo.w && point.y > geo.y && point.y < geo.y + geo.h) return box
+  }
+  return null
+}
+
+/** 一条边的某一端是否"有着落"：连着真实节点，或者有自由点（drawio 的悬空端）。 */
+function edgeHasEnd(edge, end) {
+  const id = end === 'source' ? edge.from : edge.to
+  if (typeof id === 'string' && id.length > 0) return true
+  return edgeFreePoint(edge, end) !== null
+}
+
+/**
+ * 把一条边的一端解析成"盒子"：连着节点就用节点盒，悬空端用**自由点**合成一个零尺寸盒。
+ *
+ * 零尺寸盒正是预览给"空白处光标"用的那个技巧 —— 于是悬空端的路由与预览走同一条通路。
+ * 优先顶点、自由点次之，正是 drawio 的规则（`sourcePoint`/`targetPoint` 只在该端
+ * **没有**真实顶点时才生效，见 mxGeometry 的说明）。
+ *
+ * @returns 盒子，或 null（这一端既没顶点也没自由点 —— 这条边画不出来）
+ */
+function endpointBoxOf(byId, edge, end) {
+  const id = end === 'source' ? edge.from : edge.to
+  if (typeof id === 'string' && byId[id] !== undefined) return byId[id]
+  const point = edgeFreePoint(edge, end)
+  if (point === null) return null
+  return { id: '__free-' + end, geo: { x: point.x, y: point.y, w: 0, h: 0 } }
+}
+
+/** 渲染期构造路由迟滞的 hint（memory 挂在 ui 上，同一次渲染里所有边共用一份）。 */
+function edgeRouteHint(ui, edge) {
+  const memory = ui === undefined || ui === null ? undefined : ui.routeMemory
+  if (memory === undefined || memory === null) return undefined
+  return { memory: memory, key: String(edge.id) }
+}
+
+/**
+ * 一条边当前的折线路径（渲染、命中、定位、段把手都用它）。
+ *
+ * `memory`（可选）是路由迟滞用的 Map：同一张画布上，**渲染与命中必须传同一个** ——
+ * 否则迟滞期间"画出来的线"和"点得到的线"会是两条不同的路。
+ */
+function edgeRoutePoints(doc, edge, memory) {
+  const geometry = buildGeometry(doc)
+  const from = endpointBoxOf(geometry.byId, edge, 'source')
+  const to = endpointBoxOf(geometry.byId, edge, 'target')
+  if (from === null || to === null) return null
+  const hint = memory === undefined || memory === null ? undefined : { memory: memory, key: String(edge.id) }
+  return routeEdgeStyled(from, to, geometry.boxes, geometry.bounds, edge, hint)
+}
+
+/**
+ * 按一条边的 style 路由：折点、端点约束（`exitX/exitY` 与 `entryX/entryY`）、以及"是不是直线"
+ * （`edgeStyle=none`）统统从文档的 style 键读。渲染、命中、标签定位、预览全走它 ——
+ * 一条边在哪儿只有一个答案。
+ */
+function routeEdgeStyled(fromBox, toBox, boxes, bounds, edge, hint) {
+  const style = typeof edge.style === 'string' ? edge.style : DEFAULT_EDGE_STYLE
+  return routeEdge(fromBox, toBox, boxes, bounds, edge.points, sidesFromStyle(style), !isOrthogonalEdgeStyle(style), hint)
+}
+
+/**
+ * 松手落点：**DOM 命中优先，没有 DOM 命中就回落到"最后一帧预览高亮的那个节点"**。
+ *
+ * 为什么必须有回落：预览是按**几何容差**（HOT_PAD）判"会连上"的，而节点组的 pointerup
+ * 只有在指针**真的压在节点上**时才触发。于是松手落在容差里时，节点组收不到事件 ——
+ * 表现就是"预览亮着环、松手什么也没有"（实测报过：从节点上方往目标下方/右方拖，连不上）。
+ * 既然预览已经把它高亮成落点，落盘就该认它：预览高亮谁，就连谁。
+ *
+ * 放在模块级（而不是组件里）是为了能被自测直接断言。
+ */
+function dropTargetOf(domId, preview) {
+  if (typeof domId === 'string' && domId.length > 0) return domId
+  if (preview === null || preview === undefined) return null
+  if (preview.hot === null || preview.hot === undefined) return null
+  return typeof preview.hot.id === 'string' && preview.hot.id.length > 0 ? preview.hot.id : null
+}
+
+/** 以 unit 为单位的吸附（节点用 GRID = 整格，连线用 EDGE_GRID = 半格）。 */
+function snapTo(value, unit) {
+  return Math.round(value / unit) * unit
+}
+
+/** 节点尺寸下限：都取**整格**（60 = 6 格、40 = 4 格）。原来的 minH=36 不是整格，
+ *  一旦撞上下限就会把"尺寸是整格"这条不变量破坏掉。 */
+const MIN_NODE_W = GRID * 6
+const MIN_NODE_H = GRID * 4
+
+/**
+ * 缩放的结果盒子：**最小单位是一格**，被拖的那条边按 GRID 吸附，对边原地不动。
+ *
+ * 为什么吸附"尺寸"而不是"增量"：文档里的宽度可能是 186 这种非整格值（估宽 / 导入 / 手写），
+ * 只吸附增量会永远把那个零头带着走（186 → 196 → 206…），中心也就永远落在半像素上 ——
+ * 那正是"两条线段差一像素合不成一条"的上游来源。尺寸吸附之后，只要对边在格线上，
+ * 四条边与长宽就都是整格。
+ *
+ * 抽成模块级纯函数是为了能被命令行自测直接断言：吸附规则很容易被后续改动悄悄破坏。
+ */
+function resizeBox(base, dir, rawDx, rawDy) {
+  const east = base.x + base.w
+  const south = base.y + base.h
+  let x = base.x
+  let y = base.y
+  let w = base.w
+  let h = base.h
+  if (dir.indexOf('e') >= 0) w = Math.max(MIN_NODE_W, snapTo(base.w + rawDx, GRID))
+  if (dir.indexOf('s') >= 0) h = Math.max(MIN_NODE_H, snapTo(base.h + rawDy, GRID))
+  if (dir.indexOf('w') >= 0) {
+    w = Math.max(MIN_NODE_W, snapTo(base.w - rawDx, GRID))
+    x = east - w
+  }
+  if (dir.indexOf('n') >= 0) {
+    h = Math.max(MIN_NODE_H, snapTo(base.h - rawDy, GRID))
+    y = south - h
+  }
+  return { x: x, y: y, w: w, h: h }
+}
+
+/**
+ * 拖折点段时的**统一位移**：只在垂直于线段的那一轴上生效，且让**参考点落在半格上**。
+ *
+ * 为什么是"统一位移"而不是"逐点各自吸附"：几乎水平的段（两端 y 差 0.5px 以内）如果逐点吸附，
+ * 两点可能落到不同的 5px 刻度上 —— 段就凭空多出一个 5px 的倾斜。
+ * 用同一个位移，段的形状原样保留，只是整体按半格挪动。
+ *
+ * 抽成纯函数是为了能被自测直接钉住：单位规则最容易在后续改动里被悄悄破坏。
+ */
+function segmentMoveOf(refPoint, horizontal, rawX, rawY) {
+  if (horizontal) return { x: 0, y: snapTo(refPoint.y + rawY, EDGE_GRID) - refPoint.y }
+  return { x: snapTo(refPoint.x + rawX, EDGE_GRID) - refPoint.x, y: 0 }
+}
+
+/** 节点的几何（渲染与路由共用同一套默认值）。 */
+function nodeGeoOf(node) {
+  return { x: numberOr(node.x, 0), y: numberOr(node.y, 0), w: numberOr(node.w, FALLBACK_NODE_W), h: numberOr(node.h, FALLBACK_NODE_H) }
+}
+
+/**
+ * 指针落点下的节点 —— 按**几何**判定，不是 elementFromPoint。
+ *
+ * 两个原因：
+ *  - 拖拽的最后一帧里，指针不一定还在节点上（稍稍滑出边界就不认了），而 draw.io 的语义是"靠近即接"；
+ *  - 预览要提前知道落点，而 DOM 命中测试只有在松手那一刻才有意义。
+ *
+ * padding 是"靠近"的容差：指针落在形状外这么多像素里，也算落在它身上。
+ * 倒序遍历 —— 后画的节点压在先画的上面，命中要按可见顺序取最上面那个。
+ * excludeId：改接端点时排除被钉住的那一端（指针滑回它身上不该高亮它）。
+ * 新建连线**不排除起点** —— 把线放回起点节点自己就是自环，得让它能被命中。
+ */
+function hitNodeAt(doc, geometry, x, y, padding, excludeId) {
+  if (doc === null || geometry === undefined || geometry === null) return null
+  const locked = lockedLayerIds(doc)
+  for (let i = geometry.boxes.length - 1; i >= 0; i -= 1) {
+    const box = geometry.boxes[i]
+    if (excludeId !== null && excludeId !== undefined && box.id === excludeId) continue
+    // 锁定层看得见但点不到（仍然参与避让 —— 几何里有它）。
+    if (box.node !== undefined && isLockedCell(locked, box.node)) continue
+    const g = box.geo
+    if (x >= g.x - padding && x <= g.x + g.w + padding && y >= g.y - padding && y <= g.y + g.h + padding) return box
+  }
+  return null
+}
+
+/**
+ * 实时预览的折线 —— **和真正落盘时走同一套路由**（routeEdge / connectOrtho / stubPointFor）。
+ *
+ * 这里曾经是一条从起点直接拉到指针的直线：能看出"在连线"，但看不出"这条线会怎么走"，
+ * 松手那一刻路径会整段跳变成正交折线。既然路由函数本来就在手上，预览就该用同一套算法，
+ * 让预览与结果一致（WYSIWYG）。
+ *
+ * 三种目标形态：
+ *  - seed 非空：用户指定的引出边（和 onNodePointerUp 落盘时一样）——先把该侧的 stub 钉住，
+ *    再从这个 stub 路由过去，否则算法会另挑一边，预览和结果就对不上；
+ *  - 目标是一个真实节点（吸附命中）：用它的 geo，但 id 换成 '__preview' —— routeEdge 用 id 做过
+ *    障碍排除，沿用真 id 会把"预览的落点"和"图上的那个节点"混为一谈；
+ *    用独立 id 还能保证目标节点被当成障碍物参与避让，预览更接近真实走线。
+ *    **例外：目标就是起点自己**（自环）—— 这时必须沿用真 id，才能走进自环分支。
+ *  - 目标是空白处的指针：造一个零尺寸的虚拟盒，于是 routeEdge 会从它现有的 6 个候选里挑一个
+ *    L 形/绕行走法 —— 预览在空白处也是折线，而不是斜线。
+ */
+/**
+ * 预览用的路由：把"这一帧选中的两端"当**约束**喂给 routeEdge。
+ *
+ * seed = { source, target, jetty }（侧名或 null）。与落盘写进 style 的 exitX/exitY、
+ * entryX/entryY 是同一批值 —— 这是"预览即结果"的根据。
+ */
+function routePreview(fromBox, target, seed) {
+  if (fromBox === undefined || fromBox === null || target === null || target === undefined) return null
+  // 自环（指针回到起点节点上）：**沿用真实 id**，让 routeEdge 走它的自环分支。
+  // 普通情况用 '__preview' 这个独立 id：routeEdge 拿 id 做障碍排除，沿用真 id 会把
+  // "预览的落点"和"图上的那个节点"混为一谈。
+  const selfLoop = fromBox.id === target.id
+  const toBox = { id: selfLoop ? fromBox.id : '__preview', geo: target.geo }
+  const boxes = []
+  for (let i = 0; i < target.boxes.length; i += 1) boxes.push(target.boxes[i])
+  boxes.push(toBox)
+  const sides =
+    seed === null || seed === undefined ? null : { source: seed.source, target: seed.target, jetty: seed.jetty }
+  const raw = routeEdge(fromBox, toBox, boxes, target.bounds, null, sides)
+  // routeEdge 自己已经收过尾（去共线、消台阶）：这里**不再收第二次**。
+  // 收第二次会用一个"不保折点"的简化，于是预览比落盘少一个点 ——
+  // 表现就是"拖的时候线是这样，松手就变样"。
+  const pts = raw
+  for (let i = 0; i < pts.length; i += 1) {
+    if (!Number.isFinite(pts[i].x) || !Number.isFinite(pts[i].y)) return null
+  }
+  if (pts.length < 2) return null
+  return pts
+}
+
+/**
+ * 把路由结果打包成预览数据。
+ *
+ * 返回 { points, hot, sides }：
+ *  - hot 非空 = 指针落在了某个节点身上；
+ *  - sides = { from, to } 是**这一帧选中的两个端点**（贴边框的那个 side 名或 null）。
+ *    调用方在松手时把同一对 side 转成桩点写进文档，预览才不是"仅供参考"。
+ *
+ * 两端都钉住桩点来路由（而不是让 routeThroughWaypoints 自己再挑一次落点边），
+ * 因为那一步会重新推导出边，用户看到的"接在右边"和实际落盘的边可能对不上。
+ */
+function routePreviewFor(doc, geometry, cursor, fromId, fromGeo, seed, padding, excludeId) {
+  const hot = hitNodeAt(doc, geometry, cursor.x, cursor.y, padding, excludeId)
+  const fromAnchors = anchorSidesOf(fromGeo)
+  const seedSide = seed !== null && seed !== undefined && typeof seed.side === 'string' && seed.side.length > 0 ? seed.side : null
+  const seedAnchor = seedSide === null ? null : fromAnchors[seedSide]
+  if (seedSide !== null && seedAnchor === undefined) return null
+
+  let toSide = null
+  if (hot !== null) {
+    // 指针落在节点上：按"离哪个端点近"选边 —— 目标侧也由用户选，不由算法猜。
+    const toward = { x: fromGeo.x + fromGeo.w / 2, y: fromGeo.y + fromGeo.h / 2 }
+    toSide = pickSides(hot.geo, cursor, toward).side
+    // 自环：进出口不能同侧（同侧会原地折回、屏幕上什么都看不见）。
+    // 这条纠正必须在这里做 —— 预览显示的侧就是落盘写进 style 的侧，两处不一致就等于骗人。
+    if (hot.id === fromId && toSide === seedSide) toSide = nextSideOf(seedSide)
+  }
+
+  const fromBox = { id: fromId, geo: fromGeo, label: fromId }
+  const targetGeo = hot === null ? { x: cursor.x, y: cursor.y, w: 0, h: 0 } : hot.geo
+  const targetBox = { id: hot === null ? '__cursor' : hot.id, geo: targetGeo, boxes: geometry.boxes, bounds: geometry.bounds }
+  // 两侧选中的端点作为**约束**喂给同一条路由：预览与落盘共用 chainForRoute，不存在两套判据。
+  const clean = routePreview(fromBox, targetBox, { source: seedSide, target: toSide, jetty: null })
+  if (clean === null) return null
+  return {
+    points: clean,
+    hot: hot === null ? null : { id: hot.id, x: hot.geo.x, y: hot.geo.y, w: hot.geo.w, h: hot.geo.h },
+    sides: { from: seedSide, to: toSide },
+  }
+}
+
+/**
+ * 改接端点（拖绿/红手柄）时的预览路由。
+ *
+ * 与连线拖拽的差别只有一处：**固定的那一端**在文档里，被拖的那一端跟着指针。
+ * routeEdge 是从 from 路由到 to 的，所以拖 from 时要把两者交换再反转折线顺序。
+ * 除锚点外的节点全算障碍物 —— 预览要尽量给出"松手后的样子"。
+ *
+ * excludeId 排除的是**固定那一端**（拖 to 时是 edge.from，拖 from 时是 edge.to）：
+ * 指针滑回它身上时不该高亮它 —— 松手后那条边等于原地不动，把它标成"落点"是在骗人。
+ */
+function edgePreviewRoute(doc, geometry, edge, kind, cursor, padding) {
+  // 两端都用 endpointBoxOf 解析：**悬空端**是零尺寸盒（自由点），不是 geometry.byId 里的节点。
+  // 之前直接查 byId，于是悬空端既没有预览、也拖不回来（"拖到空处变悬空"没法反向操作）。
+  const fromBox = endpointBoxOf(geometry.byId, edge, 'source')
+  const toBox = endpointBoxOf(geometry.byId, edge, 'target')
+  if (fromBox === null || toBox === null) return null
+  const fixedId = kind === 'from' ? (typeof edge.to === 'string' ? edge.to : null) : typeof edge.from === 'string' ? edge.from : null
+  const hot = hitNodeAt(doc, geometry, cursor.x, cursor.y, padding, fixedId === null ? undefined : fixedId)
+
+  // 两个端点各自的盒：固定端来自文档，被拖端是指针所在处。
+  const fixedBox = kind === 'from' ? toBox : fromBox
+  const anchoredBox = kind === 'from' ? fromBox : toBox
+  const cursorGeo = { x: cursor.x, y: cursor.y, w: 0, h: 0 }
+  const movedBox = hot === null ? { id: anchoredBox.id, geo: cursorGeo } : { id: hot.id, geo: hot.geo }
+
+  // 被拖这一端：吸附到节点就按"离哪个端点近"选边，和新建连线同一套判定。
+  let movedSide = null
+  if (hot !== null) {
+    const toward = { x: fixedBox.geo.x + fixedBox.geo.w / 2, y: fixedBox.geo.y + fixedBox.geo.h / 2 }
+    movedSide = pickSides(hot.geo, cursor, toward).side
+  }
+  // 固定端保持文档里现有的约束 —— **只读不猜**。
+  // （v1 这里是"从 edge.points 反推它现在贴哪一侧"再补一个桩点；v1.1 起约束本来就在 style 里。）
+  const fixedEnd = kind === 'from' ? 'target' : 'source'
+  const fixedSide = pinnedSideOf(edge, fixedEnd)
+  const sides = kind === 'from' ? { source: movedSide, target: fixedSide } : { source: fixedSide, target: movedSide }
+
+  // 与落盘共用 routeEdge + chainForRoute —— 预览和结果是同一条线的保证就在这里。
+  // 折点表始终按边的真实方向（fromBox → toBox）排列，所以**不反转**折线：
+  // 拖 from 端时被拖的那个盒本来就是 fromBox，出来的顺序就是对的。
+  const boxes = []
+  for (let i = 0; i < geometry.boxes.length; i += 1) boxes.push(geometry.boxes[i])
+  boxes.push(movedBox)
+  const straight = !isOrthogonalEdgeStyle(typeof edge.style === 'string' ? edge.style : DEFAULT_EDGE_STYLE)
+  const pts = kind === 'from'
+    ? routeEdge(movedBox, fixedBox, boxes, geometry.bounds, edge.points, sides, straight)
+    : routeEdge(fixedBox, movedBox, boxes, geometry.bounds, edge.points, sides, straight)
+  // routeEdge 自己已经收过尾（去共线、消台阶），这里**不再收第二次**：
+  // 第二次收尾不保折点，会把用户摆的折点消掉 —— 于是"拖的时候线是这样，松手就变样"。
+  const out = pts
+  for (let i = 0; i < out.length; i += 1) {
+    if (!Number.isFinite(out[i].x) || !Number.isFinite(out[i].y)) return null
+  }
+  if (out.length < 2) return null
+  return {
+    points: out,
+    hot: hot === null ? null : { id: hot.id, x: hot.geo.x, y: hot.geo.y, w: hot.geo.w, h: hot.geo.h },
+    side: movedSide,
+  }
+}
+
+/**
+ * drawio 独立边标签单元的落点 —— 与 `mxGraphView.getPoint` **同一套算法**。
+ *
+ * 相对几何的三个量各有含义（对着 drawio 源码核实过，不是猜的）：
+ *   · `x` ∈ [-1,1] 是**沿边的比例**：0 = 中点，-1 = 源端，+1 = 目标端
+ *     （源码里 `dist = (x/2 + 0.5) * 总长`）；
+ *   · `y` 是**垂直偏移**（px），正数在行进方向的左侧 —— 横线左→右时就是"线上方"；
+ *   · `offset`（`<mxPoint as="offset"/>`）是残余偏移，drawio 生成标签时用它把标签对准鼠标。
+ *
+ * 法线用 mxGraph 的约定：横/竖段上 `nx = dy/seg`、`ny = dx/seg`，
+ * 落点 `x = p.x + dx*factor + (nx*y + offsetX)`、`y = p.y + dy*factor - (ny*y - offsetY)`。
+ *
+ * @returns { x, y } 或 null（路径不可用时）
+ */
+function edgeLabelPointAt(pts, x, y, offsetX, offsetY) {
+  if (Array.isArray(pts) === false || pts.length < 2) return null
+  const segs = []
+  let total = 0
+  for (let i = 1; i < pts.length; i += 1) {
+    const len = Math.abs(pts[i].x - pts[i - 1].x) + Math.abs(pts[i].y - pts[i - 1].y)
+    segs.push(len)
+    total += len
+  }
+  if (total <= 0) return null
+  const gx = (Number.isFinite(Number(x)) ? Number(x) : 0) / 2
+  let dist = Math.round((gx + 0.5) * total)
+  if (dist < 0) dist = 0
+  if (dist > total) dist = total
+  let acc = 0
+  let index = 0
+  while (index < segs.length - 1 && dist >= Math.round(acc + segs[index])) {
+    acc += segs[index]
+    index += 1
+  }
+  const seg = segs[index]
+  const factor = seg === 0 ? 0 : (dist - acc) / seg
+  const p0 = pts[index]
+  const pe = pts[index + 1]
+  if (p0 === undefined || pe === undefined) return null
+  const dx = pe.x - p0.x
+  const dy = pe.y - p0.y
+  const nx = seg === 0 ? 0 : dy / seg
+  const ny = seg === 0 ? 0 : dx / seg
+  const perp = Number.isFinite(Number(y)) ? Number(y) : 0
+  const ox = Number.isFinite(Number(offsetX)) ? Number(offsetX) : 0
+  const oy = Number.isFinite(Number(offsetY)) ? Number(offsetY) : 0
+  return { x: p0.x + dx * factor + (nx * perp + ox), y: p0.y + dy * factor - (ny * perp - oy) }
+}
+
+/**
+ * `edgeLabelPointAt` 的反函数：**把标签拖到的那个点**换算成 drawio 的相对位置。
+ *
+ * 与 `mxGraphView.getRelativePoint` 同一套算法：找最近的一段 → 在段上投影 →
+ * 沿边的弧长 `d` 换成比例 `x = 2d/总长 - 1`，垂距换成 `y`（正负号与 getPoint 的法线一致）。
+ * 拖标签时用它把指针位置写成 x/y/offset —— 与 drawio 的 `mxEdgeHandler.moveLabel` 同一套存储。
+ *
+ * @returns { x, y } 或 null（路径不可用）
+ */
+function relativePointOnPath(pts, x, y) {
+  if (Array.isArray(pts) === false || pts.length < 2) return null
+  const segs = []
+  let total = 0
+  for (let i = 1; i < pts.length; i += 1) {
+    const len = Math.abs(pts[i].x - pts[i - 1].x) + Math.abs(pts[i].y - pts[i - 1].y)
+    segs.push(len)
+    total += len
+  }
+  if (total <= 0) return null
+  // 最近的一段（含它之前的弧长）—— 鼠标离哪一段近，就按那一段换算。
+  let index = 0
+  let bestDist = Infinity
+  let before = 0
+  let acc = 0
+  for (let i = 0; i < segs.length; i += 1) {
+    const a = pts[i]
+    const b = pts[i + 1]
+    const vx = b.x - a.x
+    const vy = b.y - a.y
+    const seg = segs[i]
+    let t = seg === 0 ? 0 : ((x - a.x) * vx + (y - a.y) * vy) / seg
+    if (t < 0) t = 0
+    if (t > seg) t = seg
+    const px = a.x + (seg === 0 ? 0 : (vx / seg) * t)
+    const py = a.y + (seg === 0 ? 0 : (vy / seg) * t)
+    const dist = (x - px) * (x - px) + (y - py) * (y - py)
+    if (dist < bestDist) {
+      bestDist = dist
+      index = i
+      before = acc
+    }
+    acc += seg
+  }
+  const p0 = pts[index]
+  const pe = pts[index + 1]
+  const seg = segs[index]
+  const dx = pe.x - p0.x
+  const dy = pe.y - p0.y
+  let proj = seg === 0 ? 0 : ((x - p0.x) * dx + (y - p0.y) * dy) / seg
+  if (proj < 0) proj = 0
+  if (proj > seg) proj = seg
+  const dist = before + proj
+  const nx = seg === 0 ? 0 : dy / seg
+  const ny = seg === 0 ? 0 : dx / seg
+  // 法线是 (nx, -ny)；沿它投影就是"垂直于边、偏离多少"（(dx,dy) 在这个方向上没有分量）。
+  const perp = (x - p0.x) * nx - (y - p0.y) * ny
+  return { x: (2 * dist) / total - 1, y: perp }
+}
+
+/**
+ * 拖标签落到哪儿：和 drawio 的 `mxEdgeHandler.moveLabel` 一样，
+ * `x` 取 4 位小数、`y` 取整，再把**取整剩下的零头**记进 `offset` —— 于是标签正好落在指针下，
+ * 而文件里那两个数是干净的数（drawio 读回来也一样）。
+ */
+function labelPosFor(pts, point) {
+  const rel = relativePointOnPath(pts, point.x, point.y)
+  if (rel === null) return null
+  const x = Math.round(rel.x * 10000) / 10000
+  const y = Math.round(rel.y)
+  const at = edgeLabelPointAt(pts, x, y, 0, 0)
+  const offsetX = at === null ? 0 : Math.round(point.x - at.x)
+  const offsetY = at === null ? 0 : Math.round(point.y - at.y)
+  return { labelX: x, labelY: y, labelOffsetX: offsetX, labelOffsetY: offsetY }
+}
+
+/** 折线的分段长度与总长（标签挖空按弧长定位，与 edgeLabelPointAt 同一套弧长）。 */
+function arcLengths(pts) {
+  const segs = []
+  let total = 0
+  for (let i = 1; i < pts.length; i += 1) {
+    const len = Math.abs(pts[i].x - pts[i - 1].x) + Math.abs(pts[i].y - pts[i - 1].y)
+    segs.push(len)
+    total += len
+  }
+  return { segs: segs, total: total }
+}
+
+/** 弧长 d 处的点（把"挖空的边界"落成折线上的点）。 */
+function pointAtArc(pts, segs, d) {
+  let acc = 0
+  for (let i = 0; i < segs.length; i += 1) {
+    const seg = segs[i]
+    if (d <= acc + seg || i === segs.length - 1) {
+      const t = seg === 0 ? 0 : Math.max(0, Math.min(1, (d - acc) / seg))
+      return { x: pts[i].x + (pts[i + 1].x - pts[i].x) * t, y: pts[i].y + (pts[i + 1].y - pts[i].y) * t }
+    }
+    acc += seg
+  }
+  return { x: pts[pts.length - 1].x, y: pts[pts.length - 1].y }
+}
+
+/** 连线标签按实际字号和行数占位，同时用于线条避让。 */
+function labelBox(pos, text, fontSize) {
+  if (pos === null || pos === undefined) return null
+  const lines = String(text || '').split('\n')
+  const w = Math.max(...lines.map((line) => textWidth(line, fontSize))) + 6
+  const h = labelLineHeight(fontSize) * lines.length + 2
+  return { x: pos.x - w / 2, y: pos.y + 1 - h / 2, w: w, h: h }
+}
+
+function edgeEditorBox(edge, text, pos, ctm, origin, mode) {
+  const style = typeof edge.style === 'string' ? edge.style : ''
+  const fontSize = styleNumber(style, 'fontSize', 10)
+  const lineHeight = labelLineHeight(fontSize)
+  const lines = String(text || '').split('\n')
+  const width = Math.max(24, ...lines.map((line) => textWidth(line, fontSize)))
+  const height = lines.length * lineHeight
+  const scale = numberOr(ctm.a, 1)
+  return { left: (pos.x - width / 2) * scale + numberOr(ctm.e, 0) - origin.left,
+    top: (pos.y + 1 - height / 2) * scale + numberOr(ctm.f, 0) - origin.top,
+    width: width * scale, height: height * scale, fontSize: fontSize * scale,
+    lineHeight: lineHeight * scale, scale, wraps: false, textAlign: 'center',
+    color: styleGet(style, 'fontColor', (mode === 'dark' ? DARK : LIGHT).text),
+    opacity: clampNumber(styleNumber(style, 'textOpacity', 100), 0, 100) / 100,
+  }
+}
+
+/**
+ * drawio 的 `labelBackgroundColor` 可能是 `#rrggbbaa`（8 位带透明度，例如它给拖出来的
+ * 标签单元写 `#ffffffe0`）—— SVG 的 fill 不认 8 位十六进制，得拆成颜色 + `fill-opacity`。
+ */
+function parseCssColor(value, fallback) {
+  const text = typeof value === 'string' ? value.trim() : ''
+  const eight = /^#([0-9a-fA-F]{6})([0-9a-fA-F]{2})$/.exec(text)
+  if (eight !== null) {
+    return { color: '#' + eight[1], opacity: Math.round((parseInt(eight[2], 16) / 255) * 1000) / 1000 }
+  }
+  return { color: text.length > 0 ? text : fallback, opacity: 1 }
+}
+
+/** 框外扩一圈（挖空的余量：让字的两侧不留线头）。 */
+function growBox(box, pad) {
+  return { x: box.x - pad, y: box.y - pad, w: box.w + pad * 2, h: box.h + pad * 2 }
+}
+
+/**
+ * 标签压在线上时，线要在**它这块区域里断开** —— 就是 drawio 的观感：字的位置不画线。
+ *
+ * 以前是"在字后面盖一个白色矩形"，两个毛病：把网格也盖掉了（一块白斑）；
+ * 深色主题下那块白尤其突兀；虚线与彩色底上更是穿帮。这里改成真的把线挖掉。
+ *
+ * 返回要挖掉的**弧长区间**（可能多段：框跨过折返的路径时）。正交路径每段只有横/竖两种，
+ * 所以"框与段相交"就是两个一维区间求交。
+ */
+function labelGapsOnPath(pts, box) {
+  if (Array.isArray(pts) === false || pts.length < 2) return []
+  if (box === null || box === undefined) return []
+  const segs = arcLengths(pts).segs
+  const gaps = []
+  let acc = 0
+  for (let i = 0; i < segs.length; i += 1) {
+    const a = pts[i]
+    const b = pts[i + 1]
+    const seg = segs[i]
+    if (seg > 0) {
+      if (Math.abs(a.y - b.y) < 0.5) {
+        if (a.y >= box.y && a.y <= box.y + box.h) {
+          const from = Math.max(Math.min(a.x, b.x), box.x)
+          const to = Math.min(Math.max(a.x, b.x), box.x + box.w)
+          if (to > from) {
+            const s0 = a.x <= b.x ? acc + (from - a.x) : acc + (a.x - from)
+            const s1 = a.x <= b.x ? acc + (to - a.x) : acc + (a.x - to)
+            gaps.push({ from: Math.min(s0, s1), to: Math.max(s0, s1) })
+          }
+        }
+      } else if (Math.abs(a.x - b.x) < 0.5) {
+        if (a.x >= box.x && a.x <= box.x + box.w) {
+          const from = Math.max(Math.min(a.y, b.y), box.y)
+          const to = Math.min(Math.max(a.y, b.y), box.y + box.h)
+          if (to > from) {
+            const s0 = a.y <= b.y ? acc + (from - a.y) : acc + (a.y - from)
+            const s1 = a.y <= b.y ? acc + (to - a.y) : acc + (a.y - to)
+            gaps.push({ from: Math.min(s0, s1), to: Math.max(s0, s1) })
+          }
+        }
+      }
+    }
+    acc += seg
+  }
+  gaps.sort((x, y) => x.from - y.from)
+  const merged = []
+  for (let i = 0; i < gaps.length; i += 1) {
+    const last = merged[merged.length - 1]
+    if (last !== undefined && gaps[i].from <= last.to) last.to = Math.max(last.to, gaps[i].to)
+    else merged.push({ from: gaps[i].from, to: gaps[i].to })
+  }
+  return merged
+}
+
+/** 按弧长区间把折线挖空：返回剩下的若干段子折线（被挖掉的部分自然断开）。
+ *
+ * 两端**各留一小截**（`min(8px, 总长的 20%)`）：文字比这条线还长时（长标签压在短边上），
+ * 不这么护一下整条线会连箭头一起消失 —— 那时读者连方向都看不出来。
+ * 挖空的位置在中间时这条护法不生效（断口本来就离两端很远）。 */
+function cutPathByGaps(pts, gaps) {
+  if (Array.isArray(gaps) === false || gaps.length === 0) return [pts]
+  const lengths = arcLengths(pts)
+  const segs = lengths.segs
+  const total = lengths.total
+  if (total <= 0) return [pts]
+  const keep = Math.min(8, total * 0.2)
+  const kept = []
+  let cursor = 0
+  for (let i = 0; i < gaps.length; i += 1) {
+    // 挖空的区间被夹在 [keep, 总长-keep] 里：两端那两小截永远留着。
+    const from = Math.max(keep, gaps[i].from)
+    const to = Math.min(total - keep, gaps[i].to)
+    if (to <= from) continue
+    if (from > cursor) kept.push([cursor, from])
+    cursor = Math.max(cursor, to)
+  }
+  if (cursor < total) kept.push([cursor, total])
+  const out = []
+  for (let k = 0; k < kept.length; k += 1) {
+    const a = kept[k][0]
+    const b = kept[k][1]
+    if (b - a <= 0.01) continue
+    const sub = [pointAtArc(pts, segs, a)]
+    let acc = 0
+    for (let i = 0; i < segs.length; i += 1) {
+      acc += segs[i]
+      if (acc > a + 0.01 && acc < b - 0.01) sub.push({ x: pts[i + 1].x, y: pts[i + 1].y })
+    }
+    sub.push(pointAtArc(pts, segs, b))
+    out.push(sub)
+  }
+  return out.length > 0 ? out : [pts]
+}
+
+/**
+ * 拖标签时的**吸附**（与画布其余部分同一套单位：连线的几何量走半格 = 5px）。
+ *
+ * 两条，正好覆盖两种情形：
+ *   · 指针先吸到半格 —— 线本身就落在格线上时，标签自动落在线上（垂距 0）；
+ *   · 线不在格线上时（贴节点边框的那一轴是精确值，例如 x=455），补一条**贴线吸附**：
+ *     垂距在 3px 以内就并回线上。没有它，"把字放回线上"只能靠手抖得正好。
+ */
+function snapLabelPoint(pts, point) {
+  const snapped = { x: snapTo(point.x, EDGE_GRID), y: snapTo(point.y, EDGE_GRID) }
+  const rel = relativePointOnPath(pts, snapped.x, snapped.y)
+  if (rel === null) return snapped
+  if (Math.abs(rel.y) <= 3) {
+    const onLine = edgeLabelPointAt(pts, rel.x, 0, 0, 0)
+    if (onLine !== null) return { x: onLine.x, y: onLine.y }
+  }
+  return snapped
+}
+
+/** 边自己的文字落在哪：**drawio 的规则** —— 沿折线的弧长中点，拖过就按拖到的位置。
+ *
+ * drawio 的边标签落点由 `mxGraphView.updateEdgeLabelOffset` 决定：边自己的 `mxGeometry` 是
+ * `relative="1"`（我们写出来的正是这个）时走 `getPoint()` —— `x/y/offset` 缺省（从没拖过）
+ * 就是 `x = 0` → `dist = 0.5 × 总长` = **整条折线的中点**；拖过就是 `x` 比例 + `y` 垂距 + 残余。
+ * `x`/`y`/`offset` 由 `relativePointOnPath` 反解得到（见那里的注释）。
+ *
+ * 这里以前取的是"第 2 段的中点"（pts[1]→pts[2]），于是同一份文件我们和 drawio 画在不同地方：
+ * 折线一拐，我们那段可能只是 24px 的引出段，文字就贴在节点边上。
+ */
+function edgeLabelPosition(pts, edge) {
+  const labelX = edge === undefined || edge === null ? undefined : edge.labelX
+  const labelY = edge === undefined || edge === null ? undefined : edge.labelY
+  const offX = edge === undefined || edge === null ? undefined : edge.labelOffsetX
+  const offY = edge === undefined || edge === null ? undefined : edge.labelOffsetY
+  return edgeLabelPointAt(pts, labelX, labelY, offX, offY)
+}
+
+function renderDiagram(doc, mode, uid, svgRef, ui, view) {
+  const skin = mode === 'dark' ? DARK : LIGHT
+  // 和 buildGeometry 用同一套几何：路由预览（局部命中/预览线）读的是 buildGeometry 的产物，
+  // 两边各算一遍的话，只要默认值有一点差别，预览的落点就会和真正渲染的形状差几个像素。
+  const geometry = buildGeometry(doc)
+  const boxes = geometry.boxes
+  const byId = geometry.byId
+  const bounds = geometry.bounds
+  const minX = bounds.minX
+  const minY = bounds.minY
+  const maxX = bounds.maxX
+  const maxY = bounds.maxY
+  const pad = 40
+  // 视口：显式给了就用它（平移缩放），否则按内容自适应。
+  const vx = view !== undefined && view !== null ? view.x : minX - pad
+  const vy = view !== undefined && view !== null ? view.y : minY - pad
+  const vw = view !== undefined && view !== null ? view.w : maxX - minX + pad * 2
+  const vh = view !== undefined && view !== null ? view.h : maxY - minY + pad * 2
+  const viewBox = [vx, vy, vw, vh].join(' ')
+  const gridId = 'drawai-grid-' + uid
+  const majorId = 'drawai-grid-major-' + uid
+  const arrowId = 'drawai-arrow-' + uid
+  const arrowStartId = 'drawai-arrow-start-' + uid
+
+  const children = []
+  children.push(
+    React.createElement(
+      'defs',
+      { key: 'defs' },
+      React.createElement(
+        'pattern',
+        { key: 'p1', id: gridId, width: 10, height: 10, patternUnits: 'userSpaceOnUse' },
+        React.createElement('path', { d: 'M 10 0 L 0 0 0 10', fill: 'none', stroke: skin.gridMinor, strokeWidth: 1 }),
+      ),
+      React.createElement(
+        'pattern',
+        { key: 'p2', id: majorId, width: 50, height: 50, patternUnits: 'userSpaceOnUse' },
+        React.createElement('rect', { width: 50, height: 50, fill: 'url(#' + gridId + ')' }),
+        React.createElement('path', { d: 'M 50 0 L 0 0 0 50', fill: 'none', stroke: skin.gridMajor, strokeWidth: 1 }),
+      ),
+      React.createElement(
+        'marker',
+        { key: 'm', id: arrowId, viewBox: '0 0 10 10', refX: 9.5, refY: 5, markerWidth: 6, markerHeight: 6, orient: 'auto-start-reverse' },
+        React.createElement('path', { d: 'M 0 0 L 10 5 L 0 10 z', fill: skin.line }),
+      ),
+      // 起点箭头用**同一个**向右的三角形 + orient="auto-start-reverse"：
+      // 这个 orient 值会让贴在线条起点上的 marker 自动反向，所以不必再画一个朝左的路径。
+      React.createElement(
+        'marker',
+        { key: 'ms', id: arrowStartId, viewBox: '0 0 10 10', refX: 9.5, refY: 5, markerWidth: 6, markerHeight: 6, orient: 'auto-start-reverse' },
+        React.createElement('path', { d: 'M 0 0 L 10 5 L 0 10 z', fill: skin.line }),
+      ),
+    ),
+  )
+
+  // 网格纸铺满**整个视口**（不是只铺内容范围）—— 平移到内容之外时，底下仍然是格纸，
+  // 而不是一片透明露出容器背景。关网格（本机偏好）时只铺纸色。
+  const showGrid = ui === undefined || ui === null || ui.showGrid !== false
+  const bgProps = {
+    key: 'bg',
+    x: vx,
+    y: vy,
+    width: vw,
+    height: vh,
+    fill: showGrid ? 'url(#' + majorId + ')' : skin.page === 'transparent' ? '#1b1b1b' : skin.page,
+  }
+  // 点空白处 = 取消选中（bg 是垫在所有元素下面的那张纸）。
+  if (ui !== undefined && ui !== null && typeof ui.onBackgroundPointerDown === 'function') {
+    bgProps.onPointerDown = (event) => ui.onBackgroundPointerDown(event)
+  }
+  children.push(React.createElement('rect', bgProps))
+
+  /** 边的路径：独立边标签要按它算落点（与上面渲染用的是同一次路由结果）。 */
+  const edgePts = {}
+  // 隐藏图层的连线整条不画（它的边标签也跟着藏 —— 标签的 layer 会沿 parent 找到这条边）。
+  const hiddenCells = hiddenLayerIds(doc)
+  // 混合叠放：边与节点先收进 paintedCells，再按 drawOrder 排出，于是边可以压在节点上面。
+  const paintedCells = []
+
+  for (let i = 0; i < doc.edges.length; i += 1) {
+    const edge = doc.edges[i]
+    if (isHiddenCell(hiddenCells, edge)) continue
+    const from = endpointBoxOf(byId, edge, 'source')
+    const to = endpointBoxOf(byId, edge, 'target')
+    if (from === null || to === null) continue
+    const edgeStart = children.length
+    let pts = routeEdgeStyled(from, to, boxes, bounds, edge, edgeRouteHint(ui, edge))
+    edgePts[String(edge.id)] = pts
+    // 安全网：路由若产出非有限坐标，退化成"中心直线"。
+    // 宁可画得难看，也不要让边无声消失 —— 浏览器会静默丢弃 d="M NaN NaN" 的路径，
+    // 这正是上面那个 box/geo 混用 bug 能藏这么久的原因。
+    let degenerate = false
+    for (let k = 0; k < pts.length; k += 1) {
+      if (!Number.isFinite(pts[k].x) || !Number.isFinite(pts[k].y)) {
+        degenerate = true
+        break
+      }
+    }
+    if (degenerate) {
+      pts = [
+        { x: from.geo.x + from.geo.w / 2, y: from.geo.y + from.geo.h / 2 },
+        { x: to.geo.x + to.geo.w / 2, y: to.geo.y + to.geo.h / 2 },
+      ]
+    }
+    const selected = ui !== undefined && ui !== null && Array.isArray(ui.selectedIds) && ui.selectedIds.indexOf(edge.id) >= 0
+    // 连线的画法全部存在文档的 style 键里：dashed/dashPattern 决定线型、endArrow/startArrow
+    // 决定箭头、strokeColor 决定颜色、rounded 决定拐角是否圆滑、curved=1 把折线抹成曲线
+    // —— 与 drawio 一致，缺省即"不画"。命中带与可见线**用同一个 curved 判据**，否则
+    // "看着是曲线、点起来按折线算"，两端拐弯处会点不中。
+    const edgeStyle = typeof edge.style === 'string' ? edge.style : ''
+    const edgeCurved = curvedFromStyle(edgeStyle)
+    // 命中层：连线本身只有 1px，直接点很难点中。先铺一条透明的宽带子承接触击。
+    /** 连线的交互面：命中带、标签底衬、标签文字**共用同一套**处理。
+     *
+     * 点 = 选中这条线；双击 = 改标签；右键 = 连线菜单。
+     *
+     * 标签为什么必须挂：标签的底衬（白色 rect）与文字画在命中带**上面**，
+     * 而它们默认是能命中指针的 —— 不挂的话一次点击被它们吃掉，
+     * 于是"点线上的文字"既不选中也不改标签（用户报的"无法在线段上添加文字"就是这个）。
+     */
+    const edgeFace = (extra) => {
+      const props = Object.assign({}, extra)
+      if (ui !== undefined && ui !== null) {
+        // 按在线段上：选中它（或保留整组）并准备整体拖动；没有 onEdgePointerDown 时退回"只选中"。
+        if (typeof ui.onEdgePointerDown === 'function') props.onPointerDown = (event) => ui.onEdgePointerDown(edge.id, event)
+        else if (typeof ui.onSelectEdge === 'function') props.onPointerDown = (event) => ui.onSelectEdge(edge.id, event)
+        if (typeof ui.onEdgeDoubleClick === 'function') props.onDoubleClick = (event) => ui.onEdgeDoubleClick(edge.id, event)
+        if (typeof ui.onEdgeContextMenu === 'function') props.onContextMenu = (event) => ui.onEdgeContextMenu(edge.id, event)
+      }
+      return props
+    }
+    /** 标签自己的交互面：在连线那套之上，**按住就能拖**（drawio 的标签手柄行为）。
+     *
+     * 为什么标签能拖、而命中带不能：命中带是整条线，按住它是"选中这条线"，
+     * 拖起来会和"拖段把手"打架；标签是一小块，按住它拖 = 挪这个标签，语义不冲突。
+     * 没有文字的边没有这块，也就没有"拖空标签"这回事 —— drawio 同样只在有文字时给标签手柄。 */
+    const edgeLabelFace = (extra) => {
+      const props = edgeFace(extra)
+      if (ui !== undefined && ui !== null && typeof ui.onEdgeLabelPointerDown === 'function') {
+        props.onPointerDown = (event) => ui.onEdgeLabelPointerDown(edge.id, event)
+      }
+      return props
+    }
+    const hitProps = edgeFace({ key: 'edge-hit-' + i, className: 'drawai-edge-hit', d: pathOf(pts, 6, edgeCurved) })
+    children.push(React.createElement('path', hitProps))
+    // 连线的画法全部存在文档的 style 键里：dashed/dashPattern 决定线型、endArrow/startArrow
+    // 决定箭头、strokeColor 决定颜色、rounded 决定拐角是否圆滑 —— 与 drawio 一致，缺省即"不画"。
+    // v1 只存语义（dash:'dashed'）而把像素值留在客户端；v1.1 起渲染参数就是文档的一部分。
+    const strokeColor = styleGet(edgeStyle, 'strokeColor', null)
+    const arrow = arrowFromStyle(edgeStyle)
+    const pattern = dashPatternFromStyle(edgeStyle)
+    // drawio 的圆角半径：mxPolyline.paintLine 取 arcSize（缺省 mxConstants.LINE_ARCSIZE = 20）
+    // 再 **除以 2**（那个 x2 是 addPoints 的内部约定，我们不打算复刻）→ 缺省 10px。
+    const cornerRadius = styleGet(edgeStyle, 'rounded', '0') === '1' ? Math.max(0, styleNumber(edgeStyle, 'arcSize', 20) / 2) : 0
+    const lineStroke = selected ? '#1a73e8' : strokeColor !== null ? strokeColor : skin.line
+    // 线上的文字：先算出**文字框**（渲染与"给线挖空"要用同一个框），
+    // 再把落在框里的那几段线挖掉 —— 于是字的位置不画线，而不是盖一层白底。
+    const labelFontSize = styleNumber(edgeStyle, 'fontSize', 10)
+    const hasOwnLabel = typeof edge.label === 'string' && edge.label.length > 0
+    let ownPos = hasOwnLabel ? edgeLabelPosition(pts, edge) : null
+    // 路径退化成零长（两端落在同一点）时落点算不出来：退回起点，别让文字掉到原点 (0,0) 去。
+    if (ownPos === null && hasOwnLabel && pts.length > 0) ownPos = { x: pts[0].x, y: pts[0].y }
+    const ownBox = ownPos === null ? null : labelBox(ownPos, edge.label, labelFontSize)
+    const gaps = []
+    if (ownBox !== null) gaps.push.apply(gaps, labelGapsOnPath(pts, growBox(ownBox, 2)))
+    // 挂在边上的独立标签单元（drawio 的 edgeLabel）同样"占位不画线"。位置用与下面渲染
+    // 那一段**同一个函数**算，否则框和文字会差几像素、挖空的位置就对不上了。
+    const attached = Array.isArray(doc.labels) ? doc.labels : []
+    for (let L = 0; L < attached.length; L += 1) {
+      const item = attached[L]
+      if (item === null || item === undefined || item.edgeId !== edge.id) continue
+      const itemText = typeof item.text === 'string' ? item.text : ''
+      if (itemText.length === 0) continue
+      const itemPos = edgeLabelPointAt(pts, item.x, item.y, item.offsetX, item.offsetY)
+      if (itemPos === null) continue
+      gaps.push.apply(gaps, labelGapsOnPath(pts, growBox(labelBox(itemPos, itemText, styleNumber(item.style, 'fontSize', 10)), 2)))
+    }
+    const subPaths = gaps.length > 0 ? cutPathByGaps(pts, gaps) : [pts]
+    const edgeProps = {
+      key: 'edge-' + i,
+      d: subPaths
+        .map((sub) => pathOf(sub, cornerRadius, edgeCurved))
+        .filter((text) => text.length > 0)
+        .join(' '),
+      fill: 'none',
+      stroke: lineStroke,
+      strokeWidth: selected ? 2 : styleNumber(edgeStyle, 'strokeWidth', 1),
+      strokeOpacity: clampNumber(styleNumber(edgeStyle, 'strokeOpacity', 100), 0, 100) / 100,
+      markerEnd: arrow === 'none' || arrow === 'start' ? undefined : 'url(#' + arrowId + ')',
+      markerStart: arrow === 'both' || arrow === 'start' ? 'url(#' + arrowStartId + ')' : undefined,
+      pointerEvents: 'none',
+    }
+    if (pattern !== null) edgeProps.strokeDasharray = pattern
+    children.push(React.createElement('path', edgeProps))
+    if (ownBox !== null) {
+      // 底衬只在**样式明确要求**时画（drawio 的 `labelBackgroundColor`）——
+      // 默认不画：线已经在字的位置断开，再盖一层白只会把网格也盖掉。
+      const ownBg = styleGet(edgeStyle, 'labelBackgroundColor', null)
+      if (ownBg !== null) {
+        const bg = parseCssColor(ownBg, skin.labelBg)
+        children.push(
+          React.createElement('rect', edgeLabelFace({ key: 'edge-bg-' + i, x: ownBox.x, y: ownBox.y, width: ownBox.w, height: ownBox.h, rx: 2, fill: bg.color, fillOpacity: bg.opacity })),
+        )
+      }
+      const edgeFontColor = styleGet(edgeStyle, 'fontColor', null)
+      const edgeFontFill = edgeFontColor !== null ? edgeFontColor : skin.text
+      const editingEdge = ui !== undefined && ui !== null && ui.editingEdgeId === edge.id
+      if (!editingEdge) children.push(
+        React.createElement(
+          'text',
+          edgeLabelFace({
+            key: 'edge-text-' + i,
+            x: ownPos.x,
+            y: ownPos.y + 1 - (String(edge.label).split('\n').length - 1) * labelLineHeight(labelFontSize) / 2,
+            textAnchor: 'middle',
+            dominantBaseline: 'middle',
+            fontSize: labelFontSize,
+            fontFamily: FONT,
+            fill: edgeFontFill,
+            fillOpacity: clampNumber(styleNumber(edgeStyle, 'textOpacity', 100), 0, 100) / 100,
+            // inline style：CSS 规则优先级高于 SVG presentation attribute，
+            // 万一 shell 有 svg text{...} 之类的全局规则，只有 inline style 能压住。
+            style: { fill: edgeFontFill, fontFamily: FONT, fontSize: labelFontSize + 'px', dominantBaseline: 'middle', whiteSpace: 'pre' },
+          }),
+          String(edge.label).split('\n').map((line, index) => React.createElement('tspan', {
+            key: 'line-' + index, x: ownPos.x, dy: index === 0 ? 0 : labelLineHeight(labelFontSize),
+          }, line)),
+        ),
+      )
+    }
+    // 选中时的可拖手柄。只保留两种，都是"用户能理解的东西"：
+    //   实心 绿/红 = 端点（拖到别的节点 = 改接）
+    //   空心 橙   = 段把手，每段一个（拖 = 整段平移）
+    //
+    // 刻意不再显示折点：它是"段平移"这套语义的内部记录，暴露出来只会让人多学一个概念。
+    // 想撤销一条折弯用 Ctrl+Z；想全部回到自动，右键连线选「自动路由」。
+    if (selected && ui !== undefined && ui !== null) {
+      const HANDLE_R = 4
+      const ENDPOINT_R = 5
+      const handleCircle = (key, pos, onDown, fill, radius, stroke) =>
+        React.createElement('circle', {
+          key: key,
+          className: 'drawai-handle',
+          cx: pos.x,
+          cy: pos.y,
+          r: radius,
+          fill: fill,
+          stroke: stroke,
+          strokeWidth: 2,
+          onPointerDown: onDown,
+          // 双击把手 = 双击这条线。把手正压在**段的中点**上，而中点恰恰是"给线加文字"
+          // 最自然会去双击的地方：单击选中（把手随即出现）→ 第二下打在把手上 →
+          // dblclick 的 target 变成把手、不再回到下面的命中带，于是编辑器永远打不开。
+          onDoubleClick: (event) => {
+            if (ui !== undefined && ui !== null && typeof ui.onEdgeDoubleClick === 'function') ui.onEdgeDoubleClick(edge.id, event)
+          },
+        })
+      const downAt = (kind, index) => (event) => {
+        if (typeof ui.onEdgeHandlePointerDown === 'function') ui.onEdgeHandlePointerDown(edge.id, kind, index, event)
+      }
+      if (pts.length >= 2) {
+        children.push(handleCircle('edge-from-' + i, pts[0], downAt('from', -1), '#0a7d32', ENDPOINT_R, '#ffffff'))
+        children.push(handleCircle('edge-to-' + i, pts[pts.length - 1], downAt('to', -1), '#b85450', ENDPOINT_R, '#ffffff'))
+      }
+      for (let s = 0; s < pts.length - 1; s += 1) {
+        const a = pts[s]
+        const b = pts[s + 1]
+        const segLen = Math.abs(b.x - a.x) + Math.abs(b.y - a.y)
+        // **每一段都要有把手，短段也不例外。**
+        //
+        // 这里原来是 `if (segLen < 26) continue`（"太短的段不放，否则手柄会挤成一堆"）——
+        // 代价是短段**整段挪不动**，而那恰恰是最常见需要挪一下的段：差几像素的台阶、
+        // 贴边的引出段、两个节点挨得近时的那一小截（实测报过："短线段没有可移动的段点"）。
+        //
+        // 挤的问题用两个小办法缓解：
+        //   · 半径随段长收（4 → 3），短段的手把小一点；
+        //   · 首/末段的中点若离端点把手太近（两个圈会叠住，段和端点都抓不准），
+        //     就把手挪到这一段的**另一端**（那个折点）—— 仍在这一段上，但离端点够远。
+        //     例外：整条边只有一段（首即末）时不能挪 —— 挪到哪一端都会正好压在端点把手上，
+        //     这时留在中点反而最清楚。
+        const atStart = s === 0
+        const atEnd = s === pts.length - 2
+        let pos = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }
+        if ((atStart || atEnd) && !(atStart && atEnd) && segLen < (HANDLE_R + ENDPOINT_R) * 2) pos = atStart ? b : a
+        const radius = Math.max(3, Math.min(HANDLE_R, segLen / 2))
+        children.push(handleCircle('edge-seg-' + i + '-' + s, pos, downAt('segment', s), '#ffffff', radius, '#f2a900'))
+      }
+    }
+    // 改接端点时的预览：同样走真实路由（edgePreviewRoute），从固定那一端画到指针/目标节点。
+    const preview = ui === undefined || ui === null ? null : ui.edgePreview
+    if (preview !== null && preview !== undefined && preview.edgeId === edge.id && pts.length >= 2) {
+      const anchor = preview.kind === 'from' ? pts[pts.length - 1] : pts[0]
+      const routed = Array.isArray(preview.points) && preview.points.length >= 2 ? preview.points : null
+      const sequence = routed === null ? [anchor, { x: preview.x, y: preview.y }] : routed
+      const d = pathOf(sequence, 6)
+      if (d.length > 0) {
+        children.push(
+          React.createElement('path', {
+            key: 'edge-preview-' + i,
+            className: 'drawai-preview',
+            d: d,
+            fill: 'none',
+            stroke: '#1a73e8',
+            strokeWidth: 2,
+            strokeDasharray: '6 4',
+          }),
+        )
+        const end = sequence[sequence.length - 1]
+        if (Math.abs(end.x - preview.x) > 0.5 || Math.abs(end.y - preview.y) > 0.5) {
+          children.push(
+            React.createElement('line', {
+              key: 'edge-preview-tip-' + i,
+              className: 'drawai-preview-tip',
+              x1: end.x,
+              y1: end.y,
+              x2: preview.x,
+              y2: preview.y,
+              stroke: '#1a73e8',
+              strokeWidth: 2,
+              strokeDasharray: '6 6',
+              markerEnd: 'url(#' + arrowId + ')',
+            }),
+          )
+        }
+      } else {
+        // 退化兜底：路由算不出有效折线时，至少还有一条直线跟着指针（宁可难看，不要消失）。
+        children.push(
+          React.createElement('line', {
+            key: 'edge-preview-' + i,
+            className: 'drawai-preview',
+            x1: anchor.x,
+            y1: anchor.y,
+            x2: preview.x,
+            y2: preview.y,
+            stroke: '#1a73e8',
+            strokeWidth: 2,
+            strokeDasharray: '6 4',
+          }),
+        )
+      }
+    }
+    const edgeParts = children.splice(edgeStart)
+    if (edgeParts.length > 0) {
+      paintedCells.push({
+        id: edge.id,
+        el: React.createElement.apply(null, ['g', { key: 'cell-' + edge.id, 'data-cell-id': edge.id }].concat(edgeParts)),
+      })
+    }
+  }
+
+  // 独立边标签先记下来，等单元按 drawOrder 排完再画（始终压在单元之上，避免被节点盖住）。
+  const pendingLabels = []
+
+  // drawio 的**独立边标签单元**：只读显示（画布不改它们，保存时原样带回）。
+  // 位置按 mxGraphView.getPoint 那套算法算 —— 挂在边上的用"沿边比例 + 垂直偏移 + 残余偏移"，
+  // 没挂在边上的（从别处粘过来的那种）按它自己的坐标画。
+  const labels = Array.isArray(doc.labels) ? doc.labels : []
+  const hiddenForLabels = hiddenLayerIds(doc)
+  for (let i = 0; i < labels.length; i += 1) {
+    const item = labels[i]
+    if (isHiddenCell(hiddenForLabels, item)) continue
+    const text = item === null || item === undefined || typeof item.text !== 'string' ? '' : item.text
+    if (text.length === 0) continue
+    let pos = null
+    if (typeof item.edgeId === 'string' && edgePts[item.edgeId] !== undefined) {
+      pos = edgeLabelPointAt(edgePts[item.edgeId], item.x, item.y, item.offsetX, item.offsetY)
+    } else if (Number.isFinite(Number(item.x)) && Number.isFinite(Number(item.y))) {
+      pos = { x: Number(item.x), y: Number(item.y) }
+    }
+    if (pos === null) continue
+    const size = styleNumber(item.style, 'fontSize', 10)
+    const color = styleGet(item.style, 'fontColor', null)
+    const fill = color !== null ? color : skin.text
+    // 底衬同样只在样式明确要求时画：线已经在它的位置断开了，默认不再盖一层。
+    const itemBg = styleGet(item.style, 'labelBackgroundColor', null)
+    if (itemBg !== null) {
+      const box = labelBox(pos, text, size)
+      const bg = parseCssColor(itemBg, skin.labelBg)
+      pendingLabels.push(React.createElement('rect', { key: 'elabel-bg-' + i, x: box.x, y: box.y, width: box.w, height: box.h, rx: 2, fill: bg.color, fillOpacity: bg.opacity }))
+    }
+    pendingLabels.push(
+      React.createElement(
+        'text',
+        {
+          key: 'elabel-' + i,
+          className: 'drawai-elabel',
+          x: pos.x,
+          y: pos.y + 1,
+          textAnchor: 'middle',
+          dominantBaseline: 'middle',
+          fontSize: size,
+          fontFamily: FONT,
+          fill: fill,
+          style: { fill: fill, fontFamily: FONT, fontSize: size + 'px', dominantBaseline: 'middle' },
+        },
+        text,
+      ),
+    )
+  }
+
+  for (let i = 0; i < boxes.length; i += 1) {
+    const box = boxes[i]
+    const geo = box.geo
+    const node = box.node
+    const selected = ui !== undefined && ui !== null && Array.isArray(ui.selectedIds) && ui.selectedIds.indexOf(node.id) >= 0
+    // 形状 + 标签放在同一个 <g> 里承载指针事件 —— 让浏览器做命中测试，
+    // 比自己算"点是否落在菱形内"可靠得多。
+    // 注意 connectPreview.hot 与 edgePreview.hot 都是**对象**（{id,x,y,w,h}），不是 id 字符串；
+    // 这里曾经直接拿它和 node.id 比，于是改接端点时环永远不亮（字符串 !== 对象）。
+    const hotspot =
+      ui !== undefined &&
+      ui !== null &&
+      (ui.connectHover === node.id ||
+        (ui.edgePreview !== null && ui.edgePreview !== undefined && ui.edgePreview.hot !== null && ui.edgePreview.hot !== undefined && ui.edgePreview.hot.id === node.id))
+    const groupProps = { key: 'node-' + i, className: hotspot ? 'drawai-node drawai-node-hot' : 'drawai-node', 'data-node-id': node.id }
+    if (ui !== undefined && ui !== null) {
+      if (typeof ui.onNodePointerDown === 'function') {
+        groupProps.onPointerDown = (event) => ui.onNodePointerDown(node.id, event)
+      }
+      if (typeof ui.onNodeDoubleClick === 'function') {
+        groupProps.onDoubleClick = (event) => ui.onNodeDoubleClick(node.id, event)
+      }
+      if (typeof ui.onNodePointerUp === 'function') {
+        groupProps.onPointerUp = () => ui.onNodePointerUp(node.id)
+      }
+      if (typeof ui.onNodeContextMenu === 'function') {
+        groupProps.onContextMenu = (event) => ui.onNodeContextMenu(node.id, event)
+      }
+      // 悬停：右侧条据此高亮同族形状、点一下即可换形（不必先点选）。
+      if (typeof ui.onNodePointerEnter === 'function') {
+        groupProps.onPointerEnter = () => ui.onNodePointerEnter(node.id)
+      }
+      if (typeof ui.onNodePointerLeave === 'function') {
+        groupProps.onPointerLeave = () => ui.onNodePointerLeave(node.id)
+      }
+    }
+    const drawing = ui && ui.traceDrawing && ui.traceDrawing.id === node.id ? ui.traceDrawing : null
+    const paintNode = drawing ? Object.assign({}, node, { style: styleWithSvgMarkup(node.style || '', '<svg xmlns="http://www.w3.org/2000/svg"/>', '1') }) : node
+    const groupChildren = [shapeElement(paintNode, geo, colorOf(node, mode), mode)]
+    if (drawing) {
+      groupChildren.push(React.createElement('foreignObject', {
+        key: 'trace-drawing', x: geo.x, y: geo.y, width: geo.w, height: geo.h,
+      }, React.createElement(TraceDrawingSurface, { key: node.id, id: node.id, drawing: drawing.drawing,
+        aspect: styleGet(node.style || '', 'imageAspect', '1'), onComplete: () => ui.onTraceDrawingComplete(node.id) })))
+    }
+    if (ui && ui.videoController && isVideoNodeData(node.data)) {
+      groupChildren.push(React.createElement('foreignObject', {
+        key: 'video-surface', x: geo.x, y: geo.y, width: geo.w, height: geo.h,
+      }, React.createElement(VideoSurface, { controller: ui.videoController, node,
+        meta: videoMetaOf(node), poster: videoPosterOf(node),
+        onPlay: () => { if (ui.onVideoPlay) ui.onVideoPlay(node.id) } })))
+    }
+    // 单选一个节点时给 8 个方向的缩放手柄。
+    if (selected && ui !== undefined && ui !== null && ui.singleSelectedNodeId === node.id && typeof ui.onResizePointerDown === 'function') {
+      const dirs = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w']
+      for (let d = 0; d < dirs.length; d += 1) {
+        const dir = dirs[d]
+        const hx = dir.indexOf('w') >= 0 ? geo.x : dir.indexOf('e') >= 0 ? geo.x + geo.w : geo.x + geo.w / 2
+        const hy = dir.indexOf('n') >= 0 ? geo.y : dir.indexOf('s') >= 0 ? geo.y + geo.h : geo.y + geo.h / 2
+        groupChildren.push(
+          React.createElement('rect', {
+            key: 'rs-' + dir,
+            className: 'drawai-handle drawai-rs-' + dir,
+            x: hx - 4,
+            y: hy - 4,
+            width: 8,
+            height: 8,
+            fill: '#ffffff',
+            stroke: '#1a73e8',
+            strokeWidth: 1.5,
+            onPointerDown: (event) => ui.onResizePointerDown(node.id, dir, event),
+          }),
+        )
+      }
+    }
+    if (selected) {
+      groupChildren.push(
+        React.createElement('rect', {
+          key: 'sel',
+          x: geo.x - 3,
+          y: geo.y - 3,
+          width: geo.w + 6,
+          height: geo.h + 6,
+          rx: 4,
+          fill: 'none',
+          className: 'drawai-sel',
+          pointerEvents: 'none',
+        }),
+      )
+    }
+    // 标签的画法也在文档里：fontSize / fontColor / whiteSpace。
+    // whiteSpace=nowrap 不换行（drawio 的语义就是这个），其余（含缺省）按宽度换行。
+    //
+    // **正在就地编辑的节点不画标签**：编辑框是透明的（这样才能"输入时看到的就是输完后的样子"），
+    // 画出来的标签会从它底下透出来，两层字叠在一起。以前没这问题只是因为那个单行 input
+    // 带白底、把标签盖住了 —— 换成透明 textarea 之后必须显式让位。
+    const editingHere = ui !== undefined && ui !== null && ui.editingNodeId === node.id
+    if (box.label && !editingHere) {
+      const labelStyle = typeof node.style === 'string' ? node.style : ''
+      const labelFontSize = styleNumber(labelStyle, 'fontSize', FSIZE)
+      const labelFill = colorOf(node, mode).font
+      const boxText = labelTextBox({ node: node, geo: geo, fontSize: labelFontSize })
+      const lines = labelWraps(node) ? wrapLabel(box.label, boxText.w, labelFontSize) : String(box.label).split('\n')
+      const lineHeight = labelLineHeight(labelFontSize)
+      const labelAlign = boxText.align === 'left' || boxText.align === 'right' ? boxText.align : 'center'
+      const cx = labelAlign === 'left' ? boxText.x : labelAlign === 'right' ? boxText.x + boxText.w : boxText.x + boxText.w / 2
+      const textAnchor = labelAlign === 'left' ? 'start' : labelAlign === 'right' ? 'end' : 'middle'
+      const first = boxText.y + lineHeight / 2
+      const spans = []
+      for (let li = 0; li < lines.length; li += 1) {
+        spans.push(React.createElement('tspan', { key: 'l' + li, x: cx, dy: li === 0 ? 0 : lineHeight }, lines[li]))
+      }
+      groupChildren.push(
+        React.createElement(
+          'text',
+          {
+            key: 'label-' + i,
+            x: cx,
+            y: first,
+            textAnchor: textAnchor,
+            dominantBaseline: 'middle',
+            'data-node-id': node.id,
+            fontSize: labelFontSize,
+            fontFamily: FONT,
+            fill: labelFill,
+            fillOpacity: clampNumber(styleNumber(labelStyle, 'textOpacity', 100), 0, 100) / 100,
+            pointerEvents: 'none',
+            style: { fill: labelFill, fontFamily: FONT, fontSize: labelFontSize + 'px', lineHeight: lineHeight + 'px', dominantBaseline: 'middle', whiteSpace: 'pre' },
+          },
+          spans,
+        ),
+      )
+    }
+    // 四面引出端点：上下左右各一个，从这里拖到另一个节点 = 连一条边，
+    // 并且**记住是从哪一边引出的**（拖出来的线从那一边出来，不会按算法另挑一边）。
+    // 位置推在边框外 16px —— 边框上有 8 个缩放手柄，挤在一起会点错。
+    if (selected && ui !== undefined && ui !== null && typeof ui.onHandlePointerDown === 'function') {
+      const sides = ['n', 'e', 's', 'w']
+      for (let d = 0; d < sides.length; d += 1) {
+        const side = sides[d]
+        const hx = side === 'e' || side === 'w' ? geo.x + (side === 'e' ? geo.w + 16 : -16) : geo.x + geo.w / 2
+        const hy = side === 'n' || side === 's' ? geo.y + (side === 's' ? geo.h + 16 : -16) : geo.y + geo.h / 2
+        groupChildren.push(
+          React.createElement('circle', {
+            key: 'link-' + side,
+            className: 'drawai-handle drawai-link',
+            cx: hx,
+            cy: hy,
+            r: 5,
+            fill: '#0a7d32',
+            stroke: '#ffffff',
+            strokeWidth: 2,
+            onPointerDown: (event) => ui.onHandlePointerDown(node.id, side, event),
+          }),
+        )
+      }
+    }
+    // 拖线时的实时预览：
+    //   1) 正交折线 —— 与松手后落盘的走线**同一套路由**（routePreview），所以预览即结果；
+    //   2) 收尾小段 —— 从折线终点画到落点，让"线跟着指针"这件事始终可见（折线可能停在
+    //      落点侧面/上方，没有这一段会像断掉了）。dashoffset 动画让它有流向感。
+    // 曾经这里是一条从起点直连指针的直线：能看出在连线，但看不出会怎么绕，松手瞬间整条跳变。
+    if (ui !== undefined && ui !== null && ui.connectFrom === node.id && ui.connectTo !== null && ui.connectTo !== undefined) {
+      const preview = ui.connectPreview
+      const to = ui.connectTo
+      const straight = () => {
+        const side = typeof ui.connectSide === 'string' ? ui.connectSide : 'e'
+        const x = side === 'e' || side === 'w' ? geo.x + (side === 'e' ? geo.w + 16 : -16) : geo.x + geo.w / 2
+        const y = side === 'n' || side === 's' ? geo.y + (side === 's' ? geo.h + 16 : -16) : geo.y + geo.h / 2
+        return [{ x: x, y: y }, { x: to.x, y: to.y }]
+      }
+      const pts = preview !== null && preview !== undefined && Array.isArray(preview.points) && preview.points.length >= 2 ? preview.points : straight()
+      const d = pathOf(pts, 6)
+      if (d.length > 0) {
+        groupChildren.push(
+          React.createElement('path', {
+            key: 'preview',
+            className: 'drawai-preview',
+            d: d,
+            fill: 'none',
+            stroke: '#1a73e8',
+            strokeWidth: 2,
+            strokeDasharray: '6 4',
+          }),
+        )
+        const anchor = pts[0]
+        const end = pts[pts.length - 1]
+        // 收尾段接到**指针**而不是折线终点：吸附时折线终点在目标边框上，指针还在边框外的
+        // 容差范围里，接指针能让"线头跟着手"保持连续。
+        if (Math.abs(end.x - to.x) > 0.5 || Math.abs(end.y - to.y) > 0.5) {
+          groupChildren.push(
+            React.createElement('line', {
+              key: 'preview-tip',
+              className: 'drawai-preview-tip',
+              x1: end.x,
+              y1: end.y,
+              x2: to.x,
+              y2: to.y,
+              stroke: '#1a73e8',
+              strokeWidth: 2,
+              strokeDasharray: '6 6',
+              markerEnd: 'url(#' + arrowId + ')',
+            }),
+          )
+        }
+        // 起点圆点：让"这条线从这里引出"明确可见（引出端点本身在边框外 16px 处，两者不重合）。
+        groupChildren.push(
+          React.createElement('circle', {
+            key: 'preview-dot',
+            className: 'drawai-preview',
+            cx: anchor.x,
+            cy: anchor.y,
+            r: 3.5,
+            fill: '#1a73e8',
+            stroke: '#ffffff',
+            strokeWidth: 1.5,
+          }),
+        )
+      }
+    }
+    // 吸附命中：目标节点本身的提示环（画在该节点自己的 <g> 里，于是天然贴着形状，
+    // 也不用关心它在文档里排在前面还是后面）。连线拖拽与改接端点共用这一套。
+    // connectHover 是 id 字符串；edgePreview.hot 是对象 —— 两者的取值方式不同，别写混。
+    if (
+      ui !== undefined &&
+      ui !== null &&
+      (ui.connectHover === node.id ||
+        (ui.edgePreview !== null && ui.edgePreview !== undefined && ui.edgePreview.hot !== null && ui.edgePreview.hot !== undefined && ui.edgePreview.hot.id === node.id))
+    ) {
+      groupChildren.push(
+        React.createElement('rect', {
+          key: 'hot-ring',
+          className: 'drawai-hot-ring',
+          x: geo.x - 6,
+          y: geo.y - 6,
+          width: geo.w + 12,
+          height: geo.h + 12,
+          rx: 8,
+          fill: 'none',
+          stroke: '#1a73e8',
+          strokeWidth: 2.5,
+        }),
+      )
+
+      // 四个可连接的端点。连线拖到附近时把它们画出来，**选中的那个放大高亮** ——
+      // 这样"会接在哪一边"是看得见的判断，而不是算法背地里决定的。
+      // 想换一边：把指针往那个端点挪近一点（判定就是距离最近）。
+      const anchorSource = ui.connectHover === node.id ? ui.connectPreview : ui.edgePreview
+      const activeSide = anchorSource !== null && anchorSource !== undefined && anchorSource.sides !== undefined ? anchorSource.sides.to : null
+      const activeSideFallback = anchorSource !== null && anchorSource !== undefined && typeof anchorSource.side === 'string' ? anchorSource.side : null
+      const chosenSide = activeSide !== null && activeSide !== undefined ? activeSide : activeSideFallback
+      const anchors = anchorSidesOf(geo)
+      for (let d = 0; d < SIDES.length; d += 1) {
+        const a = anchors[SIDES[d]]
+        const on = chosenSide === a.side
+        groupChildren.push(
+          React.createElement('circle', {
+            key: 'anchor-' + a.side,
+            className: on ? 'drawai-anchor drawai-anchor-on' : 'drawai-anchor',
+            cx: a.x,
+            cy: a.y,
+            r: on ? 6 : 4,
+            fill: on ? '#1a73e8' : '#ffffff',
+            stroke: on ? '#ffffff' : '#1a73e8',
+            strokeWidth: 2,
+          }),
+        )
+      }
+    }
+    paintedCells.push({ id: node.id, el: React.createElement('g', groupProps, groupChildren) })
+  }
+
+  // 按 drawOrder 交错排出边与节点（缺省仍是先边后节点）。
+  {
+    const order = drawOrderOf(doc)
+    const seenPaint = new Set()
+    for (let o = 0; o < order.length; o += 1) {
+      for (let p = 0; p < paintedCells.length; p += 1) {
+        if (paintedCells[p].id !== order[o]) continue
+        children.push(paintedCells[p].el)
+        seenPaint.add(paintedCells[p].id)
+        break
+      }
+    }
+    for (let p = 0; p < paintedCells.length; p += 1) {
+      if (seenPaint.has(paintedCells[p].id)) continue
+      children.push(paintedCells[p].el)
+    }
+  }
+  for (let L = 0; L < pendingLabels.length; L += 1) children.push(pendingLabels[L])
+
+  // 框选矩形 / 放置线条预览：铺在所有元素之上。
+  const box = ui === undefined || ui === null ? null : ui.marquee
+  if (box !== null && box !== undefined) {
+    // 武装线条拖拽：画起→终点预览（与落盘同一套 routeEdgeStyled），不要框选矩形。
+    if (typeof box.placeEdge === 'string' && box.placeEdge.length > 0) {
+      const lineKind = isEdgeLineKind(box.placeEdge) ? box.placeEdge : 'rounded'
+      const style = styleWithLineKind(DEFAULT_EDGE_STYLE, lineKind)
+      const fromPt = { x: box.x0, y: box.y0 }
+      const toPt = { x: box.x1, y: box.y1 }
+      const tempEdge = { style: style, sourcePoint: fromPt, targetPoint: toPt }
+      if (lineKind === 'curved') {
+        const dx = toPt.x - fromPt.x
+        const dy = toPt.y - fromPt.y
+        const len = Math.sqrt(dx * dx + dy * dy)
+        if (len >= 1) {
+          const bow = Math.max(20, Math.round((len * 0.12) / EDGE_GRID) * EDGE_GRID)
+          tempEdge.points = [{ x: fromPt.x + dx / 2 - (dy / len) * bow, y: fromPt.y + dy / 2 + (dx / len) * bow }]
+        }
+      }
+      const fromBox = { id: '__place-from', geo: { x: fromPt.x, y: fromPt.y, w: 0, h: 0 } }
+      const toBox = { id: '__place-to', geo: { x: toPt.x, y: toPt.y, w: 0, h: 0 } }
+      const geometry = buildGeometry(doc)
+      let previewPts = routeEdgeStyled(fromBox, toBox, geometry.boxes, geometry.bounds, tempEdge)
+      if (previewPts === null || previewPts.length < 2) previewPts = [fromPt, toPt]
+      const previewCurved = curvedFromStyle(style)
+      const d = pathOf(previewPts, 6, previewCurved)
+      if (d.length > 0) {
+        children.push(
+          React.createElement('path', {
+            key: 'place-edge-preview',
+            className: 'drawai-preview',
+            d: d,
+            fill: 'none',
+            stroke: '#1a73e8',
+            strokeWidth: 2,
+            strokeDasharray: '6 4',
+            pointerEvents: 'none',
+          }),
+        )
+      } else {
+        children.push(
+          React.createElement('line', {
+            key: 'place-edge-preview',
+            className: 'drawai-preview',
+            x1: fromPt.x,
+            y1: fromPt.y,
+            x2: toPt.x,
+            y2: toPt.y,
+            stroke: '#1a73e8',
+            strokeWidth: 2,
+            strokeDasharray: '6 4',
+            pointerEvents: 'none',
+          }),
+        )
+      }
+    } else {
+      const bx = Math.min(box.x0, box.x1)
+      const by = Math.min(box.y0, box.y1)
+      const bw = Math.abs(box.x1 - box.x0)
+      const bh = Math.abs(box.y1 - box.y0)
+      children.push(
+        React.createElement('rect', {
+          key: 'marquee',
+          x: bx,
+          y: by,
+          width: bw,
+          height: bh,
+          fill: 'rgba(26,115,232,0.12)',
+          stroke: '#1a73e8',
+          strokeWidth: 1,
+          strokeDasharray: '4 3',
+          pointerEvents: 'none',
+        }),
+      )
+    }
+  }
+
+  // 对齐辅助线画在**最上面**（drawio 的 guides 也压在单元之上）：拖动时那几条蓝虚线。
+  const guideLines = ui === undefined || ui === null || Array.isArray(ui.guides) === false ? [] : ui.guides
+  for (let i = 0; i < guideLines.length; i += 1) {
+    const g = guideLines[i]
+    const geom =
+      g.axis === 'x'
+        ? { x1: g.at, y1: g.from, x2: g.at, y2: g.to }
+        : { x1: g.from, y1: g.at, x2: g.to, y2: g.at }
+    children.push(
+      React.createElement(
+        'line',
+        Object.assign({ key: 'guide-' + i, stroke: '#1a73e8', strokeWidth: 1, strokeDasharray: '4 3', pointerEvents: 'none' }, geom),
+      ),
+    )
+  }
+
+  // 使用与 viewBox 同一帧量到的像素尺寸。100% 会在容器拖动时先拉伸旧视口，
+  // ResizeObserver / React 尚未提交更新的那一帧，节点与文字就会被缩放。
+  const viewportSize = ui && ui.viewportSize
+  const width = viewportSize && viewportSize.w > 0 ? viewportSize.w : '100%'
+  const height = viewportSize && viewportSize.h > 0 ? viewportSize.h : '100%'
+  // 宿主的 svg { max-width:100%; height:auto } 不能压缩尚未更新的旧画面。
+  const viewportStyle = { display: 'block', flexShrink: 0, background: skin.page }
+  if (typeof width === 'number' && typeof height === 'number') {
+    Object.assign(viewportStyle, { width, height, maxWidth: 'none', maxHeight: 'none' })
+  }
+  return React.createElement('svg', { ref: svgRef, viewBox: viewBox, width, height, preserveAspectRatio: 'none', style: viewportStyle }, children)
+}
+
+/**
+ * 选区锚点所属的那个 **DrawAI 面板根**（`.drawai-root`）；不在面板里就返回 null。
+ *
+ * 用它判断"这段选中的文字是不是画布自己的"。为什么一路往上找到面板根而不是看某个具体元素：
+ * 画布里的文字（节点标签、线上的字）各式各样，但都长在这一个面板下面。
+ *
+ * 注意 SVG 元素**没有 `closest`**，所以不能一遇到没有 closest 的节点就放弃 ——
+ * 节点标签的选区锚点正是一个 `<text>`，那会把"画布里的文字"误判成"外面的文字"。
+ */
+function drawaiPaneOf(node) {
+  let el = node
+  while (el !== null && el !== undefined) {
+    if (typeof el.closest === 'function') {
+      const found = el.closest('.drawai-root')
+      if (found !== null && found !== undefined) return found
+    }
+    el = el.parentNode
+  }
+  return null
+}
+
+/**
+ * 用户此刻选中的文字，是不是**画布面板之外**的（比如他自己在对话里划了一段准备复制）。
+ *
+ * 为什么需要这一条：画布的快捷键挂在 `window` 上，而 owner 判定只看"焦点在谁那儿"。
+ * 用户点过画布之后焦点就落在 body（`activeElement === null`）→ 判定为"画布拥有键盘"
+ * → Ctrl+C 被 `preventDefault()` 掉，**对话里的文字就复制不出来**（实测报过）。
+ * 所以在动手之前多问一句：你手里现在有没有一段"不属于画布"的选中文字？
+ */
+function hasTextSelectionOutside(root) {
+  if (root === null || root === undefined) return false
+  if (typeof window === 'undefined' || window === null || typeof window.getSelection !== 'function') return false
+  let selection = null
+  try {
+    selection = window.getSelection()
+  } catch (error) {
+    return false
+  }
+  if (selection === null || selection === undefined) return false
+  const text = typeof selection.toString === 'function' ? selection.toString() : ''
+  if (text.length === 0) return false
+  const anchor = selection.anchorNode
+  if (anchor === null || anchor === undefined) {
+    // 拿不到锚点（老浏览器/被清过）但确实有选中文字：**倾向放手** ——
+    // 让浏览器复制一次远比"按住 Ctrl+C 没反应"好。
+    return true
+  }
+  const pane = drawaiPaneOf(anchor)
+  return pane !== root
+}
+
+/** Explicit browser text selection takes precedence over object shortcuts. */
+function hasTextSelectionInPane(root) {
+  if (!root || typeof window === 'undefined' || typeof window.getSelection !== 'function') return false
+  try {
+    const selection = window.getSelection()
+    return !!selection && selection.toString().length > 0 && drawaiPaneOf(selection.anchorNode) === root
+  } catch { return false }
+}
+
+function isSelectableTextTarget(target) {
+  const element = target && (target.nodeType === 3 ? target.parentNode : target)
+  return !!(element && typeof element.closest === 'function' && element.closest('.drawai-note,.drawai-err,[data-drawai-text]'))
+}
+
+async function writeClipboardText(text) {
+  if (typeof navigator !== 'undefined' && navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+    try { await navigator.clipboard.writeText(text); return } catch {}
+  }
+  // HTTP deployments may not expose the Clipboard API; use a native copy event.
+  const previous = document.activeElement
+  const input = document.createElement('textarea')
+  input.value = text; input.readOnly = true
+  input.style.position = 'fixed'; input.style.opacity = '0'; input.style.pointerEvents = 'none'
+  document.body.appendChild(input)
+  try {
+    input.focus(); input.select()
+    if (typeof document.execCommand !== 'function' || !document.execCommand('copy')) throw new Error('系统剪贴板不可用，请选中文字后复制')
+  } finally {
+    input.remove()
+    if (previous && typeof previous.focus === 'function') previous.focus({ preventScroll: true })
+  }
+}
+
+function CopyableStatus(props) {
+  const [label, setLabel] = React.useState('复制提示')
+  React.useEffect(() => setLabel('复制提示'), [props.text])
+  return React.createElement('div', { className: 'drawai-note drawai-status-note', 'data-drawai-text': true },
+    React.createElement('span', { className: 'drawai-status-text', tabIndex: 0 }, props.text),
+    React.createElement('button', { type: 'button', className: 'drawai-status-copy', 'aria-label': '复制完整状态提示',
+      onClick: () => writeClipboardText(props.text).then(() => setLabel('已复制'), () => setLabel('复制失败，请选中文字复制')),
+    }, label))
+}
+
+/**
+ * 清掉"残留在别处"的浏览器文字选区。
+ *
+ * 为什么需要：用户先在对话里划了一段字（选区留在那边），然后**点画布上的一个元素**。
+ * 点 SVG 不会清掉别处的选区 —— 于是接下来按 Ctrl+C 时，
+ * `hasTextSelectionOutside` 判定"你手里有画布外的选中文字"而放手，
+ * 结果**画布里的元素也复制不了**（实测报过："又无法复制画布中的元素了"）。
+ *
+ * 反过来看，这也正是用户期望的语义：我开始在画布上选东西了，
+ * 上一次那点文字高亮就该消失（drawio / Figma 都一样）。
+ *
+ * 护栏：
+ *   · 目标在**就地编辑框**里 → 不动（那是他自己在框里选字）；
+ *   · 只有左键才清（右键要留给"复制这段文字"的右键菜单）；
+ *   · 拿不到 selection 一律静默返回（老浏览器、测试环境）。
+ */
+function clearStaleTextSelection(target, button) {
+  if (button !== 0) return
+  if (target !== null && target !== undefined && typeof target.closest === 'function' && target.closest('.drawai-edit') !== null) return
+  if (typeof window === 'undefined' || window === null || typeof window.getSelection !== 'function') return
+  let selection = null
+  try {
+    selection = window.getSelection()
+  } catch (error) {
+    return
+  }
+  if (selection !== null && selection !== undefined && typeof selection.removeAllRanges === 'function') selection.removeAllRanges()
+}
+
+/**
+ * 从宿主 `action: 'read'` 的响应里取出**可以直接画**的文档。
+ *
+ * 为什么客户端不再自己解析文件：载体是 `.drawio`（drawio 的 mxfile），而 drawio 默认把
+ * 页体压成 `base64(raw deflate(xml))` —— **浏览器没有 zlib**（DecompressionStream 是异步的，
+ * 塞不进同步渲染路径）。与其把解析器抄一份到浏览器，不如让唯一的解析器待在宿主，
+ * 客户端只认"文档"这一层。
+ *
+ * 这里仍然做防御性校验：宿主与客户端虽然同一份代码，但渲染函数不该假设状态形状 ——
+ * 之前就因为"把读到的东西当成一定有"而让整个画布降级成红底错误页。
+ */
+function docFromPayload(payload) {
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) return { error: '宿主返回的不是一个对象' }
+  if (payload.ok !== true) return { error: String(payload.error === undefined ? '读取失败' : payload.error) }
+  if (payload.exists === false) {
+    // 文件还不存在（比如从地址栏直接开了一个新路径）：当作空画布，保存时才落盘。
+    // 空画布**带一个缺省图层** —— 与"新建后落盘、再打开"的形状一致（盘上那个缺省图层单元
+    // 写出来就是 `<mxCell id="1" parent="0" />`，所以文件字节没变），/图层面板/也就有东西可显示。
+    return { doc: { version: 2, revision: '', meta: {}, nodes: [], edges: [], layers: [defaultLayer()] }, notes: [], created: true }
+  }
+  const raw = payload.doc
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return { error: '文档不是一个对象' }
+  if (Array.isArray(raw.nodes) === false || Array.isArray(raw.edges) === false) return { error: '文档缺少 nodes / edges' }
+  const doc = normalizeDrawioDoc(raw)
+  const nodes = doc.nodes.filter((n) => n !== null && typeof n === 'object' && typeof n.id === 'string')
+  // 两端各自"有着落"就收：连着节点，或带自由点（drawio 的悬空端）。
+  const edges = doc.edges.filter((e) => e !== null && typeof e === 'object' && edgeHasEnd(e, 'source') && edgeHasEnd(e, 'target'))
+  // **0 个节点不是错误** —— 空画布是完全合法的状态（刚「新建」出来就是这样，
+  // 用户还要靠右键往里面加节点）。真正该报错的是"文件不是画布"。
+  //
+  // 这里用"摊开再覆盖"而不是逐个字段抄：逐个抄漏过 version/meta、漏过 labels、又漏过
+  // layers（症状是"图层菜单说这张画布没有图层信息"，而文件里明明有）。摊开之后，
+  // 文档以后多什么字段都自动跟着走。
+  return {
+    doc: Object.assign({}, doc, {
+      revision: typeof doc.revision === 'string' ? doc.revision : '',
+      nodes: nodes,
+      edges: edges,
+    }),
+    notes: Array.isArray(payload.notes) ? payload.notes : [],
+    absolute: typeof payload.absolute === 'string' ? payload.absolute : undefined,
+  }
+}
+
+/** 缺省图层（与 drawio/我们写文件时那个 `<mxCell id="1" parent="0" />` 对应）。 */
+function defaultLayer() {
+  return { id: '1', name: '', visible: true, locked: false }
+}
+
+/**
+ * 文档的深一层拷贝。
+ *
+ * nodes/edges 是数组，edge.points / sourcePoint / targetPoint / labels / layers 是嵌套对象/数组，
+ * 快照必须**互不影响** —— 否则撤销会写坏工作副本，而且是静默的
+ * （图层的显示/隐藏就是原地改 `layers[i].visible`，快照共享同一个对象就会一起被改掉）。
+ *
+ * **先把 source 整份摊开、再覆盖需要深拷的那几个数组**，不逐个字段抄。
+ * 逐个抄已经付过三次代价：version/meta 丢过一次、labels 丢过一次、layers 又丢了一次
+ * （layers 一丢，"显示/隐藏"直接变成空操作：mutate 拿到的 next.layers 是 undefined）。
+ * 摊开之后，以后再加任何文档级字段都自动跟着走。
+ */
+function cloneDoc(source) {
+  const copy = Object.assign({}, source)
+  copy.meta = source.meta === undefined || source.meta === null ? source.meta : Object.assign({}, source.meta)
+  copy.labels = Array.isArray(source.labels) ? source.labels.map((l) => Object.assign({}, l)) : []
+  copy.layers = Array.isArray(source.layers) ? source.layers.map((l) => Object.assign({}, l)) : source.layers
+  copy.nodes = source.nodes.map((n) => Object.assign({}, n))
+  copy.edges = source.edges.map((e) => {
+    const edge = Object.assign({}, e)
+    if (Array.isArray(e.points)) edge.points = e.points.map((p) => ({ x: p.x, y: p.y }))
+    if (e.sourcePoint !== undefined) edge.sourcePoint = { x: e.sourcePoint.x, y: e.sourcePoint.y }
+    if (e.targetPoint !== undefined) edge.targetPoint = { x: e.targetPoint.x, y: e.targetPoint.y }
+    return edge
+  })
+  return copy
+}
+
+/**
+ * 编辑数据面板里用的两个纯函数：数据对象 ↔ 多行文本（每行 `key=value`）。
+ *
+ * 为什么用文本而不是表格：数据就是"drawio 用户对象上的自定义属性"，键名随人定、
+ * 值都是字符串 —— 表格反而挡路。空行与 `#` 开头的行忽略；没有 `=` 的行也忽略（不猜）。
+ */
+function formatDataLines(data) {
+  if (data === null || data === undefined || typeof data !== 'object') return ''
+  const keys = Object.keys(data)
+  const lines = []
+  for (let i = 0; i < keys.length; i += 1) lines.push(keys[i] + '=' + String(data[keys[i]]))
+  return lines.join('\n')
+}
+
+function parseDataLines(text) {
+  const out = {}
+  const lines = String(text === undefined || text === null ? '' : text).split('\n')
+  for (let i = 0; i < lines.length; i += 1) {
+    const trimmed = lines[i].trim()
+    if (trimmed.length === 0 || trimmed.charAt(0) === '#') continue
+    const at = trimmed.indexOf('=')
+    if (at <= 0) continue
+    const key = trimmed.slice(0, at).trim()
+    if (key.length === 0 || key === 'id' || key === 'label') continue
+    out[key] = trimmed.slice(at + 1).trim()
+  }
+  return out
+}
+
+/**
+ * 这个 DOM 节点是不是"正在编辑文本"的地方（按键该归它，不该归画布）。
+ *
+ * `input/textarea/select` 只覆盖了一半的输入场景：**DSH 的输入框是 Lexical 的
+ * contenteditable div**，而事件目标常常是它内部的 span —— 只看 tagName 会认不出来，
+ * 于是"在输入框里按退格"变成"删掉画布里的选中内容"，`Ctrl+C/V` 也被 preventDefault 掉，
+ * 输入框里既删不了字也复制粘贴不了（用户实测报的两条）。
+ *
+ * 三种信号都要认：
+ *   · `isContentEditable` —— 宿主与它内部的子节点都是 true（浏览器算好的）；
+ *   · 往上找 `[contenteditable]` —— 覆盖 `contenteditable="false"` 的子块（它自己 false，
+ *     但仍然长在输入框里）以及老浏览器不实现 isContentEditable 的情况；
+ *   · `role="textbox"` —— 富文本编辑器常给自己挂这个角色。
+ */
+function isTextEntry(node) {
+  if (node === null || node === undefined || typeof node !== 'object') return false
+  if (node.isContentEditable === true) return true
+  if (typeof node.tagName === 'string') {
+    const tag = node.tagName.toLowerCase()
+    if (tag === 'input' || tag === 'textarea' || tag === 'select') return true
+  }
+  if (typeof node.closest === 'function') {
+    if (node.closest('[contenteditable=""],[contenteditable="true"],[role="textbox"]') !== null) return true
+  }
+  return false
+}
+
+/**
+ * 画布该不该处理这次按键。
+ *
+ * 画布的快捷键挂在 `window` 上，代价是**别的面板里的按键也会经过这里** ——
+ * 而 DSH 的输入框就在同一个页面里。两条判据，任何一条成立就放手：
+ *
+ *   1. 事件目标或当前焦点是**输入宿主**（见 isTextEntry）→ 那是人家在打字；
+ *   2. 焦点已经落在**别的控件**上（另一个面板的按钮、链接、树节点…）→ 也不抢。
+ *      只有"焦点没了"（焦点回到 body）或"焦点就在本面板里"才算画布的。
+ *
+ * **DSH 0.2 起不能再假设"点过画布焦点就回 body"**：对话是 Lexical contenteditable，
+ * 点 SVG/画布空白常常**抢不走它的焦点**，于是这里一直判 false —— Delete / Ctrl+C/V
+ * 全无反应。所以 `onRootPointerDown` 会主动把焦点收到 `.drawai-root`（tabIndex=-1）。
+ */
+function canvasOwnsKeyboard(event, root, active) {
+  const target = event === null || event === undefined ? null : event.target
+  if (isSelectableTextTarget(target) || isSelectableTextTarget(active) || hasTextSelectionInPane(root)) return false
+  for (const item of [target, active]) {
+    if (item && typeof item.closest === 'function' && item.closest('.drawai-video-controls,.drawai-video-chrome,.drawai-video-preview')) return false
+  }
+  if (isTextEntry(target)) return false
+  if (isTextEntry(active)) return false
+  if (active === null || active === undefined) return true
+  if (typeof active.tagName === 'string') {
+    const tag = active.tagName.toUpperCase()
+    if (tag === 'BODY' || tag === 'HTML') return true
+  }
+  if (root === null || root === undefined || typeof root.contains !== 'function') return true
+  return root.contains(active) === true
+}
+
+/**
+ * 把键盘焦点收到画布面板根上（不抢就地编辑 / 菜单输入框）。
+ *
+ * 见 canvasOwnsKeyboard：DSH 0.2 点画布后焦点常仍停在对话 contenteditable，
+ * 不主动 focus 的话快捷键整组静默失效。
+ */
+function claimCanvasKeyboard(root, target) {
+  if (root === null || root === undefined || typeof root.focus !== 'function') return
+  if (isTextEntry(target)) return
+  if (isSelectableTextTarget(target)) return
+  if (target !== null && target !== undefined && typeof target.closest === 'function') {
+    if (target.closest('.drawai-video-controls,.drawai-video-chrome,.drawai-video-preview') !== null) return
+    if (target.closest('.drawai-edit') !== null) return
+  }
+  try {
+    if (typeof root.focus === 'function') root.focus({ preventScroll: true })
+  } catch (error) {
+    try {
+      root.focus()
+    } catch (error2) {
+      // 测试环境 / 隐藏节点：静默
+    }
+  }
+}
+
+/**
+ * 剪贴板：**模块级**（不属于某个标签页）—— 在一个标签页里复制、切到另一个标签页粘贴，
+ * 是画布的常规用法，做成每个标签页一份反而奇怪。
+ *
+ * 里面只存**普通数据的深拷贝**，不存文档对象：粘贴时那份文档可能已经被撤销/重载过。
+ */
+let clipboard = null
+
+function clipboardLabelText(clip) {
+  return (clip.nodes || []).filter(nodeShowsLabel).concat(clip.edges || [], clip.labels || [])
+    .map((cell) => typeof cell.label === 'string' ? cell.label : '').filter((label) => label.length > 0).join('\n')
+}
+
+/** 节点深拷贝（标签/样式都是字符串，几何是数字 —— 浅拷就够，但要显式列出来）。 */
+function cloneClipNode(node) {
+  const copy = { id: node.id, label: node.label, style: node.style, x: node.x, y: node.y, w: node.w, h: node.h }
+  // 图层与自定义数据也要跟着复制 —— 否则"复制到一个新图层"或"复制带数据的节点"会丢东西
+  // （数据是 drawio 用户对象上的属性，丢了 drawio 那边就查不到了）。
+  if (typeof node.layer === 'string' && node.layer.length > 0) copy.layer = node.layer
+  if (node.data !== undefined && node.data !== null) copy.data = copyData(node.data)
+  if (Number.isFinite(node.labelOffsetX)) copy.labelOffsetX = node.labelOffsetX
+  if (Number.isFinite(node.labelOffsetY)) copy.labelOffsetY = node.labelOffsetY
+  return copy
+}
+
+/** 边深拷贝：折点与两个自由端点都要**各拷一份**，否则粘贴出来的两条边会共享同一组点。 */
+function cloneClipEdge(edge) {
+  const copy = { id: edge.id, from: edge.from, to: edge.to }
+  if (typeof edge.label === 'string') copy.label = edge.label
+  if (typeof edge.style === 'string') copy.style = edge.style
+  if (Array.isArray(edge.points)) copy.points = edge.points.map((p) => ({ x: p.x, y: p.y }))
+  if (edge.sourcePoint !== undefined && edge.sourcePoint !== null) copy.sourcePoint = { x: edge.sourcePoint.x, y: edge.sourcePoint.y }
+  if (edge.targetPoint !== undefined && edge.targetPoint !== null) copy.targetPoint = { x: edge.targetPoint.x, y: edge.targetPoint.y }
+  if (typeof edge.layer === 'string' && edge.layer.length > 0) copy.layer = edge.layer
+  if (edge.data !== undefined && edge.data !== null) copy.data = copyData(edge.data)
+  if (Number.isFinite(Number(edge.labelX)) && Number.isFinite(Number(edge.labelY))) {
+    copy.labelX = Number(edge.labelX)
+    copy.labelY = Number(edge.labelY)
+    if (Number.isFinite(Number(edge.labelOffsetX))) copy.labelOffsetX = Number(edge.labelOffsetX)
+    if (Number.isFinite(Number(edge.labelOffsetY))) copy.labelOffsetY = Number(edge.labelOffsetY)
+  }
+  return copy
+}
+
+/**
+ * 把选中的东西收进剪贴板。
+ *
+ * 边只收**两端都在选区内**的那些 —— 只选中一个节点时把它的所有边一起搬走，
+ * 粘贴出来的边会指向没被粘贴的节点（悬空），那不是用户想要的。
+ *
+ * @returns { nodes, edges } 或 null（没选中任何节点）
+ */
+function collectClipboard(doc, ids) {
+  if (doc === null || doc === undefined || Array.isArray(ids) === false || ids.length === 0) return null
+  const picked = {}
+  for (let i = 0; i < ids.length; i += 1) picked[ids[i]] = true
+  const nodes = []
+  for (let i = 0; i < doc.nodes.length; i += 1) if (picked[doc.nodes[i].id] === true) nodes.push(cloneClipNode(doc.nodes[i]))
+  if (nodes.length === 0) return null
+  const edges = []
+  for (let i = 0; i < doc.edges.length; i += 1) {
+    const e = doc.edges[i]
+    if (picked[e.from] === true && picked[e.to] === true) edges.push(cloneClipEdge(e))
+  }
+  return { nodes: nodes, edges: edges }
+}
+
+/** 下一个可用的 `n<数字>` / `e<数字>` 编号（只在文档里已有的 id 上算，不猜别的形式）。 */
+function idCounters(doc) {
+  let maxNode = 0
+  let maxEdge = 0
+  const nre = /^n(\d+)$/
+  const ere = /^e(\d+)$/
+  for (let i = 0; i < doc.nodes.length; i += 1) {
+    const m = nre.exec(String(doc.nodes[i].id))
+    if (m !== null && parseInt(m[1], 10) > maxNode) maxNode = parseInt(m[1], 10)
+  }
+  for (let i = 0; i < doc.edges.length; i += 1) {
+    const m = ere.exec(String(doc.edges[i].id))
+    if (m !== null && parseInt(m[1], 10) > maxEdge) maxEdge = parseInt(m[1], 10)
+  }
+  return { node: maxNode, edge: maxEdge }
+}
+
+/**
+ * 粘贴：把剪贴板里的东西拷进文档，整体平移 `offset`，并给每个单元**重新分配 id**。
+ *
+ * 纯函数（返回新文档与新选中集）—— 剪贴板最容易错的两处（id 撞车、共享折点数组）
+ * 都能在命令行里直接断言，不必靠手点。
+ */
+function pasteInto(doc, clip, offsetX, offsetY, layer) {
+  if (doc === null || doc === undefined || clip === null || clip === undefined) return null
+  if (Array.isArray(clip.nodes) === false || clip.nodes.length === 0) return null
+  const counters = idCounters(doc)
+  const remap = {}
+  const nodes = doc.nodes.map((n) => Object.assign({}, n))
+  const edges = doc.edges.map(cloneClipEdge)
+  const ids = []
+  const targetLayer = typeof layer === 'string' && layer.length > 0 ? layer : null
+  for (let i = 0; i < clip.nodes.length; i += 1) {
+    const src = clip.nodes[i]
+    counters.node += 1
+    const id = 'n' + counters.node
+    remap[String(src.id)] = id
+    ids.push(id)
+    // 先整份拷（label/style/w/h/data/layer 都在里面），再改写 id 与新位置。
+    const copy = Object.assign({}, src, { id: id, x: numberOr(src.x, 0) + offsetX, y: numberOr(src.y, 0) + offsetY })
+    // 粘贴进**当前图层**（drawio 也是这个行为）；没设当前层就沿用原件那一层（copy.layer 已经在）。
+    if (targetLayer !== null) copy.layer = targetLayer
+    nodes.push(copy)
+  }
+  for (let i = 0; i < clip.edges.length; i += 1) {
+    const src = clip.edges[i]
+    const from = remap[String(src.from)]
+    const to = remap[String(src.to)]
+    if (from === undefined || to === undefined) continue
+    counters.edge += 1
+    const copy = cloneClipEdge(src)
+    copy.id = 'e' + counters.edge
+    copy.from = from
+    copy.to = to
+    if (targetLayer !== null) copy.layer = targetLayer
+    if (Array.isArray(copy.points)) copy.points = copy.points.map((p) => ({ x: p.x + offsetX, y: p.y + offsetY }))
+    if (copy.sourcePoint !== undefined) copy.sourcePoint = { x: copy.sourcePoint.x + offsetX, y: copy.sourcePoint.y + offsetY }
+    if (copy.targetPoint !== undefined) copy.targetPoint = { x: copy.targetPoint.x + offsetX, y: copy.targetPoint.y + offsetY }
+    edges.push(copy)
+    ids.push(copy.id)
+  }
+  return {
+    // 摊开整份文档再覆盖 nodes/edges：labels（只读的独立边标签）、layers（图层表）
+    // 与其他文档级字段都原样带上 —— 粘贴一次不该把图层结构弄丢。
+    doc: Object.assign({}, doc, { nodes: nodes, edges: edges }),
+    ids: ids,
+  }
+}
+
+/**
+ * 容器尺寸变化后，把视口按**同一个缩放比例**折算到新尺寸。
+ *
+ * 抽成纯函数是为了能被断言：这段数学错一点，表现就是"拖侧边栏时画面跟着缩放/被拉扁"，
+ * 而在浏览器里只能靠手感发现。
+ *
+ * 两条硬要求：
+ *   · `next.w / 结果.w` 必须等于 `prev.w / current.w`（缩放比例不变 → 内容不变大也不变小）；
+ *   · `结果.h / 结果.w` 必须等于 `next.h / next.w`（视口宽高比 = 容器宽高比 →
+ *     `preserveAspectRatio="none"` 不会把画面拉伸）。
+ *
+ * @returns 新的视口，或 null（尺寸/视口不可用时调用方保持原样）
+ */
+function resizeViewFor(current, prevSize, nextSize) {
+  if (current === null || current === undefined) return null
+  if (prevSize === null || prevSize === undefined || nextSize === null || nextSize === undefined) return null
+  if (!(prevSize.w > 0) || !(current.w > 0) || !(nextSize.w > 0) || !(nextSize.h > 0)) return null
+  const scale = prevSize.w / current.w
+  return { x: current.x, y: current.y, w: nextSize.w / scale, h: nextSize.h / scale }
+}
+
+function basename(address) {
+  if (typeof address !== 'string') return ''
+  const clean = address.split('?')[0].split('#')[0]
+  const parts = clean.split('/')
+  return parts[parts.length - 1] || ''
+}
+
+/**
+ * 把 tab 的地址解析成"能交给宿主 fs.resolve 的路径"。认不出就返回 undefined。
+ *
+ * 原来只认 `dsh-resource://file/session/<id>/<rel>` 一种形式，其余一律 undefined ——
+ * 而地址**实际**还可能是别的样子（实测用户的 tab 就解析不出来 —— 那时面板只会停在空舞台，
+ * 屏幕空白、AI 却会去改 demo.drawio）。所以这里按"形式"逐个处理，而不是只认一种：
+ *
+ *   dsh-resource://file/session/<id>/<rel>   → <rel>（相对工作区）
+ *   dsh-resource://file/<rel>                → <rel>
+ *   file:///D:/x/y.drawio                 → 绝对路径
+ *   /D:/x/y.drawio                        → 去掉前导斜杠（Windows 上多一个 / 就认不出）
+ *   D:\x\y.drawio 或 D:/x/y.drawio     → 绝对路径
+ *
+ * 绝对路径也是**合法输入**：宿主的 fs.resolve 收相对路径（带 cwd）也收绝对路径，
+ * 而且写入前会做 contains(工作区根) 校验，所以这里放宽不会开出口子。
+ */
+function pathFromAddress(address) {
+  if (typeof address !== 'string') return undefined
+  const raw = address.split('?')[0].split('#')[0].trim()
+  if (raw.length === 0) return undefined
+
+  let candidate = null
+  if (raw.indexOf('dsh-resource://') === 0) {
+    const parts = raw.slice('dsh-resource://'.length).split('/')
+    if (parts.length === 0) return undefined
+    let tail = parts
+    if (parts[0] === 'file') {
+      if (parts[1] === 'session' && parts.length > 3) tail = parts.slice(3)
+      else tail = parts.slice(1)
+    }
+    const joined = tail.join('/')
+    candidate = joined.length === 0 ? null : joined
+  } else if (raw.indexOf('file://') === 0) {
+    let rest = raw.slice('file://'.length)
+    // file://host/path 里的 host 段（本地文件通常是空或 localhost）
+    if (rest.indexOf('/') > 0) rest = rest.slice(rest.indexOf('/'))
+    candidate = rest
+  } else {
+    // 只接受**看起来像文件路径**的串。
+    //
+    // 这里翻过车：为了让绝对路径（D:\x\y.drawio）能解析，一度写成"其余一律原样返回"，
+    // 结果 tab 自己的地址 `sidebar://diagram` 也被当成相对路径交给宿主去读 ——
+    // 宿主报 workspace-file/not-found，界面上显示一串 RemoteError JSON。
+    // 判据：带 scheme 的（`x://…`）不是文件路径。
+    if (/^[A-Za-z][A-Za-z\d+.-]*:\/\//.test(raw)) return undefined
+    candidate = raw
+  }
+  if (candidate === null) return undefined
+
+  let out = candidate.replace(/\\/g, '/').trim()
+  // Windows 绝对路径被写成 /D:/... 时去掉多余的前导斜杠
+  if (/^\/[A-Za-z]:\//.test(out)) out = out.slice(1)
+  // 纯网络路径（//host/share）不是工作区文件，交回去也解析不了
+  if (out.indexOf('//') === 0) return undefined
+  return out.length === 0 ? undefined : out
+}
+
+function CanvasView(props) {
+  const sessionId = props.sessionId
+  const path = props.path
+  const infoError = typeof props.infoError === 'string' ? props.infoError : ''
+  // 路径由**外层标签页**管（CanvasTabs）：这里只读，不再自己持有。
+  // 只有两种状态：**绑定了文件的画布**（path 非空）与**空舞台**（empty：一张画布都还没打开）。
+  // 没有"未绑定画布"这种中间态 —— 那套代码已按需求删除。
+  const empty = props.empty === true
+  const target = typeof props.path === 'string' ? props.path : ''
+  const hasPath = !empty && target.length > 0
+  /** 请求外层开一个新标签（或切到已打开的那个）。「打开」用。 */
+  const onOpenTab = typeof props.onOpenTab === 'function' ? props.onOpenTab : () => {}
+  /** 通知外层"本标签现在绑定到哪了"（另存为 / 切换文件后）。 */
+  const onRebind = typeof props.onRebind === 'function' ? props.onRebind : () => {}
+  const uidState = React.useState(() => 'u' + Math.random().toString(36).slice(2, 8))
+  const uid = uidState[0]
+  const active = props.active !== false
+  const svgRef = React.useRef(null)
+  const modeState = React.useState('light')
+  const mode = modeState[0]
+  const setMode = modeState[1]
+  const docState = React.useState(null)
+  const doc = docState[0]
+  const setDoc = docState[1]
+  const statusState = React.useState({ kind: 'loading', path: target, error: '', absolute: '' })
+  const status = statusState[0]
+  const setStatus = statusState[1]
+  const nonceState = React.useState(0)
+  const nonce = nonceState[0]
+  const setNonce = nonceState[1]
+
+  // ---- 交互状态 ------------------------------------------------------------
+  // 选中（集合，支持框选与 Shift 加选）/ 就地改标签 / 连线 / 保存提示
+  const selectionState = React.useState([])
+  const selectedIds = selectionState[0]
+  const setSelectedIds = selectionState[1]
+  const editingState = React.useState(null)
+  const editing = editingState[0]
+  const setEditing = editingState[1]
+  const connectFromState = React.useState(null)
+  const connectFrom = connectFromState[0]
+  const setConnectFrom = connectFromState[1]
+  const connectToState = React.useState(null)
+  const connectTo = connectToState[0]
+  const setConnectTo = connectToState[1]
+  const connectSideState = React.useState('e')
+  const connectSide = connectSideState[0]
+  const setConnectSide = connectSideState[1]
+  const connectHoverState = React.useState(null) // 拖线时指针吸附到的目标节点 id（仅用于渲染提示环）
+  const connectHover = connectHoverState[0]
+  const setConnectHover = connectHoverState[1]
+  const connectPreviewState = React.useState(null) // { points, hot, sides }：与落盘同一套路由算出的预览折线
+  const connectPreview = connectPreviewState[0]
+  const setConnectPreview = connectPreviewState[1]
+  const saveState = React.useState('')
+  const saveNote = saveState[0]
+  const setSaveNote = saveState[1]
+  // 下拉菜单展开在**哪个按钮下面**：{ key, left, top }。
+  // 之前只记了 key，面板一律画在画布左上角 —— 于是点「导出」菜单会跑到「文件」按钮下面，
+  // 用户根本看不出它是从哪儿开出来的。
+  const [docMenuPos, setDocMenuPos] = React.useState(null)
+  // 工具条按钮的 DOM 引用：key → button 元素，用于算出按钮在**画布**里的位置。
+  const toolBtnRefs = React.useRef({})
+
+  // 工作副本放在 ref 里：指针事件回调是渲染期创建的闭包，读 state 会拿到旧值。
+  const docRef = React.useRef(null)
+  const loadedDocumentRef = React.useRef(null)
+  const revisionRef = React.useRef('')
+  const dirtyRef = React.useRef(false)
+  const dragRef = React.useRef(null)
+  const linkRef = React.useRef(null)
+  const saveTimerRef = React.useRef(null)
+  const saveInFlightRef = React.useRef(null)
+  const canvasRef = React.useRef(null)
+  /** 本视图的根元素：工作栏下拉 / 文件面板的定位参照系（它 position:absolute，是定位上下文）。 */
+  const rootRef = React.useRef(null)
+  // pointerup 时要落盘的是"用户最后看到的那一帧选中的端点"，所以预览数据也留一份在 ref 里。
+  const connectPreviewRef = React.useRef(null)
+  const edgePreviewRef = React.useRef(null)
+  /** 上一次用文件管理器选中的目录：用于面板里的「重新选择目录」与「重新读取」。 */
+  const lastPickedDirRef = React.useRef('')
+  /** 上一次上报给宿主的聚焦路径：避免每帧都打一次网络。 */
+  const focusReportedRef = React.useRef(null)
+
+  // ---- 视口（平移 / 缩放）--------------------------------------------------
+  const sizeState = React.useState({ w: 0, h: 0 })
+  const size = sizeState[0]
+  const setSize = sizeState[1]
+  const viewState = React.useState(null) // null = 自适应内容；对象 = 用户平移缩放后的视口
+  const viewOverride = viewState[0]
+  const setViewOverride = viewState[1]
+  const viewRef = React.useRef(null)
+  const panRef = React.useRef(null)
+  /** 上一次量到的容器尺寸：容器一变就要把视口按**同一个缩放比例**折算过去（见 measure）。 */
+  const measuredRef = React.useRef({ w: 0, h: 0 })
+  /**
+   * 路由迟滞的记忆：边 id → 上一次用的候选。
+   *
+   * 为什么要有它：拖动节点时，直连路线的合法性会在避让边界上反复翻转，
+   * 于是路由在"绕上面"和"直连"之间一帧一变、端点侧跟着跳（详见 applyRouteHysteresis）。
+   * **渲染与命中共用这一份** —— 否则迟滞期间"画出来的线"和"点得到的线"会是两条路。
+   */
+  const routeMemoryRef = React.useRef(new Map())
+
+  // ---- 右键菜单 / 连线拖拽 ------------------------------------------------
+  const menuState = React.useState(null) // { kind: 'canvas'|'node'|'edge', id, left, top, userX, userY }
+  const menu = menuState[0]
+  const setMenu = menuState[1]
+  const menuStyleState = React.useState(() => {
+    const p = loadDrawaiPrefs()
+    return typeof p.defaultColor === 'string' && p.defaultColor.length > 0 ? p.defaultColor : 'blue'
+  })
+  const menuStyle = menuStyleState[0]
+  const setMenuStyle = menuStyleState[1]
+  // 右侧元素条 / 偏好里记的"默认形状"：新建时用；放置工具高亮也读它。
+  const menuShapeState = React.useState(() => {
+    const p = loadDrawaiPrefs()
+    return typeof p.defaultShape === 'string' && p.defaultShape.length > 0 ? p.defaultShape : 'rounded'
+  })
+  const menuShape = menuShapeState[0]
+  const setMenuShape = menuShapeState[1]
+  // 放置工具：点了右侧条某个形状后，再在画布空白处点一下落下（Esc 取消）。
+  const placeToolState = React.useState(null)
+  const placeTool = placeToolState[0]
+  const setPlaceTool = placeToolState[1]
+  const pendingVideoRef = React.useRef(null)
+  const videoImportsRef = React.useRef(new Set())
+  React.useEffect(() => () => {
+    pendingVideoRef.current = null
+    for (const controller of videoImportsRef.current || []) controller.abort()
+  }, [target, active])
+  // 线条族放置：线型 kind（rounded/sharp/straight/curved）；与 placeTool 互斥。
+  const placeEdgeKindState = React.useState(null)
+  const placeEdgeKind = placeEdgeKindState[0]
+  const setPlaceEdgeKind = placeEdgeKindState[1]
+  const lastLineKindRef = React.useRef('rounded')
+  // 悬停节点：指针停在某个节点上时，可打开同族变体气泡换形（不必先点选）。
+  const hoverNodeIdState = React.useState(null)
+  const hoverNodeId = hoverNodeIdState[0]
+  const setHoverNodeId = hoverNodeIdState[1]
+  // 同族变体白色气泡：悬停族入口（或多变体节点）时打开，离开后短暂延迟关闭。
+  const railOpenFamilyState = React.useState(null)
+  const railOpenFamily = railOpenFamilyState[0]
+  const setRailOpenFamily = railOpenFamilyState[1]
+  const railPanelTimerRef = React.useRef(null)
+  const edgeDragRef = React.useRef(null) // { edgeId, kind: 'segment'|'from'|'to', ... }
+  const labelDragRef = React.useRef(null) // 拖连线标签：保存抓取点，避免一次点击就改位置。
+  const guidesState = React.useState([]) // 拖动时的对齐辅助线 [{axis,at,from,to}]
+  const guides = guidesState[0]
+  const setGuides = guidesState[1]
+  const canRevertState = React.useState(false) // 宿主那边有没有可退回的 AI 改动
+  const canRevert = canRevertState[0]
+  const setCanRevert = canRevertState[1]
+  // 当前图层（新建的节点/连线/粘贴进这一层）：**客户端状态**，不进文件 ——
+  // drawio 也是这样（图层面板里的选中项不落盘）。
+  const currentLayerState = React.useState(null)
+  const currentLayerId = currentLayerState[0]
+  const setCurrentLayerId = currentLayerState[1]
+  /**
+   * 「当前图层」的解析结果与图层表。
+   *
+   * **就地算在这里，不放到菜单那段去算**：新建节点/连线、从空白处拉线、粘贴都要盖"当前层"的章，
+   * 而那几个函数在组件体里出现得更早。以前把这两个常量写在菜单附近，功能上能用
+   * （事件都在组件体跑完之后才触发），但那是一个**TDZ 地雷**：哪天有人把其中任何一个
+   * 挪进渲染期（useMemo / 直接调用），就会得到 `Cannot access 'activeLayerId'
+   * before initialization` —— 和刚修掉的 `item is not defined` 一样，整张画布降级。
+   */
+  const layerList = doc !== null && doc !== undefined && Array.isArray(doc.layers) ? doc.layers : []
+  const activeLayerId =
+    currentLayerId !== null && layerList.some((l) => l !== null && l !== undefined && l.id === currentLayerId)
+      ? currentLayerId
+      : layerList.length > 0 && layerList[0] !== null && layerList[0] !== undefined
+        ? layerList[0].id
+        : null
+  const marqueeRef = React.useRef(null) // 框选拖拽 { x0, y0, x1, y1, additive, moved }
+  // 待抢的 pointer capture：按下时登记 { pointerId, x, y }，真的动起来（> CAPTURE_MOVE_PX）
+  // 才在 pointermove 里抢下来。按下就抢会让 click/dblclick 落到画布容器上（双击改标签失灵）。
+  const pendingCaptureRef = React.useRef(null)
+  const marqueeState = React.useState(null) // 同上，供渲染
+  const marquee = marqueeState[0]
+  const setMarquee = marqueeState[1]
+  const resizeRef = React.useRef(null) // 缩放拖拽 { id, dir, originX, originY, x, y, w, h }
+  const exportState = React.useState(null) // null | 'svg' | 'png'
+  const exportRequest = exportState[0]
+  const setExportRequest = exportState[1]
+  const preparedExportRef = React.useRef(null)
+  /**
+   * AI 触发的那次导出：记住**已经处理过**的请求 id。
+   *
+   * 为什么需要：导出请求挂在宿主 `read` 的回执上，而客户端每 3 秒轮询一次 —— 不去重的话，
+   * 回执慢一点同一条请求就会被反复取到（表现是"每 3 秒下载一次 PNG"）。
+   */
+  const exportHandledRef = React.useRef(null)
+  const mediaRequestRef = React.useRef(null)
+  mediaRequestRef.current = mediaAction
+  const [videoController] = React.useState(() => createVideoController((action, extra) => mediaRequestRef.current(action, extra)))
+  const videoExportRun = React.useRef(false)
+  const [videoExportJobs, setVideoExportJobs] = React.useState([])
+  const [backgroundDrawingJobs, setBackgroundDrawingJobs] = React.useState([])
+  const [backgroundQueueError, setBackgroundQueueError] = React.useState('')
+  React.useEffect(() => {
+    if (!client || !hasPath || !active) return
+    let alive = true, timer, fetching = false
+    const poll = async () => {
+      if (!alive || fetching) return
+      fetching = true
+      try {
+        const result = await mediaAction('drawing-task-list', {}, { throwOnError: true })
+        if (alive) { setBackgroundDrawingJobs(result.jobs || []); setBackgroundQueueError('') }
+      } catch (error) { if (alive) setBackgroundQueueError('任务状态暂时无法更新：' + String(error.message || error)) }
+      finally { fetching = false; if (alive) timer = setTimeout(poll, document.hidden ? 8000 : 1500) }
+    }
+    const resume = () => { if (!document.hidden) { clearTimeout(timer); poll() } }
+    poll(); document.addEventListener('visibilitychange', resume)
+    return () => { alive = false; clearTimeout(timer); document.removeEventListener('visibilitychange', resume) }
+  }, [client, sessionId, target, hasPath, active])
+  React.useEffect(() => {
+    if (!client || !hasPath || !active) return
+    let alive = true, timer, fetching = false
+    const poll = async () => {
+      if (!alive || fetching) return
+      fetching = true
+      try {
+        const result = await mediaAction('media-video-export-list', {}, { throwOnError: true })
+        if (alive && Array.isArray(result?.jobs)) setVideoExportJobs(result.jobs)
+      } catch { /* Keep the last known progress while disconnected. */ }
+      finally { fetching = false; if (alive) timer = setTimeout(poll, 1500) }
+    }
+    const resume = () => { if (!document.hidden) { clearTimeout(timer); poll() } }
+    setVideoExportJobs([]); poll()
+    document.addEventListener('visibilitychange', resume)
+    return () => { alive = false; clearTimeout(timer); document.removeEventListener('visibilitychange', resume) }
+  }, [client, sessionId, target, hasPath, active])
+  React.useEffect(() => () => videoController.reset(), [videoController, target])
+  React.useEffect(() => { if (!active) videoController.suspend() }, [videoController, active])
+  React.useEffect(() => { videoController.prune(doc === null ? [] : doc.nodes) }, [videoController, doc])
+  React.useEffect(() => {
+    const onVisibility = () => { if (document.hidden) videoController.suspend() }
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => document.removeEventListener('visibilitychange', onVisibility)
+  }, [videoController])
+  /**
+   * AI 的「看一眼」请求（`diagram_read {render:true}`）：`{ requestId }`。
+   *
+   * 与导出分开：导出是**给人**的（下载/落文件），这一条是**给模型**看的 —— 渲成 PNG 回执给宿主，
+   * 由宿主存进 DSH 的附件库（工作区零文件），再作为 image 内容块进模型上下文。
+   */
+  const lookState = React.useState(null)
+  const lookRequest = lookState[0]
+  const setLookRequest = lookState[1]
+  /** 同一个请求只处理一次（轮询每 3 秒一次，不去重会反复渲染）。 */
+  const lookHandledRef = React.useRef(null)
+  /**
+   * AI 下发的抽帧计划（`extractFrames {seconds,fps,width}`）：`{ requestId, clip, … }`。
+   *
+   * 视频解码只有浏览器能做（宿主没有解码器），所以宿主把计划挂在 `read` 回执上，这里取走后
+   * 解码视频写 `stills/`，完成后 POST 回 `media-extract-result`。同样按 requestId 去重。
+   */
+  const mediaHandledRef = React.useRef(null)
+  // 文档三件套的弹出面板：null | 'new' | 'open' | 'saveAs' | 'renameLayer' | 'find'
+  const docMenuState = React.useState(null)
+  const docMenu = docMenuState[0]
+  const setDocMenu = docMenuState[1]
+  const fileListState = React.useState(null) // null=未拉取 | { files, error }
+  const fileList = fileListState[0]
+  const setFileList = fileListState[1]
+  const newNameState = React.useState('')
+  const newName = newNameState[0]
+  const setNewName = newNameState[1]
+  /** 重命名图层时正在改哪一层（配合 docMenu === 'renameLayer'）。 */
+  const renameLayerIdState = React.useState(null)
+  const renameLayerId = renameLayerIdState[0]
+  const setRenameLayerId = renameLayerIdState[1]
+  /** 查找面板的查询串与命中列表下标。 */
+  const findQueryState = React.useState('')
+  const findQuery = findQueryState[0]
+  const setFindQuery = findQueryState[1]
+  /** 多页：当前页下标与总页数（来自宿主读回的 pageCount / pageIndex）。 */
+  const pageIndexState = React.useState(() => canvasSessions.workspace(sessionId).pages[target] || 0)
+  const pageIndex = pageIndexState[0]
+  const setPageIndex = pageIndexState[1]
+  React.useEffect(() => { canvasSessions.workspace(sessionId).pages[target] = pageIndex }, [sessionId, target, pageIndex])
+  const handledPageRequest = React.useRef(null)
+  React.useEffect(() => {
+    if (props.pageRequest && active && props.pageRequest !== handledPageRequest.current) {
+      handledPageRequest.current = props.pageRequest; switchPage(props.pageRequest.page)
+    }
+  }, [props.pageRequest, active])
+  React.useEffect(() => () => {
+    pendingVideoRef.current = null
+    for (const controller of videoImportsRef.current || []) controller.abort()
+  }, [pageIndex])
+  React.useEffect(() => { if (placeTool !== 'video') pendingVideoRef.current = null }, [placeTool])
+  const pageCountState = React.useState(1)
+  const pageCount = pageCountState[0]
+  const setPageCount = pageCountState[1]
+  /** 本机偏好：网格、默认形状/配色（localStorage）。 */
+  const prefsState = React.useState(() => loadDrawaiPrefs())
+  const prefs = prefsState[0]
+  const setPrefs = prefsState[1]
+  const showGrid = prefs.showGrid !== false
+  const showTaskList = prefs.showTaskList === true
+  function patchPrefs(patch) {
+    const next = Object.assign({}, prefs, patch === undefined || patch === null ? {} : patch)
+    setPrefs(next)
+    saveDrawaiPrefs(next)
+    if (typeof next.defaultColor === 'string' && next.defaultColor.length > 0) setMenuStyle(next.defaultColor)
+    if (typeof next.defaultShape === 'string' && next.defaultShape.length > 0) setMenuShape(next.defaultShape)
+  }
+  function setShowGrid(on) {
+    patchPrefs({ showGrid: on === true })
+  }
+  /** 新建/另存为输入框的 DOM 引用：打开时要**全选**，用户直接输入即替换默认名。 */
+  const nameInputRef = React.useRef(null)
+  // 撤销/重做：快照栈。文档只有几十 KB，压快照比逐条写 undo/redo 逻辑可靠得多，也不会漏项。
+  const historyRef = React.useRef({ past: [], future: [] })
+  const lastCoalesceRef = React.useRef(null) // 同一次手势内的连续改动只记一个快照
+  const previewState = React.useState(null) // 改接端点时的预览线终点 { edgeId, kind, x, y }
+  const edgePreview = previewState[0]
+  const setEdgePreview = previewState[1]
+  const [traceDrawing, setTraceDrawing] = React.useState(null)
+  const autoReplayTasks = React.useRef(new Set())
+  React.useEffect(() => {
+    if (!active || !doc) return
+    for (const taskId of autoReplayTasks.current) {
+      const node = doc.nodes.find((item) => item.data?.drawaiTaskId === taskId)
+      if (!node) continue
+      autoReplayTasks.current.delete(taskId)
+      mediaAction('drawing-task-result', { taskId }, { throwOnError: true }).then((result) => {
+        if (result.output.drawing?.steps.length) setTraceDrawing({ id: node.id, svg: result.output.svg, drawing: result.output.drawing, metrics: result.output.metrics })
+      }).catch((error) => setSaveNote('绘制结果已保存，回放加载失败：' + String(error.message || error)))
+    }
+  }, [active, doc])
+  const videoTraceRun = canvasSessions.task(sessionId, target, pageIndex)
+  const [, refreshVideoTrace] = React.useState(0)
+  React.useEffect(() => canvasSessions.subscribe(videoTraceRun, () => refreshVideoTrace((value) => value + 1)), [videoTraceRun])
+  const videoTraceSource = videoTraceRun.source
+  const videoTraceJob = videoTraceRun.job
+  const setVideoTraceSource = (source) => canvasSessions.update(videoTraceRun, { source })
+  const setVideoTraceJob = (value) => canvasSessions.update(videoTraceRun, {
+    job: typeof value === 'function' ? value(videoTraceRun.job) : value,
+  })
+  React.useEffect(() => {
+    // A remounted view has no document until the first read completes.
+    if (videoTraceSource && doc && loadedDocumentRef.current === videoTraceRun && !doc.nodes.some((node) => node.id === videoTraceSource.id && videoMetaOf(node)?.clip === videoTraceSource.clip)) {
+      if (videoTraceRun.queueId) drawingQueue.cancel(videoTraceRun.queueId)
+      else videoTraceRun.current?.abort()
+      if (!videoTraceRun.result) setVideoTraceSource(null)
+    }
+  }, [doc, videoTraceSource, videoTraceRun])
+  function applyPendingVideoTrace() {
+    if (!doc || !videoTraceRun.result || status.kind !== 'ready' || loadedDocumentRef.current !== videoTraceRun) return
+    try {
+      canvasSessions.consume(videoTraceRun, (result) => {
+        let id
+        const existing = result.taskId && docRef.current.nodes.find((node) => node.data?.drawaiTaskId === result.taskId)
+        if (existing) id = existing.id
+        else applyLocal((next) => {
+          id = result.kind === 'image' ? applyImageTraceToDoc(next, result.source, result.output.svg) : applyVideoTraceToDoc(next, result.source, result.output)
+          if (result.taskId) {
+            const output = next.nodes.find((node) => node.id === id)
+            output.data = Object.assign({}, output.data, { drawaiTaskId: result.taskId })
+          }
+        })
+        if (result.kind === 'image' && result.output.drawing?.steps.length) setTraceDrawing({ id, svg: result.output.svg, drawing: result.output.drawing, metrics: result.output.metrics })
+        setSelectedIds([id])
+        setSaveNote('大肥鱼画完啦！已生成 SVG ' + (result.kind === 'image' ? '图像' : '视频') + '（可撤销）')
+      })
+    } catch (error) {
+      if (videoTraceRun.result?.taskId) drawingQueue.resultError(videoTraceRun.result.taskId, error)
+      setVideoTraceJob((job) => Object.assign({}, job, { error: true, message: '复刻结果已保留，暂时无法加入原画布：' + String(error.message || error) }))
+    }
+  }
+  React.useEffect(applyPendingVideoTrace, [doc, videoTraceRun, videoTraceRun.result, status.kind])
+  async function submitBackgroundDrawing(kind, source, options) {
+    await saveNow()
+    if (dirtyRef.current || saveInFlightRef.current) throw new Error('画布自动保存未完成，请稍后重试')
+    const result = await mediaAction('drawing-task-start', { kind, sourceId: source.id, options,
+      page: pageIndex, revision: revisionRef.current }, { throwOnError: true })
+    setBackgroundDrawingJobs((jobs) => jobs.filter((job) => job.id !== result.job.id).concat(result.job))
+    if (kind === 'image') autoReplayTasks.current.add(result.job.id)
+    setSaveNote('已加入后台队列，切换或关闭网页后仍会继续')
+    return result.job
+  }
+  async function enqueueVideoTrace(options, source) {
+    return submitBackgroundDrawing('video', source, options)
+  }
+  async function enqueueImageTrace(source, options) {
+    return submitBackgroundDrawing('image', source, options)
+  }
+  async function backgroundTaskCommand(job, command, value) {
+    if (job.export) {
+      if (command === 'download') return downloadVideoExport(job)
+      if (command === 'retry-export') {
+        const result = await mediaAction('media-video-export-start', { clip: job.clip, format: job.format }, { throwOnError: true })
+        setVideoExportJobs((jobs) => jobs.concat(result)); return
+      }
+      await mediaAction('media-video-export-discard', { clip: job.clip, token: job.token }, { throwOnError: true })
+      setVideoExportJobs((jobs) => jobs.filter((item) => item.token !== job.token)); return
+    }
+    if (command === 'locate') {
+      const node = docRef.current?.nodes.find((item) => item.data?.drawaiTaskId === job.id)
+      if (!node) throw new Error('结果尚未同步到当前页，请稍后重试或打开原页面')
+      setSelectedIds([node.id]); setViewOverride(null)
+      if (job.kind === 'image') {
+        const result = await mediaAction('drawing-task-result', { taskId: job.id }, { throwOnError: true })
+        if (result.output.drawing?.steps.length) setTraceDrawing({ id: node.id, svg: result.output.svg, drawing: result.output.drawing, metrics: result.output.metrics })
+      }
+      return
+    }
+    if (['apply', 'undo'].includes(command)) {
+      await saveNow()
+      if (dirtyRef.current) throw new Error('请等待当前编辑自动保存成功后重试')
+    }
+    await mediaAction('drawing-task-command', { taskId: job.id, command, value }, { throwOnError: true })
+    const result = await mediaAction('drawing-task-list', {}, { throwOnError: true })
+    setBackgroundDrawingJobs(result.jobs || [])
+    if (['apply', 'undo'].includes(command)) setNonce((value) => value + 1)
+  }
+  async function startVideoTrace(options, sourceOverride, queueContext) {
+    if (videoTraceRun.current || videoTraceRun.result || videoTraceRun.pendingSave || !(sourceOverride || videoTraceSource)) {
+      if (queueContext) throw new Error('原画布有未完成的绘制或等待保存的结果')
+      return
+    }
+    const perf = createMediaPerformance()
+    const source = sourceOverride || videoTraceSource
+    const control = new AbortController()
+    const cancelQueued = () => control.abort()
+    if (queueContext) {
+      queueContext.signal.addEventListener('abort', cancelQueued, { once: true })
+      if (queueContext.signal.aborted) control.abort()
+      videoTraceRun.queueId = queueContext.id
+    }
+    videoTraceRun.current = control
+    setVideoTraceSource(source)
+    let lastProgressUpdate = 0
+    const update = (patch) => {
+      if (control.signal.aborted) return
+      queueContext?.update(patch)
+      if (!queueContext || patch.busy === false || Date.now() - lastProgressUpdate >= 250) {
+        lastProgressUpdate = Date.now()
+        setVideoTraceJob((job) => Object.assign({}, job, patch))
+      }
+    }
+    const check = () => { if (control.signal.aborted) throw new Error('已取消复刻') }
+    // 捕获本次画布的路径，切换画布后清理仍针对原任务。
+    const request = async (action, extra) => {
+      const pending = new AbortController()
+      // start 要取得清理令牌后才能取消；清理/释放请求也不跟随任务取消。
+      const cancellable = ['media-source-bytes', 'media-trace-frame', 'media-trace-frame-chunk', 'media-trace-finish'].includes(action)
+      const abort = () => pending.abort()
+      const timer = action === 'media-trace-frame' ? null : setTimeout(abort, 60000)
+      if (cancellable) control.signal.addEventListener('abort', abort, { once: true })
+      if (cancellable && control.signal.aborted) pending.abort()
+      const requestDone = perf.start('request.' + action)
+      try {
+        const raw = await fetch(SAVE_ENDPOINT, { method: 'POST', headers: { 'content-type': 'application/json', [SAVE_HEADER]: '1' }, signal: pending.signal,
+          body: JSON.stringify(Object.assign({ action, sessionId, path: target }, extra)) })
+        const result = await raw.json()
+        if (!raw.ok || !result || !result.ok) throw new Error(result?.error || '视频复刻请求失败')
+        return result
+      } finally { requestDone(); clearTimeout(timer); control.signal.removeEventListener('abort', abort) }
+    }
+    let pack = null, blobUrl = null, committed = false, currentFrame = -1
+    const pendingFrames = []
+    const video = document.createElement('video')
+    video.muted = true; video.playsInline = true; video.preload = 'auto'
+    setVideoTraceJob({ busy: true, done: 0, total: 1, message: '正在读取视频…', options })
+    videoController.suspend()
+    try {
+      const bytesResult = await request('media-source-bytes', { clip: source.clip })
+      check()
+      const sourceDone = perf.start('sourceBase64Decode')
+      const binary = atob(bytesResult.base64), bytes = new Uint8Array(binary.length)
+      for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i)
+      sourceDone()
+      blobUrl = URL.createObjectURL(new Blob([bytes], { type: bytesResult.mime || 'video/mp4' }))
+      await perf.measure('sourceLoad', () => waitForVideoTraceEvent(video, 'loadeddata', control.signal, () => { video.src = blobUrl; video.load() }))
+      const plan = videoTracePlan(options, video.duration, video.videoWidth, video.videoHeight)
+      pack = await request('media-trace-start', { fps: plan.fps, count: plan.count, w: plan.w, h: plan.h, maxBytes: plan.maxBytes, sourceClip: source.clip, sourceOffset: plan.from })
+      perf.enable(pack.performanceEnabled)
+      check()
+      update({ total: plan.count, message: '计划绘制 ' + plan.count.toLocaleString() + ' 帧，' + plan.w + '×' + plan.h + 'px…' })
+      const canvas = document.createElement('canvas')
+      canvas.width = plan.w; canvas.height = plan.h
+      const context = canvas.getContext('2d')
+      if (!context) throw new Error('浏览器无法创建画面缓冲区')
+      // 在途帧数与宿主 Worker 池对齐，避免多核时空转。
+      const VIDEO_TRACE_PIPELINE = Math.max(1, Math.min(4, Number(pack.poolSize) || 4))
+      let poster = '', reduced = 0, completed = 0
+      for (let i = 0; i < plan.count; i += 1) {
+        currentFrame = i
+        check()
+        if (queueContext?.pauseRequested) {
+          while (pendingFrames.length) {
+            const settled = await pendingFrames.shift()
+            if (!settled.ok) { currentFrame = settled.frameIndex; throw settled.error }
+          }
+          // Keep the scoped temporary-media lease alive during an application pause.
+          const heartbeat = setInterval(() => {
+            if (!control.signal.aborted) request('media-trace-heartbeat', { clip: pack.clip, token: pack.token }).catch(() => {})
+          }, 30000)
+          try { await queueContext.checkpoint() }
+          finally { clearInterval(heartbeat) }
+          check()
+        }
+        const time = Math.min(video.duration - 0.001, plan.from + i / plan.fps)
+        update({ total: plan.count, message: '正在抽取第 ' + (i + 1) + '/' + plan.count + ' 帧…' })
+        if (Math.abs(video.currentTime - time) > 0.00001) await perf.measure('seekDecode', () => waitForVideoTraceEvent(video, 'seeked', control.signal, () => { video.currentTime = time }))
+        check()
+        const drawDone = perf.start('scaleFrame')
+        context.drawImage(video, 0, 0, plan.w, plan.h)
+        drawDone()
+        const auth = { clip: pack.clip, token: pack.token, index: i }
+        const png = await perf.measure('pngEncode', () => new Promise((resolve, reject) => canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error('画面导出失败，请降低采样尺寸')), 'image/png')))
+        perf.count('pngBytes', png.size)
+        check()
+        let pngBase64
+        if (png.size <= 1024 * 1024) pngBase64 = await perf.measure('base64Encode', () => readVideoChunk(png, control.signal))
+        else for (let offset = 0; offset < png.size; offset += 1024 * 1024) {
+          check()
+          const base64 = await perf.measure('base64Encode', () => readVideoChunk(png.slice(offset, offset + 1024 * 1024), control.signal))
+          await request('media-trace-frame-chunk', Object.assign({}, auth, { offset, base64 }))
+        }
+        check()
+        update({ message: '正在绘制第 ' + (i + 1) + '/' + plan.count + ' 帧…（流水线 ' + Math.min(VIDEO_TRACE_PIPELINE, plan.count) + '）' })
+        const frameIndex = i
+        // 用 allSettled 形态收进队列，避免尚未 await 的失败变成未处理拒绝。
+        pendingFrames.push(request('media-trace-frame', Object.assign({}, options, auth, { pngBase64 })).then(
+          (result) => {
+            completed += 1
+            if (frameIndex === 0) poster = result.svg
+            if (result.detailReduced) reduced += 1
+            update({ done: completed, svg: result.svg, message: '已完成 ' + completed + '/' + plan.count + ' 帧…' })
+            return { ok: true, result }
+          },
+          (error) => ({ ok: false, error, frameIndex }),
+        ))
+        if (pendingFrames.length >= VIDEO_TRACE_PIPELINE) {
+          const settled = await pendingFrames.shift()
+          if (!settled.ok) { currentFrame = settled.frameIndex; throw settled.error }
+        }
+      }
+      while (pendingFrames.length) {
+        const settled = await pendingFrames.shift()
+        if (!settled.ok) { currentFrame = settled.frameIndex; throw settled.error }
+      }
+      check()
+      const finished = await request('media-trace-finish', { clip: pack.clip, token: pack.token, performance: pack.performanceEnabled ? perf.report() : undefined })
+      check()
+      if (finished.manifest.frames.length !== plan.count) throw new Error('输出帧数不完整')
+      // Keep the finished media even when the owning view is currently unmounted.
+      // Only that session/file/page consumes it, after its document is loaded.
+      queueContext?.ready()
+      canvasSessions.publish(videoTraceRun, { taskId: queueContext?.id, source, output: Object.assign({}, plan, { clip: pack.clip, poster }) })
+      committed = true
+      update({ busy: false, done: plan.count, total: plan.count, message: '复刻完成：' + plan.count + ' 帧，' + (plan.count / plan.fps).toFixed(2) + ' 秒。' +
+        (reduced ? reduced + ' 帧因字符预算降低了细节。' : '') + '可在画布播放或导出（可撤销）。' })
+      request('media-trace-release', { clip: pack.clip, token: pack.token }).catch(() => {})
+    } catch (error) {
+      let cleanupError = ''
+      if (pack && !committed) {
+        try { await request('media-trace-discard', { clip: pack.clip, token: pack.token }) }
+        catch { cleanupError = '临时媒体清理失败，可用媒体清理菜单清除未引用素材。' }
+      }
+      setVideoTraceJob({ busy: false, error: !control.signal.aborted, options,
+        message: (control.signal.aborted ? '已取消复刻。' : (currentFrame >= 0 ? '第 ' + (currentFrame + 1) + ' 帧失败：' : '') + String(error.message || error)) + cleanupError })
+      if (queueContext) throw error
+    } finally {
+      perf.report()
+      while (pendingFrames.length) await pendingFrames.shift().catch(() => {})
+      video.pause(); video.removeAttribute('src'); video.load()
+      if (blobUrl) URL.revokeObjectURL(blobUrl)
+      if (videoTraceRun.current === control) videoTraceRun.current = null
+      queueContext?.signal.removeEventListener('abort', cancelQueued)
+    }
+  }
+  React.useEffect(() => {
+    if (!traceDrawing) return
+    const node = doc && doc.nodes.find((n) => n.id === traceDrawing.id)
+    if (!active || !node || svgMarkupFromStyle(node.style || '') !== traceDrawing.svg) setTraceDrawing(null)
+  }, [doc, active, traceDrawing])
+  React.useEffect(() => { setTraceDrawing(null) }, [target])
+  async function generateImageTrace(source, options) {
+    if (!source || typeof source.image !== 'string' || !isRasterDataUri(source.image)) throw new Error('请重新选择图片')
+    setSaveNote('大肥鱼正在分析原图，准备绘制色块…')
+    try {
+      const raw = await fetch(SAVE_ENDPOINT, {
+        method: 'POST', headers: { 'content-type': 'application/json', [SAVE_HEADER]: '1' },
+        body: JSON.stringify(Object.assign({ action: 'trace-node-image', sessionId, image: source.image }, options)),
+      })
+      const result = await raw.json()
+      if (!raw.ok || !result || result.ok !== true) throw new Error(result && result.error || '绘制请求失败')
+      return result
+    } catch (error) {
+      setSaveNote('绘制失败：' + (error.message || String(error)))
+      throw error
+    }
+  }
+
+  function applyImageTrace(source, result) {
+    if (!source) throw new Error('请重新选择图片')
+    const current = docRef.current
+    const node = current && current.nodes.find((n) => n.id === source.id)
+    if (!node || imageValueFromStyle(node.style || '') !== source.image) throw new Error('原图已更改或删除，请重新选择图片')
+    if (!filterEditableIds(current, [node.id]).includes(node.id)) throw new Error('原图所在图层已锁定')
+    let id
+    applyLocal((next) => { id = applyImageTraceToDoc(next, source, result.svg) })
+    setSelectedIds([id])
+    if (result.drawing && result.drawing.steps.length > 0) {
+      setTraceDrawing({ id, svg: result.svg, drawing: result.drawing, metrics: result.metrics })
+      setSaveNote('大肥鱼开始画画！正在从大色块到细节逐步展示复刻图…')
+    } else {
+      setTraceDrawing(null)
+      setSaveNote('大肥鱼画完啦！已绘制为 SVG（可撤销）')
+    }
+  }
+
+  function finishTraceDrawing(id) {
+    if (!traceDrawing || traceDrawing.id !== id) return
+    setTraceDrawing(null)
+    setSaveNote('大肥鱼画完啦！' + traceDrawing.metrics.fragments + ' 个碎片，' + traceDrawing.metrics.svgChars + ' 字符（可撤销）')
+  }
+
+  function nodeById(id) {
+    const current = docRef.current
+    if (current === null) return null
+    for (let i = 0; i < current.nodes.length; i += 1) if (current.nodes[i].id === id) return current.nodes[i]
+    return null
+  }
+
+  // ---- 撤销 / 重做（快照栈）------------------------------------------------
+  const HISTORY_LIMIT = 60
+
+  // cloneDoc 在模块作用域（纯函数，且自测要能直接调它 —— 它曾经在这里静默吃掉 layers）。
+
+  /** 落一份文档：更新工作副本、标脏、排一次防抖保存。撤销/重做也走这里。 */
+  function commitDoc(next) {
+    docRef.current = next
+    dirtyRef.current = true
+    setDoc(next)
+    scheduleSave()
+  }
+
+  function undo() {
+    const history = historyRef.current
+    const current = docRef.current
+    if (history.past.length === 0 || current === null) return
+    history.future.push(cloneDoc(current))
+    commitDoc(cloneDoc(history.past.pop()))
+    lastCoalesceRef.current = null
+    setSelectedIds([])
+    setEditing(null)
+    setMenu(null)
+  }
+
+  function redo() {
+    const history = historyRef.current
+    const current = docRef.current
+    if (history.future.length === 0 || current === null) return
+    history.past.push(cloneDoc(current))
+    commitDoc(cloneDoc(history.future.pop()))
+    lastCoalesceRef.current = null
+    setSelectedIds([])
+    setEditing(null)
+    setMenu(null)
+  }
+
+  /** 服务端推来新版本时清空历史 —— 否则一次撤销会把别人（或 AI）刚写的改动悄悄顶掉。 */
+  function mergeBackgroundHistory(patch) {
+    for (const document of historyRef.current.past.concat(historyRef.current.future)) applyTaskPatches(document, patch)
+    if (docRef.current) {
+      const next = applyTaskPatches(cloneDoc(docRef.current), patch)
+      docRef.current = next; setDoc(next)
+    }
+    lastCoalesceRef.current = null
+  }
+
+  function resetHistory() {
+    historyRef.current.past.length = 0
+    historyRef.current.future.length = 0
+    lastCoalesceRef.current = null
+  }
+
+  /** 本地乐观改动：先压快照，再改，立刻反映到界面并排一次防抖落盘。 */
+  function applyLocal(mutate, coalesceKey) {
+    const current = docRef.current
+    if (current === null) return
+    const key = coalesceKey === undefined ? null : coalesceKey
+    if (key === null || lastCoalesceRef.current !== key) {
+      const past = historyRef.current.past
+      past.push(cloneDoc(current))
+      if (past.length > HISTORY_LIMIT) past.shift()
+      historyRef.current.future.length = 0
+      lastCoalesceRef.current = key
+    }
+    const next = cloneDoc(current)
+    mutate(next)
+    commitDoc(next)
+  }
+
+  /**
+   * 卸载前把还在防抖窗口里的改动冲出去。
+   *
+   * 现在**可以关掉最后一个标签**（回到空舞台），而防抖窗口是 300ms ——
+   * 少了这一条，手快的人在窗口内点 × 就会丢掉刚才那一笔。尽力而为：不 await、不提示。
+   */
+  React.useEffect(() => () => {
+    if (dirtyRef.current === true && hasPath && docRef.current !== null && client !== null) saveNow()
+  }, [])
+
+  function scheduleSave() {
+    if (client === null) return
+    if (saveTimerRef.current !== null) {
+      saveTimerRef.current()
+      saveTimerRef.current = null
+    }
+    // 用 cordis 定时器而不是 setTimeout：它是 fiber effect，插件卸载时自动清掉。
+    saveTimerRef.current = client.timeout(() => {
+      saveTimerRef.current = null
+      saveNow()
+    }, SAVE_DEBOUNCE_MS)
+  }
+
+  /**
+   * 向宿主要一次文件清单（「打开」菜单用）。
+   *
+   * 复用保存那条路由的 `action: 'list'`：客户端没有列目录的读权限通道，
+   * 而宿主那边已经有带信任围栏（POST + 自定义头 + 同源）的入口，少开一个口子。
+   */
+  async function fetchFileList(dir) {
+    setFileList({ files: null, error: '' })
+    const body = { action: 'list', sessionId: sessionId }
+    if (typeof dir === 'string' && dir.length > 0) body.dir = dir
+    let raw = null
+    try {
+      raw = await fetch(SAVE_ENDPOINT, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [SAVE_HEADER]: '1' },
+        body: JSON.stringify(body),
+      })
+    } catch (error) {
+      setFileList({ files: null, error: '请求失败：' + (error && error.message ? error.message : String(error)) })
+      return
+    }
+    let payload = null
+    try {
+      payload = await raw.json()
+    } catch (error) {
+      setFileList({ files: null, error: '返回不是 JSON（HTTP ' + raw.status + '）' })
+      return
+    }
+    if (payload === null || payload.ok !== true) {
+      setFileList({ files: null, error: String(payload !== null && payload.error ? payload.error : 'HTTP ' + raw.status) })
+      return
+    }
+    // 宿主同时给了相对路径（给人看）与绝对路径（当身份）。
+    // 用绝对路径去重：标签上的路径可能来自 tab 的资源地址（绝对），
+    // 与列表里的相对路径不相等 —— 直接比就会给同一个文件开出两个标签。
+    const rel = Array.isArray(payload.files) ? payload.files : []
+    const abs = Array.isArray(payload.absolute) ? payload.absolute : []
+    const entries = []
+    for (let i = 0; i < rel.length; i += 1) {
+      const identity = typeof abs[i] === 'string' && abs[i].length > 0 ? abs[i] : rel[i]
+      entries.push({ path: identity, display: rel[i] })
+    }
+    // .drawio：**不是**画布，点它要先导入。所以单独一列，界面上也分区显示 ——
+    // 混在画布列表里会让"打开"去按 JSON 读一个 XML 文件。
+    const relDrawio = Array.isArray(payload.drawio) ? payload.drawio : []
+    const absDrawio = Array.isArray(payload.drawioAbsolute) ? payload.drawioAbsolute : []
+    const drawioEntries = []
+    for (let i = 0; i < relDrawio.length; i += 1) {
+      const identity = typeof absDrawio[i] === 'string' && absDrawio[i].length > 0 ? absDrawio[i] : relDrawio[i]
+      drawioEntries.push({ path: identity, display: relDrawio[i] })
+    }
+    setFileList({
+      files: entries,
+      drawio: drawioEntries,
+      error: '',
+      notes: Array.isArray(payload.notes) ? payload.notes : [],
+      dir: typeof payload.dir === 'string' ? payload.dir : '',
+    })
+  }
+
+  /**
+   * 「打开」：先弹**系统文件管理器**选一个目录，再列出该目录下的画布。
+   *
+   * 为什么是选目录而不是选文件：DSH 的 uiWorkspace 只提供 `pickDirectory()`
+   * （没有选单个文件的接口）。所以流程是"选目录 → 列该目录下的 .drawio"，
+   * 比原来只能在"工作区根目录 + 一层子目录"里挑要灵活得多。
+   *
+   * uiWorkspace 用 ctx.get 取（可选依赖）：拿不到就退回原来的"列工作区"，
+   * 不让整个「打开」按钮失效。
+   */
+  async function openFilePicker() {
+    if (docMenu === 'open') {
+      setDocMenu(null)
+      return
+    }
+    setDocMenu('open')
+    // **不弹系统选择器**：直接列出"上次用过的目录"（没选过就是工作区）。
+    // 每次点「打开」都弹一次文件管理器很烦 —— 多数时候用户只是想切到另一个画布。
+    // 只有点面板里的「选择目录…」才真的弹选择器。
+    fetchFileList(lastPickedDirRef.current)
+  }
+
+  /**
+   * 「选择目录…」：弹**系统文件管理器**选一个目录，然后列出该目录下的画布。
+   *
+   * 为什么是选目录而不是选文件：DSH 的 uiWorkspace 只提供 `pickDirectory()`
+   * （没有选单个文件的接口）。所以流程是"选目录 → 列该目录下的 .drawio"。
+   *
+   * uiWorkspace 用 ctx.get 取（可选依赖）：拿不到就退回列工作区，不让功能失效。
+   */
+  async function pickDirectoryAndList() {
+    const ws = client === null || typeof client.get !== 'function' ? undefined : client.get('uiWorkspace')
+    if (ws === undefined || ws === null || typeof ws.pickDirectory !== 'function') {
+      setFileList({ files: null, error: '当前环境没有可用的文件管理器，已列出工作区目录' })
+      fetchFileList(lastPickedDirRef.current)
+      return
+    }
+    setFileList({ files: null, error: '' })
+    let picked = null
+    try {
+      picked = await ws.pickDirectory()
+    } catch (error) {
+      setFileList({ files: null, error: '打开文件管理器失败：' + (error && error.message ? error.message : String(error)) })
+      return
+    }
+    if (picked === null || typeof picked !== 'string' || picked.length === 0) {
+      // 用户取消了：保留原列表，别把面板清空得像"出错了"。
+      fetchFileList(lastPickedDirRef.current)
+      return
+    }
+    lastPickedDirRef.current = picked
+    fetchFileList(picked)
+  }
+
+  /**
+   * 切到另一个文件。先把手上没落盘的改动写完，再切换 ——
+   * 否则"打开另一个文件"会静默丢掉当前画布的编辑。
+   */
+  /**
+   * 「打开」某个文件。
+   *
+   * **走 onOpenTab 而不是 onRebind**：打开一个文件应该是"多出一个它的标签页并切过去"，
+   * 而不是把当前标签改名替换掉 —— 后者会让用户丢掉正在编辑的那张画布的位置。
+   * 外层 openTabIn 会去重：该文件已经开着就直接切过去，不会开出第二个标签。
+   *
+   * 因为当前标签只是"被留在后面"（没被替换、没被关掉），这里有未落盘的改动**也不必先保存**，
+   * 更不用弹警告 —— 它的内容仍留在自己那个标签里。
+   */
+  async function switchTo(relPath) {
+    if (typeof relPath !== 'string' || relPath.length === 0) return
+    setDocMenu(null)
+    setFileList(null)
+    onOpenTab(relPath)
+  }
+
+
+  /**
+   * 另存为：写入给定文件名，并把本标签**改为绑定**到它。
+   *
+   * 复用保存通道的同一套宿主校验（只收单个文件名、只落工作区根目录），
+   * 所以这里只做两件事：把当前 doc 写过去、把 target 换过去。
+   */
+  async function saveAs(name) {
+    const trimmed = String(name === undefined || name === null ? '' : name).trim()
+    if (trimmed.length === 0) {
+      setFileList({ files: null, error: '请填一个文件名' })
+      return
+    }
+    if (/[\\/]/.test(trimmed)) {
+      setFileList({ files: null, error: '文件名不能包含路径分隔符' })
+      return
+    }
+    const withExt = trimmed.toLowerCase().endsWith('.drawio') ? trimmed : trimmed + '.drawio'
+    const snapshot = docRef.current
+    if (client === null || snapshot === null) return
+    setSaveNote('另存为 ' + withExt + ' …')
+    let raw = null
+    try {
+      raw = await fetch(SAVE_ENDPOINT, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [SAVE_HEADER]: '1' },
+        // createOnly：另存为的目标**不该已存在**，已存在就让宿主返回 409，
+        // 绝不静默覆盖别人的文件 —— 想改那个文件请用「打开」进去。
+        body: JSON.stringify({
+          sessionId: sessionId,
+          path: withExt,
+          createOnly: true,
+          doc: snapshot,
+          // 成对带走 *.media（宿主按 fromPath → 新主名复制旁路包）。
+          ...(hasPath ? { fromPath: target } : {}),
+        }),
+      })
+    } catch (error) {
+      setFileList({ files: null, error: '保存请求失败：' + (error && error.message ? error.message : String(error)) })
+      return
+    }
+    let payload = null
+    try {
+      payload = await raw.json()
+    } catch (error) {
+      setFileList({ files: null, error: '返回不是 JSON（HTTP ' + raw.status + '）' })
+      return
+    }
+    if (payload === null || payload.ok !== true) {
+      const message = String(payload !== null && payload.error ? payload.error : 'HTTP ' + raw.status)
+      setFileList({ files: null, error: message === 'already exists' ? '已存在同名文件：用「打开」进去改，或换个名字' : message })
+      return
+    }
+    revisionRef.current = payload.revision
+    dirtyRef.current = false
+    onRebind(withExt)
+    setDocMenu(null)
+    setNewName('')
+    setFileList(null)
+    setSaveNote('已另存为 ' + withExt + '（revision ' + payload.revision + '）')
+  }
+
+  /** 旁路媒体 API（同源 POST，与保存同一信任围栏）。 */
+  async function mediaAction(action, extra, options) {
+    if (client === null || !hasPath) {
+      setSaveNote('请先保存画布到工作区，再使用视频媒体功能')
+      return null
+    }
+    const body = Object.assign({ action: action, sessionId: sessionId, path: target }, extra || {})
+    let raw = null
+    try {
+      raw = await fetch(SAVE_ENDPOINT, {
+        method: 'POST',
+        signal: options && options.signal,
+        headers: { 'content-type': 'application/json', [SAVE_HEADER]: '1' },
+        body: JSON.stringify(body),
+      })
+    } catch (error) {
+      if (options && options.throwOnError) throw error
+      setSaveNote('媒体请求失败：' + (error && error.message ? error.message : String(error)))
+      return null
+    }
+    let payload = null
+    try {
+      payload = await raw.json()
+    } catch (error) {
+      if (options && options.throwOnError) throw new Error('媒体返回不是 JSON（HTTP ' + raw.status + '）')
+      setSaveNote('媒体返回不是 JSON（HTTP ' + raw.status + '）')
+      return null
+    }
+    if (payload === null || payload.ok !== true) {
+      if (options && options.throwOnError) throw new Error(payload && payload.error || '媒体操作失败')
+      setSaveNote(String(payload !== null && payload.error ? payload.error : '媒体操作失败'))
+      return null
+    }
+    return payload
+  }
+
+  async function ensureMediaClip(clip, opts) {
+    return mediaAction('media-ensure', {
+      clip: clip,
+      kind: opts && opts.kind === 'raster' ? 'raster' : 'svg',
+      fps: opts && opts.fps,
+      w: opts && opts.w,
+      h: opts && opts.h,
+    })
+  }
+
+  async function reportFocus() {
+    if (client === null || !active) return
+    const focusKey = (hasPath ? target : '') + '#' + pageIndex
+    if (focusReportedRef.current === focusKey) return
+    focusReportedRef.current = focusKey
+    try {
+      await fetch(SAVE_ENDPOINT, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [SAVE_HEADER]: '1' },
+        body: JSON.stringify({
+          action: 'focus',
+          sessionId: sessionId,
+          path: hasPath ? target : '',
+          page: pageIndex,
+        }),
+      })
+    } catch (error) {
+      // 不打扰用户：下次 target / 页变化时会再试
+    }
+  }
+
+  /**
+   * 「撤销 AI 改动」：把宿主留的那一份"AI 写盘前的文本"写回去（只有一层）。
+   *
+   * 为什么需要：服务端推来新版本时客户端会清空本地撤销历史（见 resetHistory 的注释），
+   * 所以 AI 改完按 Ctrl+Z 是退不回去的。这里走宿主的 revert 端点。
+   * 本地有没落盘的改动时拒绝 —— 否则那点改动会被撤回操作压掉（300ms 自动保存，等一下就好）。
+   */
+  async function revertAiChange() {
+    if (client === null || !hasPath || client === null) return
+    if (dirtyRef.current === true) {
+      setSaveNote('有还没落盘的改动，稍等一下再撤回')
+      return
+    }
+    try {
+      const raw = await fetch(SAVE_ENDPOINT, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [SAVE_HEADER]: '1' },
+        body: JSON.stringify({ action: 'revert', sessionId: sessionId, path: target }),
+      })
+      const payload = await raw.json()
+      if (payload.ok !== true) {
+        setSaveNote(typeof payload.error === 'string' && payload.error.length > 0 ? payload.error : '撤回失败')
+        return
+      }
+      setCanRevert(false)
+      setSaveNote('已退回上一次 AI 改动（revision ' + payload.revision + '）')
+      setNonce((n) => n + 1)
+    } catch (error) {
+      setSaveNote('撤回失败：' + (error && error.message ? error.message : String(error)))
+    }
+  }
+
+  /**
+   * 显示/隐藏一个图层 —— 写的是**文档里的属性**（drawio 的 `visible="0"`），不是本地开关：
+   * 于是它会被保存、能被 drawio 看见、也进撤销历史（Ctrl+Z 能撤回一次误点）。
+   */
+  function toggleLayerVisible(id) {
+    applyLocal((next) => {
+      const layers = Array.isArray(next.layers) ? next.layers : null
+      if (layers === null) return
+      for (let i = 0; i < layers.length; i += 1) {
+        if (layers[i].id !== id) continue
+        layers[i].visible = layers[i].visible === false
+      }
+    })
+  }
+
+  /** 新建图层：自动命名"图层 N"。 */
+  function createLayer() {
+    const current = docRef.current
+    if (current === null) return
+    const id = nextLayerIdOf(current)
+    const index = Array.isArray(current.layers) ? current.layers.length : 0
+    applyLocal((next) => {
+      if (Array.isArray(next.layers) === false) next.layers = []
+      next.layers.push({ id: id, name: '图层 ' + (index + 1), visible: true, locked: false })
+    })
+    setCurrentLayerId(id)
+    setSaveNote('已新建图层「图层 ' + (index + 1) + '」并设为当前图层')
+    return id
+  }
+
+  function toggleLayerLocked(id) {
+    let note = ''
+    applyLocal((next) => {
+      const layers = Array.isArray(next.layers) ? next.layers : null
+      if (layers === null) return
+      for (let i = 0; i < layers.length; i += 1) {
+        if (layers[i].id !== id) continue
+        layers[i].locked = layers[i].locked !== true
+        note = (layers[i].locked ? '已锁定图层' : '已解锁图层') + '「' + layerLabelOf(layers[i], i) + '」'
+        break
+      }
+    })
+    if (note.length > 0) setSaveNote(note)
+  }
+
+  function openRenameLayer(id) {
+    const current = docRef.current
+    if (current === null || Array.isArray(current.layers) === false) return
+    let name = ''
+    for (let i = 0; i < current.layers.length; i += 1) {
+      if (current.layers[i].id === id) {
+        name = typeof current.layers[i].name === 'string' ? current.layers[i].name : ''
+        break
+      }
+    }
+    setRenameLayerId(id)
+    setNewName(name)
+    setDocMenu('renameLayer')
+    setDocMenuPos(null)
+    setFileList(null)
+  }
+
+  function commitRenameLayer(name) {
+    const id = renameLayerId
+    if (id === null || id === undefined) return
+    const text = String(name === undefined || name === null ? '' : name)
+    applyLocal((next) => {
+      renameLayerInDoc(next, id, text)
+    })
+    setDocMenu(null)
+    setRenameLayerId(null)
+    setSaveNote(text.length > 0 ? '已重命名图层为「' + text + '」' : '已清空图层名（显示为「第 N 层」）')
+  }
+
+  function removeLayer(id) {
+    const current = docRef.current
+    if (current === null) return
+    // 先在副本上试删：失败不进撤销历史（否则会多一条"什么都没改"的快照）。
+    const probe = cloneDoc(current)
+    const probed = deleteLayerInDoc(probe, id)
+    if (probed.ok !== true) {
+      setSaveNote(probed.error)
+      return
+    }
+    let mergeName = probed.mergeInto
+    const probeLayers = Array.isArray(probe.layers) ? probe.layers : []
+    for (let i = 0; i < probeLayers.length; i += 1) {
+      if (probeLayers[i].id === probed.mergeInto) {
+        mergeName = layerLabelOf(probeLayers[i], i)
+        break
+      }
+    }
+    applyLocal((next) => {
+      deleteLayerInDoc(next, id)
+    })
+    if (currentLayerId === id) setCurrentLayerId(probed.mergeInto)
+    setSaveNote('已删除图层，层内单元并入「' + mergeName + '」')
+  }
+
+  function moveSelectionToLayer(layerId) {
+    if (layerIsLocked(docRef.current, layerId)) { setSaveNote('目标图层已锁定：先解锁后再移动'); return }
+    const ids = filterEditableIds(docRef.current, selectedIds)
+    if (ids.length === 0) {
+      setSaveNote('没有可移层的选中项（锁定层上的单元移不了）')
+      return
+    }
+    let count = 0
+    applyLocal((next) => {
+      count = moveCellsToLayerInDoc(next, ids, layerId)
+    })
+    setSaveNote(count > 0 ? '已把 ' + count + ' 个单元移到目标图层' : '选中项已在这一层')
+  }
+
+  /** 当前图层是否锁定（新建/粘贴前要拦一下）。 */
+  function activeLayerLocked() {
+    return layerIsLocked(docRef.current, activeLayerId)
+  }
+
+  function openFindPanel() {
+    setFindQuery('')
+    setDocMenu('find')
+    setDocMenuPos(null)
+    setFileList(null)
+  }
+
+  function openPrefsPanel() {
+    setDocMenu('prefs')
+    setDocMenuPos(null)
+    setFileList(null)
+  }
+
+  async function switchPage(nextIndex) {
+    if (nextIndex === pageIndex) return
+    if (dirtyRef.current === true) {
+      await saveNow()
+      if (dirtyRef.current === true) return
+    }
+    canvasSessions.workspace(sessionId).pages[target] = nextIndex
+    setPageIndex(nextIndex)
+    setNonce((n) => n + 1)
+    setSaveNote('切换到第 ' + (nextIndex + 1) + ' 页…')
+  }
+
+  /**
+   * 解散分区：删掉分区框，子节点回到图层下（内容保留）。
+   * 分区是元素库里的可插入区块，不是"编辑→成组"——解散只在右键分区时出现。
+   */
+  function dissolveSection(sectionId) {
+    const current = docRef.current
+    if (current === null) return
+    const node = nodeById(sectionId)
+    if (node === null || isContainerNode(current, node) === false) {
+      setSaveNote('这不是分区')
+      return
+    }
+    let freed = 0
+    applyLocal((next) => {
+      for (let j = 0; j < next.nodes.length; j += 1) {
+        if (next.nodes[j].parent === sectionId) {
+          next.nodes[j].parent = null
+          freed += 1
+        }
+      }
+      next.nodes = next.nodes.filter((n) => n.id !== sectionId)
+      ensureDrawOrder(next)
+    })
+    setSelectedIds([])
+    setMenu(null)
+    setSaveNote(freed > 0 ? '已解散分区，保留 ' + freed + ' 个子节点' : '已删除空分区')
+  }
+
+  function jumpToFindHit(hit) {
+    if (hit === null || hit === undefined || typeof hit.id !== 'string') return
+    setSelectedIds([hit.id])
+    setDocMenu(null)
+    const current = docRef.current
+    if (current === null) return
+    // 以命中项为中心给一个小框，再按当前画布宽高比 fit —— 大图上不会整张缩到看不见。
+    let bounds = null
+    if (hit.kind === 'node') {
+      const n = current.nodes.find((x) => x.id === hit.id)
+      if (n !== undefined) {
+        const x = numberOr(n.x, 0)
+        const y = numberOr(n.y, 0)
+        const w = numberOr(n.w, FALLBACK_NODE_W)
+        const h = numberOr(n.h, FALLBACK_NODE_H)
+        bounds = { minX: x - 40, minY: y - 40, maxX: x + w + 40, maxY: y + h + 40 }
+      }
+    } else {
+      const geometry = buildGeometry(current)
+      const edge = current.edges.find((x) => x.id === hit.id)
+      if (edge !== undefined) {
+        const pts = edgeRoutePoints(current, edge, geometry)
+        if (pts !== null && pts.length > 0) {
+          let minX = Infinity
+          let minY = Infinity
+          let maxX = -Infinity
+          let maxY = -Infinity
+          for (let i = 0; i < pts.length; i += 1) {
+            if (pts[i].x < minX) minX = pts[i].x
+            if (pts[i].y < minY) minY = pts[i].y
+            if (pts[i].x > maxX) maxX = pts[i].x
+            if (pts[i].y > maxY) maxY = pts[i].y
+          }
+          bounds = { minX: minX - 40, minY: minY - 40, maxX: maxX + 40, maxY: maxY + 40 }
+        }
+      }
+    }
+    if (bounds === null) return
+    const aspect = size !== null && size.w > 0 && size.h > 0 ? size.h / size.w : 1
+    setViewOverride(computeFitView(bounds, aspect))
+    setSaveNote('已定位到 ' + hit.id)
+  }
+
+  async function saveNow() {
+    // Large image saves can outlive the debounce interval. Serialize writes so
+    // later edits use the revision returned by the preceding save.
+    if (saveInFlightRef.current !== null) {
+      await saveInFlightRef.current
+      if (dirtyRef.current === true) return saveNow()
+      return
+    }
+    if (client === null || dirtyRef.current !== true) return
+    // 没有绑定文件（空舞台）时不该有脏数据；真出现就说明状态串了 —— 提示而不是猜一个文件名
+    // （替用户挑文件名正是原来"悄悄写 demo"的老毛病）。
+    if (!hasPath) {
+      setSaveNote('还没有画布可保存：先「新建画布…」或「打开…」')
+      return
+    }
+    const snapshot = docRef.current
+    if (snapshot === null) return
+    const pendingSave = performSave(snapshot)
+    saveInFlightRef.current = pendingSave
+    try { await pendingSave }
+    finally { saveInFlightRef.current = null }
+  }
+
+  async function performSave(snapshot) {
+    const reportSaveError = (message) => {
+      if (videoTraceRun.pendingSave?.taskId) drawingQueue.resultError(videoTraceRun.pendingSave.taskId, message)
+    }
+    const baseRevision = revisionRef.current
+    dirtyRef.current = false
+    setSaveNote('保存中…')
+    let response = null
+    try {
+      const raw = await fetch(SAVE_ENDPOINT, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [SAVE_HEADER]: '1' },
+        body: JSON.stringify({ sessionId: sessionId, path: target, revision: baseRevision, doc: snapshot, page: pageIndex }),
+      })
+      response = await raw.json()
+    } catch (error) {
+      dirtyRef.current = true
+      reportSaveError('自动保存失败：' + (error && error.message ? error.message : String(error)))
+      setSaveNote('保存失败：' + (error && error.message ? error.message : String(error)))
+      return
+    }
+    if (response === null || response.ok !== true) {
+      const message = String(response !== null && response.error ? response.error : 'unknown')
+      if (message === 'revision conflict') {
+        dirtyRef.current = true
+        reportSaveError('自动保存遇到版本冲突，本地编辑已保留')
+        setSaveNote('保存冲突：本地编辑已保留，请先另存副本或处理外部修改')
+        return
+      }
+      dirtyRef.current = true
+      reportSaveError('自动保存失败：' + message)
+      setSaveNote('保存被拒：' + message)
+      return
+    }
+    revisionRef.current = response.revision
+    if (response.backgroundPatch) mergeBackgroundHistory(response.backgroundPatch)
+    canvasSessions.acknowledge(videoTraceRun, snapshot)
+    // 有边被略过就如实说（两端都没有落点的边写不进文件），别让用户以为"全保存了"。
+    const dropped = Array.isArray(response.dropped) ? response.dropped : []
+    setSaveNote('已保存（revision ' + response.revision + '）' + (dropped.length > 0 ? ' ｜ ' + dropped.length + ' 条边没有落点，未写入：' + dropped.join(', ') : ''))
+  }
+
+  function snap(value) {
+    return Math.round(value / GRID) * GRID
+  }
+  /** 屏幕坐标 → SVG 用户坐标。用 CTM 逆矩阵，比自己算缩放平移可靠。 */
+  function toUserSpace(event) {
+    const svg = svgRef.current
+    if (svg === null) return null
+    try {
+      const ctm = svg.getScreenCTM()
+      if (ctm === null) return null
+      const point = new DOMPoint(event.clientX, event.clientY).matrixTransform(ctm.inverse())
+      return Number.isFinite(point.x) && Number.isFinite(point.y) ? { x: point.x, y: point.y } : null
+    } catch (error) {
+      return null
+    }
+  }
+
+  /**
+   * 开始拖动**整个选区**：节点、连线的折点、连线的自由端点一起动。
+   *
+   * 以前只挪节点 —— 连线的折点留在原地，于是"框选全部再拖"时线只是重新自动路由，
+   * 形状全变了（用户报的"线段没有被拖动，只是保持着自动路由"）。
+   * 现在同一个位移同时作用在三者上，相对位置**完全不变**。
+   *
+   * `ref` 是抓起来的那一点（节点的起始坐标）；位移由它算出来并被吸附一次：
+   * 逐点各自吸附会把相对位置弄歪（两个节点差 3px 时会被吸到同一格上叠起来）。
+   */
+  function startSelectionDrag(ids, point, reference) {
+    const current = docRef.current
+    if (current === null || point === null) return
+    // 拖容器时带子节点一起走（绝对坐标模型下否则会出现"框动了、里面的东西留在原地"）。
+    const dragIds = expandDragIds(current, filterEditableIds(current, ids))
+    const starts = []
+    for (let i = 0; i < current.nodes.length; i += 1) {
+      const n = current.nodes[i]
+      if (dragIds.indexOf(n.id) < 0) continue
+      // w/h 也记下来：对齐辅助线要用**整组的外接框**比（与 drawio 一致）。
+      starts.push({ id: n.id, x: numberOr(n.x, 0), y: numberOr(n.y, 0), w: numberOr(n.w, FALLBACK_NODE_W), h: numberOr(n.h, FALLBACK_NODE_H) })
+    }
+    // 连线上"不是节点算出来的"那部分几何：折点与悬空端的自由点。
+    const edgeStarts = []
+    for (let i = 0; i < current.edges.length; i += 1) {
+      const e = current.edges[i]
+      if (dragIds.indexOf(e.id) < 0) continue
+      const points = Array.isArray(e.points) ? e.points.map((p) => ({ x: p.x, y: p.y })) : null
+      const sourcePoint = e.sourcePoint === undefined || e.sourcePoint === null ? null : { x: e.sourcePoint.x, y: e.sourcePoint.y }
+      const targetPoint = e.targetPoint === undefined || e.targetPoint === null ? null : { x: e.targetPoint.x, y: e.targetPoint.y }
+      if (points === null && sourcePoint === null && targetPoint === null) continue
+      edgeStarts.push({ id: e.id, points: points, sourcePoint: sourcePoint, targetPoint: targetPoint })
+    }
+    if (starts.length === 0 && edgeStarts.length === 0) return
+    dragRef.current = {
+      originX: point.x,
+      originY: point.y,
+      starts: starts,
+      edgeStarts: edgeStarts,
+      ref: reference === undefined || reference === null ? null : reference,
+      hasNodes: starts.length > 0,
+    }
+  }
+
+  /**
+   * 指针按下时**只登记**，等真的拖动起来再抢 pointer capture。
+   *
+   * 为什么不能按下就抢（这是一个真实事故）：pointer capture 会把随后的 **click / dblclick
+   * 的目标改成捕获元素**。规范里 click 取"按下与松开两个目标的公共祖先"，而被捕获的
+   * `pointerup` 目标是捕获元素，于是 click 就落到画布容器上 —— 按在节点上双击时，
+   * 节点那个 `<g>` 根本不在事件路径里，`onDoubleClick` 永远不触发
+   * （Chrome 把这种行为判为 working as intended，见 w3c/pointerevents#356）。
+   * 症状就是用户报的"双击节点无法更改节点内容"。
+   *
+   * 我们抢捕获的唯一理由是"拖动过程中指针离开画布也别丢事件"，而那只在**真的动了**之后才有意义：
+   * 所以按下先记一笔，在 pointermove 里移动超过阈值（3px，与"越 3px 才算拖"同一套手感）时才抢。
+   * 一次"按下-松开没动"的点击因此完全不抢捕获，click/dblclick 仍由浏览器按命中测试派发。
+   */
+  function requestCapture(event) {
+    pendingCaptureRef.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY }
+  }
+
+  /** pointermove 里的第一件事：动得够远了就把登记过的捕获真正抢下来。 */
+  function takePendingCapture(event) {
+    const pending = pendingCaptureRef.current
+    if (pending === null || pending.pointerId !== event.pointerId) return
+    if (Math.abs(event.clientX - pending.x) + Math.abs(event.clientY - pending.y) <= CAPTURE_MOVE_PX) return
+    pendingCaptureRef.current = null
+    const element = canvasRef.current
+    if (element === null || typeof element.setPointerCapture !== 'function') return
+    try {
+      element.setPointerCapture(event.pointerId)
+    } catch (error) {
+      // 捕获失败不影响拖动：指针仍在画布内时会继续派发 pointermove
+    }
+  }
+
+  /**
+   * 侧栏悬停：打开同族形状面板，或最后一级的名称气泡。
+   * `key` 可以是族名（shape/text/…），也可以是独立工具键（edge / edge-straight）。
+   */
+  function openRailHover(key) {
+    if (typeof key !== 'string' || key.length === 0) return
+    if (railPanelTimerRef.current !== null) {
+      clearTimeout(railPanelTimerRef.current)
+      railPanelTimerRef.current = null
+    }
+    setRailOpenFamily(key)
+  }
+
+  /** 画布上悬停节点时：只有多变体族才打开同族面板（最后一级不弹名称，避免干扰画布）。 */
+  function openRailFamilyPanel(family) {
+    if (shapesInFamily(family).length <= 1) return
+    openRailHover(family)
+  }
+
+  function scheduleCloseRailFamilyPanel() {
+    if (railPanelTimerRef.current !== null) clearTimeout(railPanelTimerRef.current)
+    railPanelTimerRef.current = setTimeout(() => {
+      railPanelTimerRef.current = null
+      setRailOpenFamily(null)
+    }, 160)
+  }
+
+  /** 侧栏悬停气泡要显示的名字；多变体族返回 null（那走形状/线型面板）。 */
+  function railHoverTipLabel(key) {
+    if (typeof key !== 'string' || key.length === 0) return null
+    if (shapesInFamily(key).length > 1) return null
+    for (let i = 0; i < RAIL_FAMILIES.length; i += 1) {
+      if (RAIL_FAMILIES[i].family === key) return RAIL_FAMILIES[i].label
+    }
+    return null
+  }
+
+  /** 悬停气泡相对侧栏顶部的偏移（与族 chip 对齐）。 */
+  function railHoverTopPx(key) {
+    const chip = 36
+    const gap = 6
+    const cap = 12 + 5
+    for (let i = 0; i < RAIL_FAMILIES.length; i += 1) {
+      if (RAIL_FAMILIES[i].family === key) return cap + i * (chip + gap)
+    }
+    return cap
+  }
+
+  /** 选区里的连线 id（线条族换线型用）。 */
+  function railReplaceEdgeTargets() {
+    const current = docRef.current
+    if (current === null) return []
+    const out = []
+    for (let i = 0; i < selectedIds.length; i += 1) {
+      if (edgeById(selectedIds[i]) !== null) out.push(selectedIds[i])
+    }
+    return out
+  }
+
+  function onNodePointerEnter(id) {
+    setHoverNodeId(id)
+  }
+
+  function onNodePointerLeave(id) {
+    setHoverNodeId((cur) => (cur === id ? null : cur))
+  }
+
+  function onNodePointerDown(id, event) {
+    if (event.button !== 0) return
+    setMenu(null)
+    // 点在节点上：取消"放置工具"（否则拖完还以为下一刀会落形状）。
+    if (placeTool !== null) setPlaceTool(null)
+    if (placeEdgeKind !== null) setPlaceEdgeKind(null)
+    event.preventDefault()
+    event.stopPropagation()
+    if (editing !== null && editing.id !== id) setEditing(null)
+
+    const current = docRef.current
+    const node = nodeById(id)
+    // 锁定层点不到（渲染仍在，命中测试也会跳过；这里再挡一道右键/残余事件）。
+    if (current !== null && isLockedCell(lockedLayerIds(current), node)) {
+      setSaveNote('这一层已锁定，不能选中或拖动')
+      return
+    }
+
+    // Shift 加选/减选；否则若点的不在选区里就改成只选它，在选区里则保留整组（准备整体拖动）。
+    const additive = event.shiftKey === true
+    let ids = selectedIds
+    if (additive) {
+      ids = ids.indexOf(id) >= 0 ? ids.filter((x) => x !== id) : ids.concat([id])
+    } else if (ids.indexOf(id) < 0) {
+      ids = [id]
+    }
+    ids = filterEditableIds(current, ids)
+    setSelectedIds(ids)
+
+    const point = toUserSpace(event)
+    if (current === null || point === null) return
+    // 位移的基准取**抓起来的这个节点**：它的落点会被吸到格线上，其余成员跟同一个位移。
+    const reference = node === null ? null : { x: numberOr(node.x, 0), y: numberOr(node.y, 0) }
+    startSelectionDrag(ids, point, reference)
+    requestCapture(event)
+  }
+
+  /**
+   * 按在**连线**上：选中它（或保留整组），并准备好拖动整组。
+   *
+   * 这样"框选全部之后随手抓住一条线拖"也能整体移动 —— 只抓节点拖的话，
+   * 用户会以为线不能被拖。折点/自由端点都没有的边（纯自动路由）拖不动：
+   * 它没有"自己的几何"可以平移，改形状要用段把手（拖动某一段）。
+   */
+  function onEdgePointerDown(edgeId, event) {
+    if (event.button !== 0) return
+    setMenu(null)
+    const current = docRef.current
+    const edge = current === null ? null : edgeById(edgeId)
+    if (current !== null && isLockedCell(lockedLayerIds(current), edge)) {
+      setSaveNote('这一层已锁定，不能选中或拖动')
+      return
+    }
+    const additive = event.shiftKey === true
+    let ids = selectedIds
+    if (additive) {
+      ids = ids.indexOf(edgeId) >= 0 ? ids.filter((x) => x !== edgeId) : ids.concat([edgeId])
+    } else if (ids.indexOf(edgeId) < 0) {
+      ids = [edgeId]
+    }
+    ids = filterEditableIds(current, ids)
+    setSelectedIds(ids)
+    const point = toUserSpace(event)
+    if (point === null) return
+    // 抓的是连线：位移基准取选区里的第一个节点（有节点就跟它对齐格线），没有就按半格吸附。
+    let reference = null
+    if (current !== null) {
+      for (let i = 0; i < current.nodes.length; i += 1) {
+        if (ids.indexOf(current.nodes[i].id) < 0) continue
+        reference = { x: numberOr(current.nodes[i].x, 0), y: numberOr(current.nodes[i].y, 0) }
+        break
+      }
+    }
+    startSelectionDrag(ids, point, reference)
+    requestCapture(event)
+  }
+
+  function onNodePointerUp(id) {
+    const linking = linkRef.current
+    if (linking === null) return
+    // 拖拽过程中每一帧算出的预览里，已经记着"这一帧选中了目标哪一边"；
+    // 松手就用它落盘 —— 屏幕上刚高亮的那个端点，就是这条边真正接上的那个。
+    // （不要在这里重新算一次：重算的输入是指针位置，可能和最后一帧渲染用的不是同一个点。）
+    const preview = connectPreviewRef.current
+    const chosenTo = preview !== null && preview !== undefined && preview.sides !== undefined && typeof preview.sides.to === 'string' ? preview.sides.to : null
+    clearConnect()
+    // 这里曾经有一条"同向边已存在就直接 return"的守卫 —— 它会**无声**吞掉整个手势：
+    // 实测过（demo 里已有 n1→canvas 时，从 n1 往 canvas 拖永远没反应）。
+    // drawio 允许同一条两端之间有多条边（各自带自己的连接点与画法），所以这里不再拦。
+    //
+    // 自环（把线放回起点节点自己）：**允许** —— drawio 就是这么做的。
+    // 只要进出口不是同一个侧：同侧会从原路折回，屏幕上什么都看不见。
+    const selfLoop = linking.from === id
+    let entrySide = chosenTo
+    if (selfLoop) entrySide = chosenTo !== null && chosenTo !== linking.side ? chosenTo : nextSideOf(linking.side)
+    // 用户选中的两个端点写进 style 的 exitX/exitY 与 entryX/entryY（drawio 的固定连接点）。
+    // v1 是把桩点塞进 edge.points —— 那等于把"接在哪一侧"伪装成一个折点，
+    // 端点一动它就成了过期坐标（宿主重排时只能清掉，约束也就丢了）。
+    let style = DEFAULT_EDGE_STYLE
+    if (typeof linking.side === 'string' && linking.side.length > 0) style = styleWithSide(style, 'source', linking.side)
+    if (typeof entrySide === 'string' && entrySide.length > 0) style = styleWithSide(style, 'target', entrySide)
+
+    applyLocal((next) => {
+      let max = 0
+      const re = /^e(\d+)$/
+      for (let i = 0; i < next.edges.length; i += 1) {
+        const m = re.exec(String(next.edges[i].id))
+        if (m !== null) {
+          const n = parseInt(m[1], 10)
+          if (n > max) max = n
+        }
+      }
+      const fresh = { id: 'e' + (max + 1), from: linking.from, to: id, style: style }
+      if (activeLayerId !== null && activeLayerId !== undefined) fresh.layer = activeLayerId
+      next.edges.push(fresh)
+    })
+  }
+
+  /**
+   * 打开节点的就地编辑框。双击与右键菜单共用同一套定位。
+   *
+   * 位置/尺寸/字号全部由 `nodeEditorBox` 算 —— 它按**这个节点的文字区**摆，
+   * 于是编辑框里的断行与字号跟提交后画出来的标签一模一样（需求"输入时的效果与
+   * 输入完成后统一"）。定位仍然换算到**画布容器**的坐标系（画布是定位上下文）。
+   */
+  function openNodeEditor(id) {
+    const node = nodeById(id)
+    const svg = svgRef.current
+    const canvas = canvasRef.current
+    if (node === null || svg === null || canvas === null || !nodeShowsLabel(node)) return
+    const ctm = svg.getScreenCTM()
+    if (ctm === null) return
+    const rect = canvas.getBoundingClientRect()
+    setSelectedIds([id])
+    setMenu(null)
+    const text = typeof node.label === 'string' ? node.label : ''
+    const box = nodeEditorBox(node, text, ctm, { left: rect.left, top: rect.top }, mode)
+    setEditing(
+      Object.assign({ kind: 'node', id: id, text: text }, box),
+    )
+  }
+
+  function onNodeDoubleClick(id, event) {
+    event.preventDefault()
+    event.stopPropagation()
+    const node = nodeById(id)
+    // 双击打开大预览，播放入口与工具条共用同一控制器。
+    if (node !== null && isVideoNodeData(node.data)) {
+      startVideoPlayback(node).then(() => {
+        if (videoController.get(id).kind) videoController.configure(id, { expanded: true })
+      })
+      return
+    }
+    if (node !== null && !nodeShowsLabel(node)) return
+    openNodeEditor(id)
+  }
+
+  /** side ∈ n/e/s/w：从这一侧引出的线，落点会固定在这一边。 */
+  function onHandlePointerDown(id, side, event) {
+    if (event.button !== 0) return
+    event.preventDefault()
+    event.stopPropagation()
+    const current = docRef.current
+    const node = current === null ? null : nodeById(id)
+    if (current === null || node === null) return
+    // 引出侧是**手势真值**，记在 ref 里而不是只记在 state 里：
+    // 指针回调都是渲染期创建的闭包，读 state 会拿到上一帧的值；而预览路由和松手落线
+    // 必须用同一份边（否则预览从 E 边引出、落盘却按 S 边）。
+    const seed = { from: id, side: typeof side === 'string' ? side : 'e' }
+    linkRef.current = seed
+    setConnectFrom(id)
+    setConnectSide(seed.side)
+    setConnectHover(null)
+    setConnectPreview(null)
+    // 按下即出预览：不等第一次 pointermove，用户一握上手柄就能看到吸附环与折线。
+    setConnectCursor(event.clientX, event.clientY)
+  }
+
+  /**
+   * 拖线过程中的每一帧：算吸附目标 + 用真实路由算预览折线。
+   * 两者必须一起更新 —— 吸附目标就是路由的目标，分开算会出现"环亮了但线还指着空白处"。
+   */
+  function setConnectCursor(clientX, clientY) {
+    const current = docRef.current
+    const link = linkRef.current
+    const svg = svgRef.current
+    if (current === null || link === null || svg === null) return
+    let point = null
+    try {
+      const ctm = svg.getScreenCTM()
+      if (ctm !== null) {
+        const p = new DOMPoint(clientX, clientY).matrixTransform(ctm.inverse())
+        if (Number.isFinite(p.x) && Number.isFinite(p.y)) point = { x: p.x, y: p.y }
+      }
+    } catch (error) {
+      point = null
+    }
+    if (point === null) return
+    const geometry = buildGeometry(current)
+    const fromBox = geometry.byId[link.from]
+    if (fromBox === undefined) return
+    const route = routePreviewFor(current, geometry, point, link.from, fromBox.geo, link, HOT_PAD, null)
+    setConnectTo(point)
+    setConnectHover(route === null || route.hot === null ? null : route.hot.id)
+    setConnectPreview(route)
+    connectPreviewRef.current = route
+  }
+
+  /** 一次拖线结束：三份状态一起清，避免"环还亮着但已经没在连线"。 */
+  function clearConnect() {
+    linkRef.current = null
+    setConnectFrom(null)
+    setConnectTo(null)
+    setConnectHover(null)
+    setConnectPreview(null)
+    connectPreviewRef.current = null
+  }
+
+  /**
+   * 拖线落在**空白处**：建一条一端悬空的边（drawio 里拖到空白就是画一条"还没接上"的线）。
+   *
+   * 文档里那一端不写 `to`，只写 `targetPoint` —— 与 drawio 一致：
+   * `sourcePoint`/`targetPoint` 只在该端**没有**真实顶点时才生效。
+   */
+  function finishDanglingEdge(point) {
+    const link = linkRef.current
+    const current = docRef.current
+    clearConnect()
+    if (link === null || current === null || point === null) return
+    if (nodeById(link.from) === null) return
+    let style = DEFAULT_EDGE_STYLE
+    if (typeof link.side === 'string' && link.side.length > 0) style = styleWithSide(style, 'source', link.side)
+    applyLocal((next) => {
+      let max = 0
+      const re = /^e(\d+)$/
+      for (let i = 0; i < next.edges.length; i += 1) {
+        const m = re.exec(String(next.edges[i].id))
+        if (m !== null && parseInt(m[1], 10) > max) max = parseInt(m[1], 10)
+      }
+      next.edges.push({ id: 'e' + (max + 1), from: link.from, targetPoint: { x: point.x, y: point.y }, style: style })
+    })
+    setSaveNote('连出一条悬空端：把它的端点拖到节点上就接上了')
+  }
+
+  /**
+   * 开始一次可能的平移。button 记在 ref 里：松手时只有**左键**的空拖才算"点击空白"
+   * （中键平移不应该顺手把选中也清掉）。
+   *
+   * 位移一律在**屏幕像素**里算，缩放系数在按下时锁定。
+   * 曾经用 getScreenCTM() 把每帧的屏幕坐标换算成用户坐标再求差 —— 那是错的：
+   * 视口正在被这次拖动改写，坐标系跟着动，算出的位移又反馈回视口，形成自激振荡，
+   * 表现就是画面剧烈抖动。
+   */
+  function startPan(event, button) {
+    const current = viewRef.current
+    if (current === null) return false
+    const element = canvasRef.current
+    const scale = element !== null && element.clientWidth > 0 ? element.clientWidth / current.w : 0
+    if (!(scale > 0)) return false
+    panRef.current = {
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+      viewX: current.x,
+      viewY: current.y,
+      w: current.w,
+      h: current.h,
+      scale: scale,
+      moved: false,
+      button: button,
+    }
+    requestCapture(event)
+    return true
+  }
+
+  /** 空白处左键按下 = 开始框选（没拖动就是一次点击 → 松手取消选中）。平移让给中键。 */
+  function onBackgroundPointerDown(event) {
+    if (event.button !== 0) return
+    setMenu(null)
+    // CSS 的 user-select:none 是治本，这里再拦一次默认行为兜底：
+    // 有些浏览器仍会从 pointerdown 起启动选择拖拽。
+    event.preventDefault()
+    const point = toUserSpace(event)
+    if (point === null) return
+    const placeEdge = typeof placeEdgeKind === 'string' && placeEdgeKind.length > 0 ? placeEdgeKind : null
+    marqueeRef.current = {
+      x0: point.x,
+      y0: point.y,
+      x1: point.x,
+      y1: point.y,
+      additive: event.shiftKey === true,
+      moved: false,
+      // 武装了放置工具时：形状是松手且没拖才落下；线条则单击或拖拽定起终点都行（见 finishMarquee）。
+      placeShape: typeof placeTool === 'string' && placeTool.length > 0 ? placeTool : null,
+      placeEdge: placeEdge,
+    }
+    setMarquee({ x0: point.x, y0: point.y, x1: point.x, y1: point.y, placeEdge: placeEdge })
+    requestCapture(event)
+  }
+
+  /** 中键按下（在任何位置都生效，包括压在节点上）：拖动画布。 */
+  function onCanvasPointerDown(event) {
+    if (event.button !== 1) return
+    event.preventDefault()
+    startPan(event, 1)
+  }
+
+  function onCanvasPointerMove(event) {
+    // 第一件事：真的动起来了才把 pointer capture 抢下来（见 requestCapture 的注释 ——
+    // 按下就抢会让 click/dblclick 的目标变成画布容器，节点双击改标签会失灵）。
+    takePendingCapture(event)
+    const pan = panRef.current
+    if (pan !== null) {
+      const dxPx = event.clientX - pan.startClientX
+      const dyPx = event.clientY - pan.startClientY
+      if (Math.abs(dxPx) > 1 || Math.abs(dyPx) > 1) pan.moved = true
+      setViewOverride({ x: pan.viewX - dxPx / pan.scale, y: pan.viewY - dyPx / pan.scale, w: pan.w, h: pan.h })
+      return
+    }
+    // 拖边标签：越过 3px 才算"拖"（否则按住不放也点选一下，不该改文档）。
+    const labelDrag = labelDragRef.current
+    if (labelDrag !== null) {
+      const at = toUserSpace(event)
+      if (at === null) return
+      const distance = Math.abs(at.x - labelDrag.originX) + Math.abs(at.y - labelDrag.originY)
+      if (labelDrag.moved === false && distance > 3) labelDrag.moved = true
+      if (labelDrag.moved) moveEdgeLabel(labelDrag.edgeId, at)
+      return
+    }
+    const drag = dragRef.current
+    if (drag !== null) {
+      const point = toUserSpace(event)
+      if (point === null) return
+      // 整组一起移动：**同一个位移**作用在节点、折点、自由端点上，相对位置不变。
+      // 吸附只做一次（在 dragMoveOf 里），逐点各自吸附会把相对位置弄歪。
+      let move = dragMoveOf(drag, point)
+      // 对齐辅助线（drawio 的 guides）：与**没在拖的**节点比 左/中/右、上/中/下 六条线，
+      // 差在 6px 内就再吸过去，并把那条线画出来。以**整组的外接框**为准。
+      const live = docRef.current
+      let guideLines = []
+      if (live !== null && drag.starts.length > 0) {
+        const movedIds = drag.starts.map((s) => s.id)
+        const box = boxOfBoxes(drag.starts.map((s) => ({ x: s.x + move.x, y: s.y + move.y, w: s.w, h: s.h })))
+        const others = []
+        const hiddenForGuides = hiddenLayerIds(live)
+        for (let i = 0; i < live.nodes.length; i += 1) {
+          const n = live.nodes[i]
+          if (movedIds.indexOf(n.id) >= 0) continue
+          if (isHiddenCell(hiddenForGuides, n)) continue
+          others.push({ x: numberOr(n.x, 0), y: numberOr(n.y, 0), w: numberOr(n.w, FALLBACK_NODE_W), h: numberOr(n.h, FALLBACK_NODE_H) })
+        }
+        if (box !== null && others.length > 0) {
+          const snapped = alignGuidesFor(others, box, 6)
+          if (snapped.dx !== 0 || snapped.dy !== 0) move = { x: move.x + snapped.dx, y: move.y + snapped.dy }
+          guideLines = snapped.guides
+        }
+      }
+      setGuides(guideLines)
+      const moved = draggedGeometry(drag, move)
+      const key = 'drag:' + drag.starts.map((s) => s.id).join(',') + '|' + drag.edgeStarts.map((e) => e.id).join(',')
+      applyLocal((next) => {
+        for (let i = 0; i < moved.nodes.length; i += 1) {
+          for (let k = 0; k < next.nodes.length; k += 1) {
+            if (next.nodes[k].id !== moved.nodes[i].id) continue
+            next.nodes[k].x = moved.nodes[i].x
+            next.nodes[k].y = moved.nodes[i].y
+            break
+          }
+        }
+        for (let i = 0; i < moved.edges.length; i += 1) {
+          const item = moved.edges[i]
+          for (let k = 0; k < next.edges.length; k += 1) {
+            const e = next.edges[k]
+            if (e.id !== item.id) continue
+            if (item.points !== null) e.points = item.points.map((p) => ({ x: p.x, y: p.y }))
+            if (item.sourcePoint !== null) e.sourcePoint = { x: item.sourcePoint.x, y: item.sourcePoint.y }
+            if (item.targetPoint !== null) e.targetPoint = { x: item.targetPoint.x, y: item.targetPoint.y }
+            break
+          }
+        }
+      }, key)
+      return
+    }
+    const resize = resizeRef.current
+    if (resize !== null) {
+      const point = toUserSpace(event)
+      if (point === null) return
+      // 缩放的最小单位是**一格**：交给 resizeBox（尺寸按 GRID 吸附、对边原地不动、下限也取整格）。
+      const box = resizeBox(
+        { x: resize.x, y: resize.y, w: resize.w, h: resize.h },
+        resize.dir,
+        point.x - resize.originX,
+        point.y - resize.originY,
+      )
+      const x = box.x
+      const y = box.y
+      const w = box.w
+      const h = box.h
+      applyLocal((next) => {
+        for (let i = 0; i < next.nodes.length; i += 1) {
+          if (next.nodes[i].id !== resize.id) continue
+          next.nodes[i].x = x
+          next.nodes[i].y = y
+          next.nodes[i].w = w
+          next.nodes[i].h = h
+          break
+        }
+      }, 'resize:' + resize.id + ':' + resize.dir)
+      return
+    }
+    const marqueeDrag = marqueeRef.current
+    if (marqueeDrag !== null) {
+      const point = toUserSpace(event)
+      if (point === null) return
+      if (Math.abs(point.x - marqueeDrag.x0) > 2 || Math.abs(point.y - marqueeDrag.y0) > 2) marqueeDrag.moved = true
+      marqueeDrag.x1 = point.x
+      marqueeDrag.y1 = point.y
+      setMarquee({
+        x0: marqueeDrag.x0,
+        y0: marqueeDrag.y0,
+        x1: point.x,
+        y1: point.y,
+        placeEdge: typeof marqueeDrag.placeEdge === 'string' ? marqueeDrag.placeEdge : null,
+      })
+      return
+    }
+    if (linkRef.current !== null) {
+      // 预览要跟着指针走：这里不能只更新 connectTo —— 吸附目标与路由折线都要同一帧算出来。
+      setConnectCursor(event.clientX, event.clientY)
+      return
+    }
+    const edgeDrag = edgeDragRef.current
+    if (edgeDrag !== null) {
+      const current = docRef.current
+      if (current === null) return
+      const point = toUserSpace(event)
+      if (point === null) return
+      if (edgeDrag.kind === 'segment') {
+        // 整段平移：两个端点折点一起动，位移只在**垂直于该段**的方向上生效。
+        // 用按下时存的 base 做绝对定位（而不是累加），避免逐帧误差滚雪球。
+        //
+        // 最小移动单位是**半格**（EDGE_GRID = 5px）：连线比节点需要更细的手感。
+        // 做法是把**参考点**（被拖那一段的一个端点）的目标坐标吸附到 5px，再换算成统一位移 ——
+        // 两个端点用同一个位移，段本身的形状不会被吸附弄歪（逐点各自吸附会让"几乎水平"的段产生倾斜）。
+        const refPoint = edgeDrag.a < edgeDrag.base.length ? edgeDrag.base[edgeDrag.a] : edgeDrag.base[0]
+        const move = segmentMoveOf(refPoint, edgeDrag.horizontal, point.x - edgeDrag.originX, point.y - edgeDrag.originY)
+        const moveX = move.x
+        const moveY = move.y
+        applyLocal((next) => {
+          for (let i = 0; i < next.edges.length; i += 1) {
+            const e = next.edges[i]
+            if (e.id !== edgeDrag.edgeId) continue
+            const points = edgeDrag.base.map((p) => ({ x: p.x, y: p.y }))
+            if (edgeDrag.a < points.length) {
+              points[edgeDrag.a].x += moveX
+              points[edgeDrag.a].y += moveY
+            }
+            if (edgeDrag.b < points.length) {
+              points[edgeDrag.b].x += moveX
+              points[edgeDrag.b].y += moveY
+            }
+            e.points = points
+            break
+          }
+        }, 'segment:' + edgeDrag.edgeId + ':' + edgeDrag.a + ':' + edgeDrag.b)
+        return
+      }
+      // 改接端点：同样用真实路由算出预览折线，并吸附到指针附近的节点。
+      // 落点判定仍然交给松手时的 elementFromPoint（那是最终裁决），这里只负责"看起来会接成什么样"。
+      const dragged = edgeById(edgeDrag.edgeId)
+      const geometry = buildGeometry(current)
+      const routed =
+        dragged === null
+          ? null
+          : edgePreviewRoute(current, geometry, dragged, edgeDrag.kind, point, HOT_PAD)
+      const payload = Object.assign({ edgeId: edgeDrag.edgeId, kind: edgeDrag.kind, x: point.x, y: point.y }, routed)
+      edgePreviewRef.current = routed
+      setEdgePreview(payload)
+      return
+    }
+  }
+
+  function onCanvasPointerUp(event) {
+    // 手势结束：还没抢下来的捕获登记也一起作废（这一轮没拖动 = 就是一次点击，
+    // 不该在后面的某次 move 里突然抢捕获）。
+    pendingCaptureRef.current = null
+    const pan = panRef.current
+    if (pan !== null) {
+      panRef.current = null
+      // 中键平移不该顺手清掉选中。
+      if (pan.moved !== true && pan.button === 0) setSelectedIds([])
+    }
+    // 先记下这一轮有哪些手势结束过 —— 它们都会改变几何，之后要清一次冗余折点。
+    const endedDrag = dragRef.current
+    const geometryChanged = endedDrag !== null || resizeRef.current !== null || edgeDragRef.current !== null
+    dragRef.current = null
+    resizeRef.current = null
+    labelDragRef.current = null
+    setGuides([])
+    finishEdgeDrag(event)
+    finishMarquee()
+    // 手势结束必须清掉合并键：否则下一次拖同一个节点会命中同一个 key，
+    // 不再压快照 —— 表现为"第二次拖动撤销不了"。
+    lastCoalesceRef.current = null
+    // 拖完节点：中心点落在分区里就挂进分区，拖出则脱离（飞书分区语义）。
+    if (endedDrag !== null && Array.isArray(endedDrag.starts) && endedDrag.starts.length > 0) {
+      reparentAfterNodeDrag(endedDrag)
+    }
+    // 拖线松手落在吸附容差里时，节点组收不到 pointerup（事件挂在节点上）——用最后一帧预览
+    // 高亮的那个节点兜底，否则"预览亮着、松手什么都没有"。压在节点上时节点组已经处理过，
+    // 那时 linkRef 已被它清空，这里不会重复建边。
+    if (linkRef.current !== null) {
+      const fallback = dropTargetOf(null, connectPreviewRef.current)
+      if (fallback !== null) onNodePointerUp(fallback)
+      else {
+        // 落在空白处：把这一端留成**悬空端**（drawio 里拖到空白就是画一条"还没接上"的线）。
+        // 目标端点用松手时的指针位置（吸附到半格）—— 与折点同一套单位。
+        const at = event === null || event === undefined ? null : toUserSpace(event)
+        const target = at === null ? connectTo : at
+        finishDanglingEdge(target === null ? null : { x: snap(target.x, EDGE_GRID), y: snap(target.y, EDGE_GRID) })
+      }
+    }
+    // 收尾清理：让"一条线段只有一个把手"这个不变量在每次手势后都重新成立。
+    if (geometryChanged) pruneAllEdges()
+  }
+
+  /**
+   * 拖动结束后按中心点重新挂 parent：进入分区 / 离开分区。
+   * 正在拖的分区本身不改自己的 parent；分区的子节点若是跟着容器一起拖的，也不改（仍挂在该分区下）。
+   */
+  function reparentAfterNodeDrag(drag) {
+    const current = docRef.current
+    if (current === null || drag === null) return
+    const movedIds = new Set(drag.starts.map((s) => s.id))
+    const draggedSections = new Set()
+    for (let i = 0; i < current.nodes.length; i += 1) {
+      const n = current.nodes[i]
+      if (movedIds.has(n.id) && nodeShapeFromStyle(typeof n.style === 'string' ? n.style : '') === 'section') {
+        draggedSections.add(n.id)
+      }
+    }
+    const updates = []
+    for (let i = 0; i < current.nodes.length; i += 1) {
+      const n = current.nodes[i]
+      if (movedIds.has(n.id) === false) continue
+      if (draggedSections.has(n.id)) continue
+      if (typeof n.parent === 'string' && draggedSections.has(n.parent)) continue
+      if (nodeShapeFromStyle(typeof n.style === 'string' ? n.style : '') === 'section') continue
+      const cx = numberOr(n.x, 0) + numberOr(n.w, FALLBACK_NODE_W) / 2
+      const cy = numberOr(n.y, 0) + numberOr(n.h, FALLBACK_NODE_H) / 2
+      const host = sectionAtPoint(current, cx, cy, movedIds)
+      const nextParent = host === null ? null : host.id
+      const prev = n.parent === undefined ? null : n.parent
+      if (prev !== nextParent) updates.push({ id: n.id, parent: nextParent })
+    }
+    if (updates.length === 0) return
+    applyLocal((next) => {
+      for (let u = 0; u < updates.length; u += 1) {
+        for (let i = 0; i < next.nodes.length; i += 1) {
+          if (next.nodes[i].id !== updates[u].id) continue
+          next.nodes[i].parent = updates[u].parent
+          break
+        }
+      }
+    })
+  }
+
+  /** 开始缩放一个节点。dir ∈ n/s/e/w/ne/nw/se/sw。 */
+  function onResizePointerDown(id, dir, event) {
+    if (event.button !== 0) return
+    event.preventDefault()
+    event.stopPropagation()
+    setMenu(null)
+    const node = nodeById(id)
+    const point = toUserSpace(event)
+    if (node === null || point === null) return
+    resizeRef.current = {
+      id: id,
+      dir: dir,
+      originX: point.x,
+      originY: point.y,
+      x: numberOr(node.x, 0),
+      y: numberOr(node.y, 0),
+      w: numberOr(node.w, FALLBACK_NODE_W),
+      h: numberOr(node.h, FALLBACK_NODE_H),
+    }
+    requestCapture(event)
+  }
+
+  /** 导出前把实时 SVG 克隆一份、摘掉交互件 —— 手柄和选中框不该出现在产物里。 */
+  function buildExportSvg(opts) {
+    const current = docRef.current
+    const options = opts || {}
+    const boundsDoc = exportDocument(current, options)
+    if (!boundsDoc) return null
+    const transparent = options.transparent === true || options.backgroundColor === 'none'
+    const withGrid = typeof options.grid === 'boolean' ? options.grid : !transparent && showGrid
+    const area = exportGeometry(boundsDoc, options)
+    const output = exportOutputSize(area.width, area.height, Object.assign({ format: 'svg' }, options))
+    const clone = svgTreeToDom(renderDiagram(boundsDoc, mode, uid + '-export', { current: null }, { showGrid: withGrid },
+      { x: area.x, y: area.y, w: area.width, h: area.height }), document)
+    // 框按**这一刻会画出来的东西**取：`paintedBounds` 用渲染器同一批函数算出
+    // 节点框、标签、每条边的实际走线与线上的文字（与 `renderDiagram` 同一个口径）。
+    // 少了任何一样，导出图都会"画上有、图里没有"；而如果按 DOM 的 getBBox 去量，
+    // 铺满视口的网格纸会把框撑成整个视口 —— 那正是"导出图白留一大圈"的来源。
+    const w = area.width
+    const h = area.height
+    clone.setAttribute('viewBox', [area.x, area.y, w, h].join(' '))
+    clone.setAttribute('width', String(output.width))
+    clone.setAttribute('height', String(output.height))
+    clone.setAttribute('preserveAspectRatio', options.lockAspect === false ? 'none' : 'xMidYMid meet')
+    clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    // SVG 内容节点用的是 <image>，它带 xlink:href 这个**带命名空间的属性** ——
+    // 序列化出来的文档必须声明 xmlns:xlink，否则严格 XML 解析器（浏览器把 SVG 当图片加载时
+    // 就是严格模式）会因为"用了未声明的前缀"整份丢弃：导出的 SVG/PNG 里那张图凭空消失。
+    clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+    clone.removeAttribute('style')
+    // 视口底：网格纸（url(#drawai-grid-major…)）或关网格时的实色纸。它是 svg 下第一个 <rect>。
+    let pageRect = null
+    for (let i = 0; i < clone.childNodes.length; i += 1) {
+      const child = clone.childNodes[i]
+      if (child.nodeType === 1 && String(child.nodeName).toLowerCase() === 'rect') {
+        pageRect = child
+        break
+      }
+    }
+    if (!withGrid) {
+      if (pageRect !== null && pageRect.parentNode !== null) pageRect.parentNode.removeChild(pageRect)
+    } else {
+      // 网格纸在实时视图里只铺满"当前视口"；导出要铺满整图，否则缩放状态下网格会断掉。
+      if (pageRect !== null) {
+        pageRect.setAttribute('x', String(area.x))
+        pageRect.setAttribute('y', String(area.y))
+        pageRect.setAttribute('width', String(w))
+        pageRect.setAttribute('height', String(h))
+      }
+    }
+    if (!transparent) {
+      const paper = document.createElementNS('http://www.w3.org/2000/svg', 'rect')
+      paper.setAttribute('x', String(area.x))
+      paper.setAttribute('y', String(area.y))
+      paper.setAttribute('width', String(w))
+      paper.setAttribute('height', String(h))
+      paper.setAttribute('fill', normalizeCustomColor(options.backgroundColor) || (mode === 'dark' ? '#1b1b1b' : '#ffffff'))
+      clone.insertBefore(paper, clone.firstChild)
+    }
+    return { node: clone, width: w, height: h, output }
+  }
+
+  function prepareExport(request) {
+    const key = JSON.stringify([mode, showGrid, request.format, request.ids, request.layerIds, request.transparent, request.grid,
+      request.backgroundColor, request.padding, request.scale, request.pixelWidth, request.pixelHeight, request.lockAspect])
+    const previous = preparedExportRef.current
+    if (previous && previous.doc === docRef.current && previous.key === key) return previous.promise
+    const record = { doc: docRef.current, key, promise: null }
+    record.promise = Promise.resolve().then(() => {
+      const built = buildExportSvg(request)
+      if (!built) throw new Error('导出范围内没有可导出的内容')
+      const markup = new XMLSerializer().serializeToString(built.node)
+      if (request.format === 'svg') { const blob = new Blob([markup], { type: 'image/svg+xml;charset=utf-8' }); return { blob, bytes: blob.size, built } }
+      return encodeExportPng(built.node, built.output).then((blob) => ({ blob, bytes: blob.size, built }))
+    })
+    record.promise.catch(() => { if (preparedExportRef.current === record) preparedExportRef.current = null })
+    preparedExportRef.current = record
+    return record.promise
+  }
+
+  /**
+   * 把导出结果回执给宿主 —— AI 的 `{op:'export'}` 靠这一条闭环（渲染器只在这半边）。
+   *
+   * 回执失败只是"AI 不知道结果"（宿主的请求还挂着，下次刷新会重来），不该在界面上冒错。
+   */
+  async function reportExportResult(requestId, format, payload) {
+    try {
+      await fetch(SAVE_ENDPOINT, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [SAVE_HEADER]: '1' },
+        body: JSON.stringify(
+          Object.assign(
+            { action: 'export-result', sessionId: sessionId, path: target, requestId: requestId, format: format },
+            payload === undefined || payload === null ? {} : payload,
+          ),
+        ),
+      })
+    } catch (error) {
+      /* 网络抖动就算了：宿主那边请求还挂着，用户下次操作会重来 */
+    }
+  }
+
+  /**
+   * 把当前画布渲成 PNG 的 base64（给 AI「看一眼」用）。
+   *
+   * 与 `downloadPng` 同一套取图路径（SVG 序列化 → Image → canvas → PNG），区别只在这里
+   * **返回数据**而不是触发下载：图片不进用户的工作区、也不进下载目录，直接回执给宿主。
+   * 复用同一条路径是刻意的 —— 两处各画一遍迟早会不一样。
+   */
+  function renderPngPayload(node, width, height, scale) {
+    return new Promise((resolve, reject) => {
+      const markup = new XMLSerializer().serializeToString(node)
+      const url = URL.createObjectURL(new Blob([markup], { type: 'image/svg+xml;charset=utf-8' }))
+      const image = new Image()
+      image.onload = () => {
+        try {
+          const px = Math.max(1, Math.round(width * scale))
+          const py = Math.max(1, Math.round(height * scale))
+          const canvas = document.createElement('canvas')
+          canvas.width = px
+          canvas.height = py
+          const context = canvas.getContext('2d')
+          if (context === null) {
+            URL.revokeObjectURL(url)
+            reject(new Error('画布拿不到 2D 上下文'))
+            return
+          }
+          // 底色跟随主题（与导出同一套）：深色模式下不要给模型一张纯白底图。
+          context.fillStyle = mode === 'dark' ? '#1b1b1b' : '#ffffff'
+          context.fillRect(0, 0, px, py)
+          context.drawImage(image, 0, 0, px, py)
+          URL.revokeObjectURL(url)
+          const dataUrl = canvas.toDataURL('image/png')
+          const comma = dataUrl.indexOf(',')
+          if (comma < 0) {
+            reject(new Error('PNG 编码失败'))
+            return
+          }
+          resolve({ base64: dataUrl.slice(comma + 1), width: px, height: py })
+        } catch (error) {
+          URL.revokeObjectURL(url)
+          reject(error)
+        }
+      }
+      image.onerror = () => {
+        URL.revokeObjectURL(url)
+        reject(new Error('SVG 转图片失败（画布内容里有浏览器渲染不了的东西？）'))
+      }
+      image.src = url
+    })
+  }
+
+  /**
+   * 把「看一眼」的结果回执给宿主 —— 图片走附件通道，**工作区零文件**。
+   *
+   * 失败也要回执（`ok:false`）：宿主那边请求还挂着，不回声模型会永远看到 pending。
+   */
+  async function reportRenderResult(requestId, payload) {
+    try {
+      await fetch(SAVE_ENDPOINT, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [SAVE_HEADER]: '1' },
+        body: JSON.stringify(
+          Object.assign({ action: 'render-result', sessionId: sessionId, path: target, requestId: requestId }, payload || {}),
+        ),
+      })
+    } catch (error) {
+      /* 网络抖动：宿主那边请求还挂着，用户下次操作会重来 */
+    }
+  }
+
+  function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = filename
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    setTimeout(() => URL.revokeObjectURL(url), 2000)
+  }
+
+  async function exportNodeImage(node, format) {
+    setMenu(null)
+    try {
+      const info = nodeImageExportInfo(node)
+      if (!info) throw new Error('节点没有可导出的内嵌图片')
+      const asPng = format === 'png' && info.mime === 'image/svg+xml'
+      const filename = asPng ? info.filename.replace(/\.svg$/i, '.png') : info.filename
+      if (asPng) setSaveNote('正在生成 PNG…')
+      const blob = asPng ? await nodeImageExportPng(node, info) : nodeImageExportBlob(info)
+      downloadBlob(blob, filename)
+      setSaveNote('已导出 ' + filename)
+    } catch (error) {
+      setSaveNote('图片导出失败：' + (error.message || String(error)))
+    }
+  }
+
+  function downloadPng(node, width, height, filename, opts) {
+    const options = Object.assign({ format: 'png' }, opts || {})
+    const encoded = options.blob ? Promise.resolve(options.blob) : encodeExportPng(node, exportOutputSize(width, height, options))
+    return encoded.then((blob) => downloadBlob(blob, filename))
+  }
+
+  /** 收尾框选：没拖动过就是一次"点空白"（取消选中），否则按矩形相交挑节点与连线。 */
+  function finishMarquee() {
+    const drag = marqueeRef.current
+    if (drag === null) return
+    marqueeRef.current = null
+    setMarquee(null)
+    // 武装线条：单击落缺省长度；拖拽用起终点定独立线 —— 都不走框选。
+    if (typeof drag.placeEdge === 'string' && drag.placeEdge.length > 0) {
+      if (drag.moved === true) createFreeEdgeAt(drag.x0, drag.y0, drag.placeEdge, drag.x1, drag.y1)
+      else createFreeEdgeAt(drag.x0, drag.y0, drag.placeEdge)
+      setRailOpenFamily(null)
+      return
+    }
+    if (drag.moved !== true) {
+      // 放置工具武装时：点空白 = 落下**一个**节点（单次；放完卸工具）。
+      if (typeof drag.placeShape === 'string' && drag.placeShape.length > 0) {
+        createNodeAt(drag.placeShape, menuStyle, drag.x0, drag.y0)
+        setPlaceTool(null)
+        setPlaceEdgeKind(null)
+        setRailOpenFamily(null)
+        setSaveNote('')
+        return
+      }
+      if (drag.additive !== true) setSelectedIds([])
+      return
+    }
+    const current = docRef.current
+    if (current === null) return
+    const minX = Math.min(drag.x0, drag.x1)
+    const maxX = Math.max(drag.x0, drag.x1)
+    const minY = Math.min(drag.y0, drag.y1)
+    const maxY = Math.max(drag.y0, drag.y1)
+    const hits = marqueeHits(current, { x: minX, y: minY, w: maxX - minX, h: maxY - minY }, routeMemoryRef.current)
+    if (drag.additive === true) {
+      const merged = selectedIds.slice()
+      for (let i = 0; i < hits.length; i += 1) if (merged.indexOf(hits[i]) < 0) merged.push(hits[i])
+      setSelectedIds(merged)
+      return
+    }
+    setSelectedIds(hits)
+  }
+
+  // ---- 右键菜单 / 元素库 ---------------------------------------------------
+  function openMenu(kind, id, event, withPoint, extra) {
+    event.preventDefault()
+    event.stopPropagation()
+    const canvas = canvasRef.current
+    if (canvas === null) return
+    const rect = canvas.getBoundingClientRect()
+    const point = withPoint === true ? toUserSpace(event) : null
+    const base = {
+      kind: kind,
+      id: id,
+      left: event.clientX - rect.left,
+      top: event.clientY - rect.top,
+      userX: point === null ? 0 : point.x,
+      userY: point === null ? 0 : point.y,
+    }
+    setMenu(extra === undefined ? base : Object.assign(base, extra))
+  }
+
+  function onCanvasContextMenu(event) {
+    setSelectedIds([])
+    openMenu('canvas', null, event, true)
+  }
+
+  function onNodeContextMenu(id, event) {
+    // 右键的节点**已经在选区里**且选区不止一个 → 用户想收拾的是这一整批（对齐/分布），
+    // 而不是要把选区缩成这一个。选单个时保持原行为（形状/配色/改标签/删除）。
+    if (selectedIds.length > 1 && selectedIds.indexOf(id) >= 0) {
+      openMenu('multi', id, event, false)
+      return
+    }
+    setSelectedIds([id])
+    openMenu('node', id, event, false)
+  }
+
+  function onEdgeContextMenu(id, event) {
+    setSelectedIds([id])
+    openMenu('edge', id, event, false)
+  }
+
+  function nextNodeId(doc) {
+    let max = 0
+    const re = /^n(\d+)$/
+    for (let i = 0; i < doc.nodes.length; i += 1) {
+      const m = re.exec(String(doc.nodes[i].id))
+      if (m !== null) {
+        const n = parseInt(m[1], 10)
+        if (n > max) max = n
+      }
+    }
+    return 'n' + (max + 1)
+  }
+
+  /** 连线的 id 分配（与宿主 nextId 同一套规则：扫 e<n> 取 max+1）。 */
+  function nextEdgeId(doc) {
+    let max = 0
+    const re = /^e(\d+)$/
+    for (let i = 0; i < doc.edges.length; i += 1) {
+      const m = re.exec(String(doc.edges[i].id))
+      if (m !== null) {
+        const n = parseInt(m[1], 10)
+        if (n > max) max = n
+      }
+    }
+    return 'e' + (max + 1)
+  }
+
+  /** 新节点：形状与配色都落成 drawio 的 style 键，高度**一开始就装得下自己的标签**。 */
+  function freshNode(id, shape, styleName, userX, userY, label) {
+    const isText = shape === 'text'
+    const isSvg = shape === 'svg'
+    const isVideo = shape === 'video'
+    const isSection = shape === 'section'
+    // svg/video 节点的内容是一张图、标签通常是空的 —— 不给它塞"新节点"三个字（那会压在图上）。
+    // 分区默认叫「分区」（飞书式区块标题），可双击改名。
+    const text = typeof label === 'string' ? label : isText ? '文字' : isSvg || isVideo ? '' : isSection ? '分区' : '新节点'
+    // 形状与配色都落成 drawio 的 style 键：rect/plain 落成空串（= drawio 的 defaultVertexStyle）。
+    // 文字**不吃配色**：它的样式就是 drawio 的 defaultTextStyle（无边框无底色），
+    // 往上盖 fillColor/strokeColor 只会让文件与 drawio 不一致，画面上也什么都看不出来。
+    // svg/video 同理：图片不受 fillColor/strokeColor 影响，颜色要写在标记自己身上。
+    // 分区自带淡底虚线样式，也不盖调色板（否则看起来像普通色块矩形）。
+    const base =
+      isText || isSvg || isVideo || isSection
+        ? styleWithNodeShape('', shape)
+        : styleWithColorName(styleWithNodeShape('', shape), styleName)
+    const style = isSvg
+      ? styleWithSvgMarkup(base, DEFAULT_SVG_MARKUP)
+      : isVideo
+        ? styleWithSvgMarkup(base, DEFAULT_VIDEO_POSTER)
+        : base
+    // svg 节点放下来是**正方形**：图形多半是方的，用文字尺寸（130×60）会把图标压扁。
+    // video 缺省 16:9；分区要大一圈，才能当区块用。
+    const w = isVideo ? NEW_VIDEO_W : isSvg ? NEW_SVG_SIZE : isSection ? NEW_SECTION_W : NEW_NODE_W
+    const h = isVideo ? NEW_VIDEO_H : isSvg ? NEW_SVG_SIZE : isSection ? NEW_SECTION_H : NEW_NODE_H
+    const node = {
+      id: id,
+      label: text,
+      style: style,
+      x: snap(userX - w / 2),
+      y: snap(userY - h / 2),
+      w: w,
+      h: h,
+    }
+    if (isVideo) {
+      node.data = videoDataForNew(allocateClientClipId(docRef.current), w, h)
+    }
+    // 与 autoHeightPass 同一套规则：新建时就落成撑开后的高度，
+    // 免得"新节点先按原样画一帧、再被自动长高"多出一步莫名其妙的撤销历史。
+    // 分区不自动长高（它是容器框，标题一行就够）。
+    if (isSection === false && isVideo === false) {
+      const fit = nodeTextFitHeight(node)
+      if (fit > node.h) node.h = snapTo(fit, GRID)
+    }
+    return node
+  }
+
+  function createNodeAt(shape, styleName, userX, userY) {
+    const current = docRef.current
+    if (current === null) return
+    if (activeLayerLocked()) {
+      setSaveNote('当前图层已锁定：先解锁或换一层再新建')
+      setMenu(null)
+      return
+    }
+    // 图片不能空手落下（没有 data URI 就是空框）—— 点落点后弹文件选择。
+    if (shape === 'image') {
+      setPlaceTool(null)
+      openImageFilePicker({ at: { x: userX, y: userY } })
+      return
+    }
+    if (shape === 'video') {
+      const file = pendingVideoRef.current
+      pendingVideoRef.current = null
+      if (file) { setPlaceTool(null); insertVideoFiles([file], userX, userY) }
+      else openVideoFilePicker()
+      return
+    }
+    const id = nextNodeId(current)
+    const isText = shape === 'text'
+    const isSection = shape === 'section'
+    applyLocal((next) => {
+      const node = freshNode(id, shape, styleName, userX, userY)
+      // 新节点进**当前图层**（没设过就是第一层）—— drawio 的"当前图层"就是这个意思。
+      if (activeLayerId !== null) node.layer = activeLayerId
+      // 落在某个分区里时，直接挂进该分区（飞书：在分区内新建）。
+      const host = sectionAtPoint(next, userX, userY, null)
+      if (host !== null && isSection === false) node.parent = host.id
+      next.nodes.push(node)
+      ensureDrawOrder(next)
+      if (isSection) reorderDrawOrder(next, id, 'back')
+    })
+    setSelectedIds([id])
+    setMenu(null)
+    // 文字放下来就直接进编辑态（drawio 的 insertText 也是放完立刻 startEditing）：
+    // 否则用户还得再双击一次，而屏幕上只是一小块淡淡的选择框。
+    if (isText) openNodeEditor(id)
+  }
+
+  /**
+   * 在空白处新建一条**独立连线**（两端都不接节点）。
+   *
+   * drawio 的模型里这是合法形态：边的两端都可以是自由点（几何里的 sourcePoint/targetPoint），
+   * `edgeFreePoint` / `endpointBoxOf` 早就按这套语义实现了（两端各给一个零尺寸虚拟盒去路由）。
+   * 缺的只是"从零画一条"的入口 —— 原来只能从节点手柄拖出来，于是至少有一端是节点。
+   * 画完之后照样能拖端点接到节点上（改接端点那套手势对自由端点同样有效）。
+   *
+   * `endX`/`endY` 可选：拖拽定终点时传入；缺省则从起点水平伸出 200px（单击落下）。
+   */
+  function createFreeEdgeAt(userX, userY, kind, endX, endY) {
+    const current = docRef.current
+    if (current === null) return
+    if (activeLayerLocked()) {
+      setSaveNote('当前图层已锁定：先解锁或换一层再新建')
+      setMenu(null)
+      return
+    }
+    const lineKind = isEdgeLineKind(kind) ? kind : 'rounded'
+    const id = nextEdgeId(current)
+    const from = { x: snap(userX, EDGE_GRID), y: snap(userY, EDGE_GRID) }
+    let to =
+      typeof endX === 'number' && Number.isFinite(endX) && typeof endY === 'number' && Number.isFinite(endY)
+        ? { x: snap(endX, EDGE_GRID), y: snap(endY, EDGE_GRID) }
+        : { x: from.x + 200, y: from.y }
+    // 吸附后起终点重合：退回缺省长度，避免落成看不见的零长边。
+    if (Math.abs(to.x - from.x) < EDGE_GRID && Math.abs(to.y - from.y) < EDGE_GRID) {
+      to = { x: from.x + 200, y: from.y }
+    }
+    applyLocal((next) => {
+      const edge = {
+        id: id,
+        style: styleWithLineKind(DEFAULT_EDGE_STYLE, lineKind),
+        sourcePoint: from,
+        targetPoint: to,
+      }
+      // 曲线两点会退化成直线：补一个垂直弓形中点（与 applyLineKind 同一口径）。
+      if (lineKind === 'curved') {
+        const dx = to.x - from.x
+        const dy = to.y - from.y
+        const len = Math.sqrt(dx * dx + dy * dy)
+        if (len >= 1) {
+          const bow = Math.max(20, Math.round((len * 0.12) / EDGE_GRID) * EDGE_GRID)
+          edge.points = [
+            {
+              x: snap(from.x + dx / 2 - (dy / len) * bow, EDGE_GRID),
+              y: snap(from.y + dy / 2 + (dx / len) * bow, EDGE_GRID),
+            },
+          ]
+        }
+      }
+      if (activeLayerId !== null) edge.layer = activeLayerId
+      next.edges.push(edge)
+    })
+    setSelectedIds([id])
+    setMenu(null)
+    setPlaceEdgeKind(null)
+    setPlaceTool(null)
+    setSaveNote('已放一条「' + edgeLineLabelOf(lineKind) + '」（两端都没接节点）—— 拖端点即可接到节点上')
+  }
+
+  /**
+   * 批量对齐 / 分布。算法在 computeAlignMoves（纯函数，可被命令行自测直接断言），
+   * 这里只负责取选区、落盘一次、记一格撤销历史。
+   */
+  function alignSelection(kind) {
+    const current = docRef.current
+    if (current === null) return
+    const moves = computeAlignMoves(current, selectedIds, kind, GRID)
+    if (Object.keys(moves).length === 0) return
+    applyLocal((next) => {
+      for (let i = 0; i < next.nodes.length; i += 1) {
+        const move = moves[next.nodes[i].id]
+        if (move === undefined) continue
+        if (move.axis === 'x') next.nodes[i].x = move.value
+        else next.nodes[i].y = move.value
+      }
+    })
+  }
+
+
+  /** 改节点样式：`ids` 可以是整组（见 styleTargets）——选区里点一个，整组一起换。 */
+  function updateNode(ids, patch) {
+    const list = Array.isArray(ids) ? ids : [ids]
+    // 故意不关菜单：改形状/换配色是可以连点几次试的，弹一次关一次很难用。
+    applyLocal((next) => {
+      for (let i = 0; i < next.nodes.length; i += 1) {
+        if (list.indexOf(next.nodes[i].id) < 0) continue
+        const keys = Object.keys(patch)
+        for (let k = 0; k < keys.length; k += 1) next.nodes[i][keys[k]] = patch[keys[k]]
+      }
+    })
+  }
+
+  function onEdgeLabelPointerDown(edgeId, event) {
+    if (event.button !== 0) return
+    setSelectedIds([edgeId])
+    setMenu(null)
+    const point = toUserSpace(event)
+    if (point === null) return
+    labelDragRef.current = { edgeId: edgeId, originX: point.x, originY: point.y, moved: false }
+    // 同上：按下不抢捕获（抢了 dblclick 就落到画布容器上，"双击改线上的字"会失灵）。
+    requestCapture(event)
+  }
+
+  /** 拖标签的每一帧：指针先**吸附**（半格 + 贴线），再反解成 drawio 的相对位置。 */
+  function moveEdgeLabel(edgeId, point) {
+    const current = docRef.current
+    if (current === null) return
+    const edge = edgeById(edgeId)
+    if (edge === null) return
+    const pts = edgeRoutePoints(current, edge, routeMemoryRef.current)
+    if (pts === null) return
+    const pos = labelPosFor(pts, snapLabelPoint(pts, point))
+    if (pos === null) return
+    // 合并键：一次拖动只压一格撤销历史（与拖节点同一套）。
+    applyLocal((next) => {
+      for (let i = 0; i < next.edges.length; i += 1) {
+        if (next.edges[i].id !== edgeId) continue
+        next.edges[i].labelX = pos.labelX
+        next.edges[i].labelY = pos.labelY
+        next.edges[i].labelOffsetX = pos.labelOffsetX
+        next.edges[i].labelOffsetY = pos.labelOffsetY
+        break
+      }
+    }, 'label:' + edgeId)
+  }
+
+  /** 标签回到弧长中点（drawio 里把标签拖回去 / 重置位置的效果）。 */
+  function centerEdgeLabel(id) {
+    applyLocal((next) => {
+      for (let i = 0; i < next.edges.length; i += 1) {
+        if (next.edges[i].id !== id) continue
+        delete next.edges[i].labelX
+        delete next.edges[i].labelY
+        delete next.edges[i].labelOffsetX
+        delete next.edges[i].labelOffsetY
+        break
+      }
+    })
+    setMenu(null)
+  }
+
+  /**
+   * 改连线的画法：全部落成 style 键（dashed/dashPattern/endArrow/startArrow/strokeColor）。
+   * 回到默认 = **删键**，不写 `dashed=0` 之类的冗余 —— 与宿主 edgeStyleFromOp 同一套语义。
+   */
+  function updateEdge(ids, patch) {
+    const list = Array.isArray(ids) ? ids : [ids]
+    applyLocal((next) => {
+      for (let i = 0; i < next.edges.length; i += 1) {
+        const e = next.edges[i]
+        if (list.indexOf(e.id) < 0) continue
+        let style = typeof e.style === 'string' ? e.style : DEFAULT_EDGE_STYLE
+        if (has(patch, 'dash')) style = styleWithDash(style, patch.dash)
+        if (has(patch, 'arrow')) style = styleWithArrow(style, patch.arrow)
+        if (has(patch, 'line')) style = styleWithLineKind(style, patch.line)
+        if (has(patch, 'fontSize')) style = stylePatch(style, { fontSize: patch.fontSize === null ? null : String(patch.fontSize) })
+        // 字色：`fontColor`。值给的是**调色板名**（'plain' = 删键），与节点上那一类同一套语义。
+        if (has(patch, 'fontColor')) style = styleWithTextColorName(style, patch.fontColor)
+        if (has(patch, 'color')) {
+          style = stylePatch(style, { strokeColor: typeof patch.color === 'string' && patch.color.length > 0 ? patch.color : null })
+        }
+        e.style = style
+      }
+    })
+  }
+
+  /**
+   * 换连线的**线型**（直线 / 直角折线 / 圆角折线 / 曲线）—— 比 updateEdge 多做一件几何上的事。
+   *
+   * - 直线（无折点）：必须把折点清掉。留着折点 + `edgeStyle=none` 在 drawio 里会画成
+   *   "穿过折点的折线"，不是用户按「直线」时想要的东西。
+   * - 直角/圆角折线：折点照旧有意义（就是折线的拐角），什么都不动，只改 style 键。
+   * - 曲线：`curved=1` 是把**现有走线**抹圆。走线本来就带拐角（自动路由的 L 形、或人摆的折点）时
+   *   直接就能看见弧度；但如果这条边是两点直连（完全共线），drawio 的曲线会退化成直线
+   *   （mxPolyline.paintCurvedLine 在两点时控制点落在起点上）—— 那时补一个**垂直弓形的中点**，
+   *   弧才真的看得见。这跟人在 drawio 里手动拖一个中点出来是同一件事。
+   */
+  function applyLineKind(ids, kind) {
+    const current = docRef.current
+    if (current === null) return
+    const list = Array.isArray(ids) ? ids : [ids]
+    applyLocal((next) => {
+      for (let i = 0; i < next.edges.length; i += 1) {
+        const e = next.edges[i]
+        if (list.indexOf(e.id) < 0) continue
+        const style = typeof e.style === 'string' ? e.style : DEFAULT_EDGE_STYLE
+        e.style = styleWithLineKind(style, kind)
+        if (kind === 'straight') {
+          delete e.points
+          continue
+        }
+        if (kind !== 'curved') continue
+        const hasPoints = Array.isArray(e.points) && e.points.length > 0
+        if (hasPoints) continue
+        const pts = edgeRoutePoints(next, e, routeMemoryRef.current)
+        if (pts === null || pts.length < 2) continue
+        let turns = false
+        for (let k = 1; k < pts.length - 1; k += 1) {
+          const a = pts[k - 1]
+          const b = pts[k]
+          const c = pts[k + 1]
+          if (Math.abs((b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x)) > 0.5) {
+            turns = true
+            break
+          }
+        }
+        if (turns) continue
+        const ax = pts[0].x
+        const ay = pts[0].y
+        const bx = pts[pts.length - 1].x
+        const by = pts[pts.length - 1].y
+        const dx = bx - ax
+        const dy = by - ay
+        const len = Math.sqrt(dx * dx + dy * dy)
+        if (len < 1) continue
+        // 弓高：取长度的 12%，至少 20px、至多半格对齐后的整数（折点单位就是半格）
+        const bow = Math.max(20, Math.round((len * 0.12) / EDGE_GRID) * EDGE_GRID)
+        e.points = [{ x: snap((ax + bx) / 2 - (dy / len) * bow, EDGE_GRID), y: snap((ay + by) / 2 + (dx / len) * bow, EDGE_GRID) }]
+      }
+    })
+  }
+
+  /** 全选：节点与连线都进选区（Ctrl+A / 「编辑 → 全选」）。 */
+  function selectAll() {
+    const current = docRef.current
+    if (current === null) return
+    const ids = allIdsOf(current)
+    setMenu(null)
+    setSelectedIds(ids)
+    setSaveNote(ids.length === 0 ? '这张画布还是空的' : '已全选 ' + ids.length + ' 项')
+  }
+
+  /** 清掉一条连线的全部折点**与进出侧约束**，回到自动路由（= drawio 的「自动路由」）。 */
+  function clearEdgeWaypoints(id) {
+    applyLocal((next) => {
+      for (let i = 0; i < next.edges.length; i += 1) {
+        const e = next.edges[i]
+        if (e.id !== id) continue
+        delete e.points
+        // **自由端点不是折点**：那一端没有真实顶点时，自由点就是它的落点。无条件删掉，
+        // "两端都自由"的独立线就一个落点都不剩 —— 写回会整条跳过它（线上直接消失）。
+        // 所以只在该端有真实顶点时才删（那种情况下 drawio 本来就忽略自由点）。
+        if (typeof e.from === 'string') delete e.sourcePoint
+        if (typeof e.to === 'string') delete e.targetPoint
+        let style = typeof e.style === 'string' ? e.style : DEFAULT_EDGE_STYLE
+        style = styleWithSide(style, 'source', null)
+        style = styleWithSide(style, 'target', null)
+        e.style = style
+        break
+      }
+    })
+    setMenu(null)
+  }
+
+  /**
+   * 清理所有连线上的共线冗余折点。
+   *
+   * 不只线段拖动会产生冗余 —— **移动/缩放节点也会**：形状边框落点变了，
+   * 原本必要的折点可能就和邻点共线了，于是那条边凭空多出一个段把手。
+   * 所以任何改变几何的手势结束后都跑一次。
+   *
+   * 用 commitDoc 而不是 applyLocal：这一步**不改变画面**（只是把等价表示换成更短的），
+   * 不该占一格撤销历史。
+   */
+  function pruneAllEdges() {
+    const current = docRef.current
+    if (current === null) return
+    let changed = false
+    const edges = current.edges.map((edge) => {
+      if (!Array.isArray(edge.points) || edge.points.length === 0) return edge
+      const pruned = prunePoints(current, edge)
+      if (pruned === null || pruned.length === edge.points.length) return edge
+      changed = true
+      const copy = Object.assign({}, edge)
+      if (pruned.length === 0) delete copy.points
+      else copy.points = pruned
+      return copy
+    })
+    if (!changed) return
+    commitDoc({ revision: current.revision, nodes: current.nodes.map((n) => Object.assign({}, n)), edges: edges })
+  }
+
+  function deleteById(id) {
+    setEditing(null)
+    setSelectedIds([])
+    setMenu(null)
+    applyLocal((next) => {
+      next.nodes = next.nodes.filter((n) => n.id !== id)
+      next.edges = next.edges.filter((e) => e.id !== id && e.from !== id && e.to !== id)
+    })
+  }
+
+  // ---- 连线的自由修改 ------------------------------------------------------
+  function edgeById(id) {
+    const current = docRef.current
+    if (current === null) return null
+    for (let i = 0; i < current.edges.length; i += 1) if (current.edges[i].id === id) return current.edges[i]
+    return null
+  }
+
+  function onEdgeHandlePointerDown(edgeId, kind, index, event) {
+    if (event.button !== 0) return
+    event.preventDefault()
+    event.stopPropagation()
+    const current = docRef.current
+    if (current === null) return
+    const edge = edgeById(edgeId)
+    if (edge === null) return
+    setSelectedIds([edgeId])
+    setMenu(null)
+
+    if (kind === 'from' || kind === 'to') {
+      edgeDragRef.current = { edgeId: edgeId, kind: kind, index: -1 }
+      requestCapture(event)
+      return
+    }
+
+    const points = Array.isArray(edge.points) ? edge.points.slice() : []
+    if (kind === 'segment') {
+      // 拖动某一段 = **整段平移**（draw.io 的段把手语义），而不是插入一个自由折点。
+      //
+      // 做法：先把这一段的两个端点就地钉成折点（在原位补折点不改变路径，所以这一刻画面不动），
+      // 之后同时平移这两个折点，这一段就整体挪走了。
+      //
+      // 端点落在起点/终点一侧时同样成立：那个顶点被钉住之后，形状的落点会朝它重新计算，
+      // 于是自动多出一小段连接 —— 也就是"相当于新建一条线段"。
+      const pts = edgeRoutePoints(current, edge, routeMemoryRef.current)
+      if (pts === null || index < 0 || index >= pts.length - 1) return
+      const a = pts[index]
+      const b = pts[index + 1]
+      const pinA = ensurePinned(pts, points, index)
+      const pinB = ensurePinned(pts, points, index + 1)
+      if (pinA < 0 || pinB < 0 || pinA === pinB) return
+      const saved = points.map((p) => ({ x: p.x, y: p.y }))
+      applyLocal((next) => {
+        for (let i = 0; i < next.edges.length; i += 1) {
+          if (next.edges[i].id !== edgeId) continue
+          next.edges[i].points = saved.map((p) => ({ x: p.x, y: p.y }))
+          break
+        }
+      })
+      const origin = toUserSpace(event)
+      if (origin === null) return
+      edgeDragRef.current = {
+        edgeId: edgeId,
+        kind: 'segment',
+        a: pinA,
+        b: pinB,
+        horizontal: Math.abs(a.y - b.y) < 0.5,
+        base: saved,
+        originX: origin.x,
+        originY: origin.y,
+      }
+      requestCapture(event)
+      return
+    }
+    // 只剩下 from/to/segment 三种；走到这里说明参数不对，不启动拖拽。
+  }
+
+  /** 用 document.elementFromPoint 做命中测试 —— 让浏览器告诉我们指针下是哪个节点。 */
+  function nodeIdAtPoint(clientX, clientY) {
+    let element = null
+    try {
+      element = document.elementFromPoint(clientX, clientY)
+    } catch (error) {
+      element = null
+    }
+    if (element === null || element === undefined || typeof element.closest !== 'function') return null
+    const group = element.closest('[data-node-id]')
+    return group === null ? null : group.getAttribute('data-node-id')
+  }
+
+  function finishEdgeDrag(event) {
+    const drag = edgeDragRef.current
+    if (drag === null) return
+    edgeDragRef.current = null
+    setEdgePreview(null)
+    if (drag.kind === 'segment') {
+      // 冗余折点的回收统一交给 onCanvasPointerUp 里的 pruneAllEdges()，
+      // 这里不再单独处理 —— 否则"节点拖动后变共线"那条路径会被漏掉。
+      return
+    }
+    if (event === null || event === undefined) return
+    // 改接端点同理：落在容差里也算连上（预览已经把目标高亮了）。
+    const targetId = dropTargetOf(nodeIdAtPoint(event.clientX, event.clientY), edgePreviewRef.current)
+    const current = docRef.current
+    if (current === null) return
+    const dragged = edgeById(drag.edgeId)
+    if (dragged === null) return
+
+    // ── 松手落在空白处：这一端**脱离形状**，变成悬空端（drawio 里也是这么做的）──
+    // 文档里就用 sourcePoint/targetPoint 表示：那一端没有真实顶点时它才生效。
+    if (targetId === null) {
+      const at = toUserSpace(event)
+      if (at === null) return
+      const free = { x: snap(at.x, EDGE_GRID), y: snap(at.y, EDGE_GRID) }
+      applyLocal((next) => {
+        for (let i = 0; i < next.edges.length; i += 1) {
+          const e = next.edges[i]
+          if (e.id !== drag.edgeId) continue
+          if (drag.kind === 'from') {
+            delete e.from
+            e.sourcePoint = { x: free.x, y: free.y }
+            e.style = styleWithSide(typeof e.style === 'string' ? e.style : DEFAULT_EDGE_STYLE, 'source', null)
+          } else {
+            delete e.to
+            e.targetPoint = { x: free.x, y: free.y }
+            e.style = styleWithSide(typeof e.style === 'string' ? e.style : DEFAULT_EDGE_STYLE, 'target', null)
+          }
+          break
+        }
+      })
+      setSaveNote('这一端已脱离形状（悬空端）；再拖回去就能重新连上')
+      return
+    }
+
+    const movedNode = nodeById(targetId)
+    if (movedNode === null) return
+    const fixedNode = nodeById(drag.kind === 'from' ? dragged.to : dragged.from)
+    // 固定端也可能是悬空端（另一端拖回来时）：它的坐标从自由点来，不再是节点。
+    const fixedBox =
+      fixedNode !== null
+        ? { id: fixedNode.id, geo: nodeGeoOf(fixedNode) }
+        : endpointBoxOf(buildGeometry(current).byId, dragged, drag.kind === 'from' ? 'target' : 'source')
+    if (fixedBox === null) return
+    const fixedEnd = drag.kind === 'from' ? 'target' : 'source'
+    // 固定端保持文档里既有的约束（没有约束就继续不钉）—— 与预览用同一个读法。
+    const fixedSide = pinnedSideOf(dragged, fixedEnd)
+    // 被拖那一端选中的端点：就是最后一帧预览记下来的那个。
+    const preview = edgePreviewRef.current
+    const movedSide = preview === null || preview === undefined || typeof preview.side !== 'string' ? null : preview.side
+
+    applyLocal((next) => {
+      for (let i = 0; i < next.edges.length; i += 1) {
+        const e = next.edges[i]
+        if (e.id !== drag.edgeId) continue
+        if (drag.kind === 'from') e.from = targetId
+        else e.to = targetId
+        // 两端约束写回 style；用户原有折点原样保留（它们是折点，不是端点表示）。
+        let style = typeof e.style === 'string' ? e.style : DEFAULT_EDGE_STYLE
+        style = styleWithSide(style, 'source', drag.kind === 'from' ? movedSide : fixedSide)
+        style = styleWithSide(style, 'target', drag.kind === 'from' ? fixedSide : movedSide)
+        e.style = style
+        break
+      }
+    })
+  }
+
+  /** 打开连线的就地标签编辑框。双击与右键菜单共用。 */
+  function openEdgeEditor(edgeId) {
+    const current = docRef.current
+    const svg = svgRef.current
+    const canvas = canvasRef.current
+    if (current === null || svg === null || canvas === null) return
+    const edge = edgeById(edgeId)
+    if (edge === null) return
+    const pts = edgeRoutePoints(current, edge, routeMemoryRef.current)
+    const label = pts === null ? null : edgeLabelPosition(pts, edge)
+    if (label === null) return
+    const ctm = svg.getScreenCTM()
+    if (ctm === null) return
+    const rect = canvas.getBoundingClientRect()
+    setSelectedIds([edgeId])
+    setMenu(null)
+    setEditing({
+      kind: 'edge',
+      id: edgeId,
+      text: typeof edge.label === 'string' ? edge.label : '',
+      ...edgeEditorBox(edge, edge.label, label, ctm, { left: rect.left, top: rect.top }, mode),
+    })
+  }
+
+  /**
+   * 就地编辑框跟着视图走。
+   *
+   * 实测过的毛病：双击节点开始改字，然后拖动画布 —— 节点跟着画布走了，输入框**原地不动**，
+   * 看上去就是"文字和节点分家了"。根因是 left/top 只在打开那一刻用当时的 CTM 算了一次。
+   * 这里每次渲染后按当前 CTM 重算（值没变就不 setState，避免自激循环），
+   * 于是平移、缩放、拖节点、AI 改坐标，输入框都跟着走。
+   */
+  React.useEffect(() => {
+    if (editing === null) return
+    const svg = svgRef.current
+    const canvas = canvasRef.current
+    const current = docRef.current
+    if (svg === null || canvas === null || current === null) return
+    const ctm = svg.getScreenCTM()
+    if (ctm === null) return
+    const rect = canvas.getBoundingClientRect()
+    const toCanvas = { left: rect.left, top: rect.top }
+    let next = null
+    if (editing.kind === 'node') {
+      const node = nodeById(editing.id)
+      if (node === null) {
+        setEditing(null)
+        return
+      }
+      // 连**打字的内容**一起交给纯函数：行数变了编辑框就长高，断行位置也与画出来的标签一致。
+      next = nodeEditorBox(node, editing.text, ctm, toCanvas, mode)
+    } else {
+      const edge = edgeById(editing.id)
+      if (edge === null) {
+        setEditing(null)
+        return
+      }
+      const pts = edgeRoutePoints(current, edge, routeMemoryRef.current)
+      const label = pts === null ? null : edgeLabelPosition(pts, edge)
+      if (label === null) return
+      next = edgeEditorBox(edge, editing.text, label, ctm, toCanvas, mode)
+    }
+    const moved =
+      Math.abs(next.left - editing.left) > 0.5 ||
+      Math.abs(next.top - editing.top) > 0.5 ||
+      Math.abs(next.width - editing.width) > 0.5 ||
+      Math.abs(next.height - editing.height) > 0.5 ||
+      next.fontSize !== editing.fontSize || next.color !== editing.color || next.textAlign !== editing.textAlign || next.opacity !== editing.opacity
+    if (moved) setEditing(Object.assign({}, editing, next))
+  })
+
+  /**
+   * 文字撑高的节点：把"有效高度"写回文档。
+   *
+   * 为什么需要这一步：`buildGeometry` 已经让**看到**的高度随机长，但文件里的 `h` 还是旧的。
+   * 不写回去的话，"盘上的图"与"屏幕上的图"不一致 —— 导出/别人用 drawio 打开、
+   * 以及 AI 读回来的坐标都会是溢出前的高度。
+   *
+   * 四个约定：
+   *   · **只长不缩**：`nodeTextFitHeight` 比现在矮时一个字都不动（不把用户拉大的空白吃掉）；
+   *   · 走 `applyLocal` 但用**同一个 coalesceKey**：一次加载里多个节点需要调整只压一步撤销历史；
+   *   · 高度取整格（`snapTo(…, GRID)`）—— 与"新建节点的尺寸都整格"同一条理由：
+   *     中心落在半像素上，连线的自动路由会多出"差一像素"的台阶；
+   *   · 没打开文件的空舞台不写（`hasPath`），否则"新建画布"会在用户还没命名时就把文件落盘。
+   */
+  React.useEffect(() => {
+    if (hasPath !== true) return
+    const current = docRef.current
+    if (current === null || Array.isArray(current.nodes) === false) return
+    let changed = false
+    for (let i = 0; i < current.nodes.length; i += 1) {
+      const n = current.nodes[i]
+      if (nodeTextFitHeight(n) > numberOr(n.h, FALLBACK_NODE_H)) {
+        changed = true
+        break
+      }
+    }
+    if (changed === false) return
+    applyLocal((next) => {
+      for (let i = 0; i < next.nodes.length; i += 1) {
+        const n = next.nodes[i]
+        const fit = nodeTextFitHeight(n)
+        if (fit > numberOr(n.h, FALLBACK_NODE_H)) n.h = snapTo(fit, GRID)
+      }
+    }, 'auto-height')
+  }, [doc, hasPath])
+
+  function onEdgeDoubleClick(edgeId, event) {
+    event.preventDefault()
+    event.stopPropagation()
+    openEdgeEditor(edgeId)
+  }
+
+  function commitEdit() {
+    const current = editing
+    if (current === null) return
+    const label = String(current.text)
+    setEditing(null)
+    // 文字没改就**不要写**：不然"点开编辑框、又点空白处关掉"会平白多一步撤销历史
+    // （用户按 Ctrl+Z 时屏幕毫无变化，看起来像撤销坏了）。
+    const before = current.kind === 'edge' ? edgeById(current.id) : nodeById(current.id)
+    const beforeLabel = before === null || before === undefined ? null : typeof before.label === 'string' ? before.label : ''
+    if (beforeLabel === label) return
+    if (current.kind === 'edge') {
+      applyLocal((next) => {
+        for (let i = 0; i < next.edges.length; i += 1) {
+          if (next.edges[i].id !== current.id) continue
+          next.edges[i].label = label
+          break
+        }
+      })
+      return
+    }
+    applyLocal((next) => {
+      for (let i = 0; i < next.nodes.length; i += 1) {
+        if (next.nodes[i].id !== current.id) continue
+        next.nodes[i].label = label
+        break
+      }
+    })
+  }
+
+  /**
+   * 一次性几何迁移：把这张画布上的几何对齐到格线（节点整格、折点与自由端点半格）。
+   *
+   * 为什么值得有一个手动入口：画布自己的手势是吸附的，但从 drawio 手画来的图、
+   * AI 早期写下的坐标、旧版本估宽留下的 186/56 这种尺寸都不会自己变整齐 ——
+   * 而"差几像素的台阶"正是"同一条线上两个段把手""连线抖动"那类毛病的温床。
+   * 只动几何，style / 标签 / 两端约束 / 层级一律不碰。
+   */
+  function normalizeGeometry() {
+    const current = docRef.current
+    if (current === null) return
+    const result = snapDocGeometry(current, { grid: GRID, edgeGrid: EDGE_GRID, minW: MIN_NODE_W, minH: MIN_NODE_H })
+    setMenu(null)
+    if (result.changes === 0) {
+      setSaveNote('几何已经都在格线上，不用整理')
+      return
+    }
+    applyLocal((next) => {
+      next.nodes = result.doc.nodes
+      next.edges = result.doc.edges
+    })
+    setSaveNote('已整理 ' + result.changes + ' 处几何（节点对齐整格、折点对齐半格；可 Ctrl+Z 撤销）')
+  }
+
+  /**
+   * 顺序（z-order）：节点的先后 = 画布上的覆盖顺序，也是 drawio 里"谁在上面"。
+   *
+   * 只改模型数组顺序；**文件那边的先后由写回负责**（`planReorder`），
+   * 不写回去的话重新载入就变回原样，用户会觉得"置顶没生效"。
+   */
+  function reorderItem(kind, id, mode) {
+    const current = docRef.current
+    if (current === null) return
+    applyLocal((next) => {
+      const list = kind === 'edge' ? next.edges : next.nodes
+      let at = -1
+      for (let i = 0; i < list.length; i += 1) {
+        if (list[i].id === id) {
+          at = i
+          break
+        }
+      }
+      if (at < 0) return
+      const item = list.splice(at, 1)[0]
+      if (mode === 'front') list.push(item)
+      else if (mode === 'back') list.unshift(item)
+      else if (mode === 'up') list.splice(Math.min(at + 1, list.length), 0, item)
+      else list.splice(Math.max(at - 1, 0), 0, item)
+      // 混合叠放：同一套 front/back/up/down 也动 drawOrder，边才能压到节点上面。
+      reorderDrawOrder(next, id, mode)
+    })
+    setMenu(null)
+  }
+
+  /**
+   * 「编辑数据…」：把 drawio 用户对象上的自定义属性摊成 `key=value` 几行来改。
+   *
+   * 数据最终写在 `<object>` 包装上（mxCell 上的陌生属性会被 drawio 保存时丢掉），
+   * 所以这里只管"键值对"，包装的事交给写回；裸单元第一次加数据时写回会自动包一层。
+   */
+  function openDataEditor(kind, id) {
+    const item = kind === 'edge' ? edgeById(id) : nodeById(id)
+    if (item === null) return
+    setSelectedIds([id])
+    setMenu(Object.assign({}, menu, { kind: 'data', dataKind: kind, id: id, text: formatDataLines(item.data) }))
+  }
+
+  function commitDataEditor(kind, id, text) {
+    const data = parseDataLines(text)
+    applyLocal((next) => {
+      const list = kind === 'edge' ? next.edges : next.nodes
+      for (let i = 0; i < list.length; i += 1) {
+        if (list[i].id !== id) continue
+        if (Object.keys(data).length === 0) delete list[i].data
+        else list[i].data = data
+        break
+      }
+    })
+    setMenu(null)
+    const count = Object.keys(data).length
+    setSaveNote(count === 0 ? '已清空这条单元的数据' : '已保存 ' + count + ' 项数据（写在 <object> 上，drawio 也认）')
+  }
+
+  /**
+   * 「SVG 内容…」：直接编辑节点的**图形标记**（与「编辑数据…」同一套面板节奏）。
+   *
+   * svg 节点的内容不是标签文字，改不了"就地双击那套"（那改的是图上的字）—— 它需要一个
+   * 能贴一大段标记的地方，所以复用数据面板的多行输入。
+   * 节点还不是 svg 形状时，草稿框里先放那张占位图（保存即把它变成 SVG 图形节点）。
+   */
+  function openSvgEditor(id) {
+    const node = nodeById(id)
+    if (node === null) return
+    const style = typeof node.style === 'string' ? node.style : ''
+    const current = svgMarkupFromStyle(style)
+    setSelectedIds([id])
+    setMenu(Object.assign({}, menu, { kind: 'svg', id: id, text: current === null ? DEFAULT_SVG_MARKUP : current }))
+  }
+
+  /**
+   * 保存 SVG 内容：**整段替换**（没有"改某一根线"这种事）。
+   *
+   * 空文本 = 清掉内容、回到矩形 —— 与宿主 `{op:"setStyle", svg:null}` 是同一件事，
+   * 也是这个界面里唯一"把图形删掉"的入口。
+   */
+  function commitSvgEditor(id, text) {
+    const raw = typeof text === 'string' ? text.trim() : ''
+    const current = nodeById(id)
+    if (current === null) return
+    if (raw.length > 0 && isSvgMarkup(raw) === false) {
+      // 拦在这里比写进文档再"看不见"好：画布上什么都没有、也不报错，用户只会以为坏了。
+      setSaveNote('这段文本里没有 <svg …>：SVG 内容必须以 <svg> 根元素开头')
+      return
+    }
+    const style = typeof current.style === 'string' ? current.style : ''
+    const nextStyle = raw.length === 0 ? styleWithoutSvgMarkup(style) : styleWithSvgMarkup(style, raw)
+    applyLocal((next) => {
+      for (let i = 0; i < next.nodes.length; i += 1) {
+        if (next.nodes[i].id !== id) continue
+        next.nodes[i].style = nextStyle
+        break
+      }
+    })
+    setMenu(null)
+    setSaveNote(raw.length === 0 ? '已清空 SVG 内容（这个节点回到矩形）' : '已保存 SVG 内容（' + normalizeSvgMarkup(raw).length + ' 字符，drawio 也认）')
+  }
+
+  function deleteSelected() {
+    const ids = filterEditableIds(docRef.current, selectedIds)
+    if (ids.length === 0) {
+      if (selectedIds.length > 0) setSaveNote('锁定层上的单元删不掉：先解锁图层')
+      return
+    }
+    setEditing(null)
+    setSelectedIds([])
+    setMenu(null)
+    applyLocal((next) => {
+      const remove = new Set(ids)
+      // 删分区时内容保留：子节点只是脱离 parent，不当作一并删除。
+      for (let i = 0; i < next.nodes.length; i += 1) {
+        const p = next.nodes[i].parent
+        if (typeof p === 'string' && remove.has(p)) next.nodes[i].parent = null
+      }
+      next.nodes = next.nodes.filter((n) => remove.has(n.id) === false)
+      next.edges = next.edges.filter((e) => remove.has(e.id) === false && remove.has(e.from) === false && remove.has(e.to) === false)
+      ensureDrawOrder(next)
+    })
+  }
+
+  /** 复制选区（节点 + 两端都在选区内的边）。剪贴板是模块级的，跨标签页粘贴也成立。 */
+  function copySelection() {
+    const current = docRef.current
+    const clip = collectClipboard(current, selectedIds)
+    if (clip === null) {
+      setSaveNote('没有可复制的东西：先选中节点（Shift 加选）')
+      return
+    }
+    clipboard = clip
+    setMenu(null)
+    setSaveNote('已复制 ' + clip.nodes.length + ' 个节点' + (clip.edges.length > 0 ? ' / ' + clip.edges.length + ' 条连线' : ''))
+    writeClipboardText(clipboardLabelText(clip)).catch(() => setSaveNote('画布对象已复制；系统剪贴板不可用，可双击标签选中文字复制'))
+  }
+
+  /** 剪切 = 复制 + 删除（一次撤销能退回：删除走的是 applyLocal 的历史）。 */
+  function cutSelection() {
+    const current = docRef.current
+    const clip = collectClipboard(current, selectedIds)
+    if (clip === null) {
+      setSaveNote('没有可剪切的东西：先选中节点（Shift 加选）')
+      return
+    }
+    clipboard = clip
+    setSaveNote('已剪切 ' + clip.nodes.length + ' 个节点' + (clip.edges.length > 0 ? ' / ' + clip.edges.length + ' 条连线' : ''))
+    writeClipboardText(clipboardLabelText(clip)).catch(() => setSaveNote('画布对象已剪切；系统剪贴板不可用'))
+    deleteSelected()
+  }
+
+  /**
+   * 粘贴：整体平移两格（20px）——与原件错开，一眼能看出哪一份是新贴的；
+   * 新单元重新分配 id，拼完选中它们，方便接着拖。
+   */
+  function pasteClipboard() {
+    const current = docRef.current
+    if (current === null) return
+    if (activeLayerLocked()) {
+      setSaveNote('当前图层已锁定：先解锁或换一层再粘贴')
+      return
+    }
+    if (clipboard === null) {
+      setSaveNote('剪贴板是空的：先复制或剪切点什么')
+      return
+    }
+    let pasted = null
+    applyLocal((next) => {
+      const result = pasteInto(next, clipboard, GRID * 2, GRID * 2, activeLayerId)
+      if (result === null) return
+      pasted = result
+      next.nodes = result.doc.nodes
+      next.edges = result.doc.edges
+    })
+    setMenu(null)
+    if (pasted !== null) {
+      setSelectedIds(pasted.ids)
+      setSaveNote('已粘贴 ' + pasted.ids.length + ' 项')
+    }
+  }
+
+  /** 当前视口中心（用户坐标）—— 粘贴/侧栏选图没给落点时落在这儿。 */
+  function viewportCenterUser() {
+    const v = viewRef.current
+    if (v === null || v === undefined) return { x: 0, y: 0 }
+    return { x: v.x + v.w / 2, y: v.y + v.h / 2 }
+  }
+
+  /** File → data URI + 自然尺寸（超 IMAGE_PASTE_MAX_BYTES 直接拒）。 */
+  function readImageFile(file) {
+    return new Promise((resolve, reject) => {
+      if (file === null || file === undefined) {
+        reject(new Error('没有图片'))
+        return
+      }
+      if (typeof file.size === 'number' && file.size > IMAGE_PASTE_MAX_BYTES) {
+        reject(
+          new Error(
+            '图片太大（' +
+              Math.round(file.size / 1024) +
+              'KB），上限 ' +
+              Math.round(IMAGE_PASTE_MAX_BYTES / 1024) +
+              'KB',
+          ),
+        )
+        return
+      }
+      const reader = new FileReader()
+      reader.onload = () => {
+        const dataUri = reader.result
+        if (typeof dataUri !== 'string' || isRasterDataUri(dataUri) === false) {
+          reject(new Error('读不出这张图片（只支持 png / jpeg / gif / webp）'))
+          return
+        }
+        const img = new Image()
+        img.onload = () =>
+          resolve({
+            dataUri: dataUri,
+            w: img.naturalWidth > 0 ? img.naturalWidth : NEW_SVG_SIZE,
+            h: img.naturalHeight > 0 ? img.naturalHeight : NEW_SVG_SIZE,
+          })
+        img.onerror = () => resolve({ dataUri: dataUri, w: NEW_SVG_SIZE, h: NEW_SVG_SIZE })
+        img.src = dataUri
+      }
+      reader.onerror = () => reject(new Error('读图片失败'))
+      reader.readAsDataURL(file)
+    })
+  }
+
+  /**
+   * 把一张（或多张）图片落成 image 节点。
+   * @param {File[]} files
+   * @param {number} userX
+   * @param {number} userY
+   * @param {{ replaceIds?: string[] }} [opts] 有 replaceIds 时用第一张图换掉选中节点的内容（尺寸保留）。
+   */
+  function insertImageFiles(files, userX, userY, opts) {
+    const list = Array.isArray(files) ? files : []
+    if (list.length === 0) return
+    const current = docRef.current
+    if (current === null) return
+    if (activeLayerLocked()) {
+      setSaveNote('当前图层已锁定：先解锁或换一层再贴图')
+      return
+    }
+    const replaceIds =
+      opts !== undefined && opts !== null && Array.isArray(opts.replaceIds) ? opts.replaceIds.filter((id) => typeof id === 'string') : []
+    setSaveNote('正在把图片放进画布…')
+    Promise.all(list.map((f) => readImageFile(f)))
+      .then((loaded) => {
+        if (docRef.current === null) return
+        const ids = []
+        applyLocal((next) => {
+          if (replaceIds.length > 0 && loaded.length > 0) {
+            const dataUri = loaded[0].dataUri
+            for (let r = 0; r < replaceIds.length; r += 1) {
+              for (let i = 0; i < next.nodes.length; i += 1) {
+                if (next.nodes[i].id !== replaceIds[r]) continue
+                const prev = typeof next.nodes[i].style === 'string' ? next.nodes[i].style : ''
+                next.nodes[i].style = styleWithImageDataUri(prev, dataUri, '1')
+                ids.push(next.nodes[i].id)
+                break
+              }
+            }
+            return
+          }
+          for (let i = 0; i < loaded.length; i += 1) {
+            const size = fitImageNodeSize(loaded[i].w, loaded[i].h)
+            const id = nextNodeId(next)
+            const ox = userX + i * (GRID * 2)
+            const oy = userY + i * (GRID * 2)
+            const node = {
+              id: id,
+              label: '',
+              style: styleWithImageDataUri('', loaded[i].dataUri, '1'),
+              x: snap(ox - size.w / 2),
+              y: snap(oy - size.h / 2),
+              w: size.w,
+              h: size.h,
+            }
+            if (activeLayerId !== null) node.layer = activeLayerId
+            const host = sectionAtPoint(next, ox, oy, null)
+            if (host !== null) node.parent = host.id
+            next.nodes.push(node)
+            ensureDrawOrder(next)
+            ids.push(id)
+          }
+        })
+        setSelectedIds(ids)
+        setMenu(null)
+        setPlaceTool(null)
+        setSaveNote(
+          replaceIds.length > 0
+            ? '已换成新图片'
+            : '已放入 ' + ids.length + ' 张图片（可拖动/缩放；Ctrl+V 也可直接粘贴截图）',
+        )
+      })
+      .catch((error) => {
+        const message = error && error.message ? error.message : String(error)
+        setSaveNote('贴图失败：' + message)
+      })
+  }
+
+  /** 隐藏的 `<input type=file accept=image/*>`：侧栏「图片」与放置工具共用。 */
+  function openImageFilePicker(opts) {
+    const options = opts === undefined || opts === null ? {} : opts
+    const input = document.createElement('input')
+    input.type = 'file'
+    input.accept = 'image/png,image/jpeg,image/gif,image/webp'
+    input.multiple = options.replaceIds === undefined || options.replaceIds === null || options.replaceIds.length === 0
+    input.style.display = 'none'
+    document.body.appendChild(input)
+    input.onchange = () => {
+      const files = input.files === null ? [] : Array.prototype.slice.call(input.files)
+      document.body.removeChild(input)
+      if (files.length === 0) return
+      const at =
+        options.at !== undefined && options.at !== null
+          ? options.at
+          : viewportCenterUser()
+      insertImageFiles(files, at.x, at.y, { replaceIds: options.replaceIds })
+    }
+    input.click()
+  }
+
+  function openVideoFilePicker() {
+    if (!hasPath) { setSaveNote('请先保存画布，再导入视频'); return }
+    if (activeLayerLocked()) { setSaveNote('当前图层已锁定'); return }
+    const control = new AbortController()
+    if (!videoImportsRef.current) videoImportsRef.current = new Set()
+    videoImportsRef.current.add(control)
+    const input = document.createElement('input')
+    input.type = 'file'; input.accept = '.mp4,.webm,.mov,.mkv,video/mp4,video/webm,video/quicktime,video/x-matroska'
+    input.style.display = 'none'
+    const cleanup = () => { input.remove(); videoImportsRef.current.delete(control); control.signal.removeEventListener('abort', cleanup) }
+    input.oncancel = cleanup
+    control.signal.addEventListener('abort', cleanup, { once: true })
+    input.onchange = () => {
+      const file = input.files && input.files[0]
+      cleanup()
+      if (!file || control.signal.aborted) return
+      if (!videoFileExtension(file) || file.size <= 0 || file.size > VIDEO_FILE_MAX_BYTES) { setSaveNote('请选择 48MB 以内的 MP4 / WebM / MOV / MKV 视频'); return }
+      pendingVideoRef.current = file
+      setPlaceEdgeKind(null); setSelectedIds([]); setPlaceTool('video'); setMenu(null)
+      setSaveNote('已选择「' + file.name + '」，点击画布放置视频（Esc 取消）')
+    }
+    document.body.appendChild(input); input.click()
+  }
+
+  async function insertVideoFiles(files, userX, userY) {
+    if (!hasPath || !docRef.current) { setSaveNote('请先保存画布，再导入视频'); return }
+    if (activeLayerLocked()) { setSaveNote('当前图层已锁定'); return }
+    const control = new AbortController(), layerId = activeLayerId
+    if (!videoImportsRef.current) videoImportsRef.current = new Set()
+    videoImportsRef.current.add(control)
+    const check = () => {
+      if (control.signal.aborted || !docRef.current) throw new Error('已取消视频导入')
+      const layer = (docRef.current.layers || []).find((item) => item.id === layerId)
+      if (layerId !== null && !layer) throw new Error('目标图层已删除')
+      if (layer && layer.locked) throw new Error('目标图层已锁定')
+    }
+    const api = async (action, extra) => {
+      const pending = new AbortController(), abort = () => pending.abort()
+      const cancellable = action === 'media-upload-chunk' || action === 'media-upload-finish'
+      const timer = setTimeout(abort, 60000)
+      if (cancellable) control.signal.addEventListener('abort', abort, { once: true })
+      if (cancellable && control.signal.aborted) pending.abort()
+      try {
+        const result = await mediaAction(action, extra, { signal: pending.signal })
+        if (!result) throw new Error('视频上传失败，请重试')
+        return result
+      } finally { clearTimeout(timer); control.signal.removeEventListener('abort', abort) }
+    }
+    let result = null, committed = false
+    try {
+      for (let i = 0; i < files.length; i++) {
+        result = null; committed = false; check()
+        setSaveNote('正在读取视频「' + files[i].name + '」…')
+        const metadata = await readVideoFile(files[i], control.signal)
+        result = await uploadVideoFile(files[i], metadata, api, control.signal, (done, total) => {
+          if (!control.signal.aborted) setSaveNote('正在导入「' + files[i].name + '」 ' + Math.round(done / total * 100) + '%…')
+        })
+        check()
+        let id
+        applyLocal((next) => { id = applyImportedVideoToDoc(next, result, { x: userX + i * GRID * 2, y: userY + i * GRID * 2 }, layerId) })
+        committed = true; setSelectedIds([id]); setMenu(null)
+        api('media-upload-release', { clip: result.clip, token: result.token }).catch(() => {})
+      }
+      setSaveNote('已导入 ' + files.length + ' 个视频（可播放或绘制复刻，可撤销）')
+    } catch (error) {
+      let cleanupError = ''
+      if (result && !committed) {
+        try { await api('media-upload-discard', { clip: result.clip, token: result.token }) }
+        catch { cleanupError = '；临时媒体清理失败，可用媒体清理菜单清除未引用素材' }
+      }
+      setSaveNote((control.signal.aborted ? '已取消视频导入' : '视频导入失败：' + (error.message || error)) + cleanupError)
+    } finally { videoImportsRef.current.delete(control) }
+  }
+
+  function insertMediaFiles(files, userX, userY) {
+    const images = files.filter((file) => !videoFileExtension(file)), videos = files.filter((file) => videoFileExtension(file))
+    if (images.length) insertImageFiles(images, userX, userY)
+    if (videos.length) insertVideoFiles(videos, userX + (images.length ? GRID * 2 : 0), userY + (images.length ? GRID * 2 : 0))
+  }
+
+  /** 方向键微移：默认一格（10px），Shift = 1px；连续按合并进同一次撤销。 */
+  function nudgeSelectionByKey(key, shift) {
+    const step = shift === true ? 1 : GRID
+    let dx = 0
+    let dy = 0
+    if (key === 'ArrowLeft') dx = -step
+    else if (key === 'ArrowRight') dx = step
+    else if (key === 'ArrowUp') dy = -step
+    else if (key === 'ArrowDown') dy = step
+    else return
+    if (selectedIds.length === 0) return
+    let count = 0
+    applyLocal((next) => {
+      count = nudgeSelectionInDoc(next, selectedIds, dx, dy)
+    }, 'nudge:' + selectedIds.slice().sort().join(','))
+    if (count === 0) setSaveNote('锁定层上的单元移不动：先解锁图层')
+  }
+
+  /**
+   * 快捷键字母是否匹配（兼容 event.key 与 event.code）。
+   * 某些布局 / IME 下 Ctrl+C 的 key 不是可靠的 'c'，code 仍是 KeyC。
+   */
+  function accelLetter(event, letter) {
+    if (event === null || event === undefined) return false
+    const upper = String(letter).toUpperCase()
+    if (event.code === 'Key' + upper) return true
+    const key = event.key
+    return key === letter || key === upper
+  }
+
+  React.useEffect(() => {
+    function onKey(event) {
+      if (!active) return
+      if (event.target && typeof event.target.closest === 'function' && event.target.closest('.drawai-palette-panel')) return
+      // 归属判定见 canvasOwnsKeyboard：**在别处打字时这里一律不动手**。
+      // 之前只挡了 input/textarea，而 DSH 的输入框是 contenteditable，
+      // 于是输入框里按退格会删掉画布里的选中内容、Ctrl+C/V 也被吞掉。
+      if (!canvasOwnsKeyboard(event, rootRef.current, document.activeElement)) return
+      const accel = event.ctrlKey === true || event.metaKey === true
+      // **用户手里有"画布之外"的选中文字时，Ctrl+C/X/A 交给浏览器**。
+      //
+      // 为什么：焦点在 body（点过画布之后就是这样）也算"画布拥有键盘"，于是
+      // 用户在对话里划了一段字按 Ctrl+C，被这里 preventDefault 掉 —— 复制不出任何东西
+      // （实测报过）。只放开这三个"浏览器本来就能做对"的组合：复制 / 剪切 / 全选；
+      // 撤销、粘贴、删除仍然归画布（那些在对话里由 DSH 自己处理，不靠我们的窗口监听）。
+      //
+      // 半路踩过的坑：**画布里有选中元素时不能放手**。用户先在对话里划了字、再点画布上的
+      // 元素，那次点击不会清掉别处的选区，于是"外部有选区"成立、Ctrl+C 被让给浏览器，
+      // 画布里的元素就**复制不了**了。所以判据是两条同时成立：画布空着 **且** 外面有选中的字。
+      if (accel && (accelLetter(event, 'c') || accelLetter(event, 'x') || accelLetter(event, 'a'))) {
+        if (selectedIds.length === 0 && hasTextSelectionOutside(rootRef.current)) return
+      }
+      if (accel && accelLetter(event, 'z')) {
+        event.preventDefault()
+        if (event.shiftKey === true) redo()
+        else undo()
+        return
+      }
+      if (accel && accelLetter(event, 'y')) {
+        event.preventDefault()
+        redo()
+        return
+      }
+      // 复制 / 剪切：keydown 是兜底；主通道是下面的 copy/cut 捕获监听
+      // （DSH 0.2 有时在冒泡阶段先截走 Ctrl+C，keydown 冒泡听不到）。
+      if (accel && accelLetter(event, 'c')) {
+        event.preventDefault()
+        event.stopPropagation()
+        copySelection()
+        return
+      }
+      if (accel && accelLetter(event, 'x')) {
+        event.preventDefault()
+        event.stopPropagation()
+        cutSelection()
+        return
+      }
+      // Ctrl+V：有画布内剪贴板时直接粘贴（不要等 paste 事件 —— 焦点若在中间被抢走会丢）。
+      // 剪贴板空时不 preventDefault，留给 paste 事件接系统图片。
+      if (accel && accelLetter(event, 'v')) {
+        if (clipboard !== null) {
+          event.preventDefault()
+          event.stopPropagation()
+          pasteClipboard()
+        }
+        return
+      }
+      // 全选：与框选同一套语义（节点与连线都选上），于是能整体拖动/换样式/一把删掉。
+      if (accel && accelLetter(event, 'a')) {
+        event.preventDefault()
+        selectAll()
+        return
+      }
+      if (event.key === 'Delete' || event.key === 'Backspace' || event.code === 'Delete' || event.code === 'Backspace') {
+        event.preventDefault()
+        deleteSelected()
+        return
+      }
+      if (event.key === 'ArrowLeft' || event.key === 'ArrowRight' || event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+        event.preventDefault()
+        nudgeSelectionByKey(event.key, event.shiftKey === true)
+        return
+      }
+      if (accel && accelLetter(event, 'f')) {
+        event.preventDefault()
+        openFindPanel()
+        return
+      }
+      if (event.key === 'Escape' || event.code === 'Escape') {
+        setSelectedIds([])
+        setEditing(null)
+        setMenu(null)
+        setPlaceTool(null)
+        setPlaceEdgeKind(null)
+        setHoverNodeId(null)
+        setRailOpenFamily(null)
+        // 下拉菜单与「打开/新建/另存为」面板也一起收掉：Esc 是"退出当前这层"，
+        // 菜单开着却按 Esc 没反应会让人以为键盘坏了（与外面点一下同一个语义）。
+        setDocMenu(null)
+        setDocMenuPos(null)
+      }
+    }
+    // 捕获阶段：抢在 DSH / 其他插件的冒泡监听之前（Ctrl+C 曾被截走导致"能删不能复制"）。
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [selectedIds, editing, menu, placeTool, placeEdgeKind, active])
+
+  // 复制 / 剪切的主通道：浏览器 `copy`/`cut` 事件（捕获）。
+  // 比 keydown 更稳 —— 只要用户按了系统复制快捷键就会到这里，不依赖 event.key 字形。
+  React.useEffect(() => {
+    function ownsCopyCut(event) {
+      if (!active) return false
+      if (!canvasOwnsKeyboard(event, rootRef.current, document.activeElement)) return false
+      if (selectedIds.length === 0) return false
+      // 画布有选中单元时，复制/剪切归画布（即使页面上还残留对话文字选区）。
+      return true
+    }
+    function onCopy(event) {
+      if (!ownsCopyCut(event)) return
+      const clip = collectClipboard(docRef.current, selectedIds)
+      if (clip === null) return
+      event.preventDefault()
+      event.stopPropagation()
+      clipboard = clip
+      setMenu(null)
+      setSaveNote('已复制 ' + clip.nodes.length + ' 个节点' + (clip.edges.length > 0 ? ' / ' + clip.edges.length + ' 条连线' : ''))
+      try {
+        if (event.clipboardData !== null && event.clipboardData !== undefined) {
+          event.clipboardData.setData('text/plain', clipboardLabelText(clip))
+        }
+      } catch (error) {
+        // 系统剪贴板写失败不影响画布内 clipboard
+      }
+    }
+    function onCut(event) {
+      if (!ownsCopyCut(event)) return
+      const clip = collectClipboard(docRef.current, selectedIds)
+      if (clip === null) return
+      event.preventDefault()
+      event.stopPropagation()
+      clipboard = clip
+      if (event.clipboardData) event.clipboardData.setData('text/plain', clipboardLabelText(clip))
+      setSaveNote('已剪切 ' + clip.nodes.length + ' 个节点' + (clip.edges.length > 0 ? ' / ' + clip.edges.length + ' 条连线' : ''))
+      deleteSelected()
+    }
+    document.addEventListener('copy', onCopy, true)
+    document.addEventListener('cut', onCut, true)
+    return () => {
+      document.removeEventListener('copy', onCopy, true)
+      document.removeEventListener('cut', onCut, true)
+    }
+  }, [selectedIds, active])
+
+  // 系统剪贴板粘贴：识别图片与视频文件；否则回落到画布内剪贴板（节点/边）。
+  React.useEffect(() => {
+    function onPaste(event) {
+      if (!active) return
+      if (!canvasOwnsKeyboard(event, rootRef.current, document.activeElement)) return
+      if (editing !== null) return
+      if (isTextEntry(document.activeElement)) return
+      const files = mediaFilesFromDataTransfer(event.clipboardData)
+      if (files.length > 0) {
+        event.preventDefault()
+        const at = viewportCenterUser()
+        insertMediaFiles(files, at.x, at.y)
+        return
+      }
+      if (clipboard !== null) {
+        event.preventDefault()
+        pasteClipboard()
+      }
+    }
+    window.addEventListener('paste', onPaste, true)
+    return () => window.removeEventListener('paste', onPaste, true)
+  }, [editing, selectedIds, activeLayerId, active, target, pageIndex, hasPath])
+
+  React.useEffect(() => {
+    return () => {
+      if (saveTimerRef.current !== null) {
+        saveTimerRef.current()
+        saveTimerRef.current = null
+      }
+    }
+  }, [])
+
+  // 画布 div 只在读取成功后才存在。这两个 effect 必须跟着它重新挂 ——
+  // 依赖写死 [] 的话，首帧 doc === null、ref 还是 null，effect 直接 return 就再也不跑了：
+  // 滚轮监听挂不上（滚轮没反应）、ResizeObserver 挂不上（size 恒为 0，视口算错）。
+  const canvasReady = status.kind !== 'error' && doc !== null
+
+  /**
+   * 量容器尺寸。
+   *
+   * **容器尺寸变了要"保持缩放比例"，只改变可见范围** —— 这一个动作同时修掉两个症状
+   * （用户实测报过："拖侧边栏，画布跟着缩放、内容还畸形"）：
+   *
+   *   1. 保持 scale（screen px / 用户单位）→ 内容不会被重新缩放；
+   *   2. 新的 w/h 由**同一个 scale** 推出来 → 视口宽高比恒等于容器。SVG 用的是
+   *      `preserveAspectRatio="none"`（1:1 贴像素），比例一旦不一致就会把画面拉伸变形。
+   *
+   * 旧的写法是"每次渲染都按当前容器宽高比重算 fitView"：右栏一被拖宽，缩放就跟着变；
+   * 而一旦用户自己缩放过（viewOverride 非空），冻结的 h 与新容器的宽高比对不上 ——
+   * 于是画面被横向拉扁，正是"内容畸形"。
+   *
+   * 两个 setState 在同一个回调里，React 会合成一次渲染 —— 不会先按新尺寸自适应一帧
+   * 再被纠正回来（那会看见闪一下）。
+   *
+   * 副作用：调整之后视口就是显式的了，不再跟着内容自动变化；要重新贴合按「视图 → 适应内容」。
+   */
+  ;(React.useLayoutEffect || React.useEffect)(() => {
+    if (!canvasReady) return undefined
+    const element = canvasRef.current
+    if (element === null) return undefined
+    function measure() {
+      const w = element.clientWidth
+      const h = element.clientHeight
+      if (w <= 0 || h <= 0) return
+      const prev = measuredRef.current
+      const current = prev.view || viewRef.current
+      const known = prev.w > 0 && prev.h > 0
+      if (known && (prev.w !== w || prev.h !== h)) {
+        const resized = resizeViewFor(current, prev, { w: w, h: h })
+        if (resized !== null) {
+          // 同步更新引用：连续通知可能早于下一次 React 渲染，不能拿旧视口配新尺寸。
+          viewRef.current = resized
+          setViewOverride(resized)
+        }
+      }
+      measuredRef.current = { w: w, h: h, view: viewRef.current }
+      setSize({ w: w, h: h })
+    }
+    measure()
+    if (typeof ResizeObserver === 'function') {
+      const observer = new ResizeObserver(measure)
+      observer.observe(element)
+      return () => observer.disconnect()
+    }
+    window.addEventListener('resize', measure)
+    return () => window.removeEventListener('resize', measure)
+  }, [canvasReady])
+
+  // 滚轮：直接缩放，以指针为锚点（指针下的那个点在缩放前后保持不动 —— 这是手感的关键）。
+  // 必须用原生监听并显式 passive:false —— React 在根容器上挂的 wheel 是被动的，
+  // 在那里 preventDefault() 不生效，页面会跟着一起滚。
+  React.useEffect(() => {
+    if (!canvasReady) return undefined
+    const element = canvasRef.current
+    if (element === null) return undefined
+    function onWheel(event) {
+      if (event.target && typeof event.target.closest === 'function' && event.target.closest('.drawai-selection-toolbar')) return
+      const current = viewRef.current
+      if (current === null) return
+      event.preventDefault()
+      const point = toUserSpace(event)
+      if (point === null) return
+      const factor = Math.exp(clampNumber(event.deltaY, -240, 240) * 0.002)
+      // 锚点缩放的数学在 zoomViewAt 里（纯函数，可断言）：锚点前后必须停在同一位置。
+      setViewOverride(zoomViewAt(current, point, factor))
+    }
+    element.addEventListener('wheel', onWheel, { passive: false })
+    return () => element.removeEventListener('wheel', onWheel)
+  }, [canvasReady])
+
+  // 导出。刻意放在 effect 里跑：按钮先清掉选中，等这一帧渲染完（DOM 里没有手柄和选中框了）
+  // 再序列化，产物才干净。若在点击回调里直接导，会把手柄一起拍进去。
+  //
+  // 两种触发形态：菜单里点的是字符串（'svg' / 'png'）→ 浏览器下载；对象形态
+  // （`{format, requestId?, name?, ids?, transparent?, scale?}`）→ 菜单的选区/透明导出，
+  // 或 AI 的 `{format, requestId, name}`（svg 回执落盘、png 仍走浏览器下载）。
+  React.useEffect(() => {
+    if (exportRequest === null) return
+    const request = exportRequest
+    setExportRequest(null)
+    const fromObj = typeof request === 'object' && request !== null
+    const format = fromObj ? request.format : request
+    const requestId = fromObj && typeof request.requestId === 'string' ? request.requestId : null
+    const askedName = fromObj && typeof request.name === 'string' && request.name.length > 0 ? request.name : null
+    const exportIds = fromObj && Array.isArray(request.ids) ? request.ids : null
+    const transparent = fromObj && request.transparent === true
+    // 导出文件名：绑定文件就用它的名字；没有绑定就叫 'diagram'，别去借 demo 的名字。
+    const source = typeof status.path === 'string' && status.path.length > 0 && status.path[0] !== '(' ? status.path : 'diagram'
+    const name =
+      askedName !== null
+        ? askedName
+        : String(source).split(/[\\/]/).pop().replace(/\.drawio$/i, '') +
+          (exportIds !== null ? '-selection' : '') +
+          (transparent ? '-transparent' : '')
+    setSaveNote('正在生成导出文件…')
+    prepareExport(fromObj ? Object.assign({}, request, { format }) : { format }).then((result) => {
+    if (format === 'svg') {
+      const markup = new XMLSerializer().serializeToString(result.built.node)
+      // AI 要的是"落成工作区里的一个文件"：把文本回执给宿主，由它写在 .drawio 旁边。
+      if (requestId !== null) {
+        setSaveNote('AI 要的 SVG 已渲染，交给宿主落盘…')
+        reportExportResult(requestId, 'svg', { ok: true, svg: markup })
+        return
+      }
+      downloadBlob(result.blob, name + '.svg')
+      setSaveNote('SVG 已交给浏览器下载')
+      return
+    }
+    downloadPng(result.built.node, result.built.width, result.built.height, name + '.png', { blob: result.blob })
+    setSaveNote('PNG 已交给浏览器下载（' + result.built.output.width + ' × ' + result.built.output.height + ' px）')
+    // PNG 走浏览器下载（AI 触发的也一样）：宿主写二进制得另开通道，而"点一次导出"就有的东西
+    // 不值得为它搬 base64。下载成不成浏览器不给回执，所以这里只报"已经交给下载"。
+    if (requestId !== null) {
+      setSaveNote('AI 要的 PNG 已交给浏览器下载')
+      reportExportResult(requestId, 'png', { ok: true, downloaded: true })
+    }
+    }).catch((error) => {
+      const message = error && error.message ? error.message : String(error)
+      setSaveNote('导出失败：' + message)
+      if (requestId !== null) reportExportResult(requestId, format, { ok: false, error: message })
+    })
+  }, [exportRequest])
+
+  // AI 的「看一眼」。与导出同一个理由放在 effect 里：pull() 先清掉选中，等这一帧渲染完
+  // （DOM 里没有手柄与选中框）再序列化，模型看到的才是干净的图。
+  React.useEffect(() => {
+    if (lookRequest === null) return
+    const request = lookRequest
+    setLookRequest(null)
+    const requestId = typeof request.requestId === 'string' ? request.requestId : null
+    if (requestId === null) return
+    const built = buildExportSvg()
+    if (built === null) {
+      setSaveNote('AI 想看一眼，但画布还没准备好')
+      reportRenderResult(requestId, { ok: false, error: '画布还没准备好，渲染没做成' })
+      return
+    }
+    setSaveNote('正在把画布渲成图片给 AI 看…')
+    // AI 看图用 2×（比手动导出的 4× 更轻）；体量不再由客户端预检截断（宿主对 render-result 放开了 body 上限）。
+    // 部署附件服务若自带 maxImageBytes，仍会在那一侧拒收。
+    renderPngPayload(built.node, built.width, built.height, 2)
+      .then((payload) => {
+        reportRenderResult(requestId, { ok: true, png: payload.base64, width: payload.width, height: payload.height })
+        setSaveNote('已把画布交给 AI 看（图片存在宿主那边，你的工作区不会多出文件）')
+      })
+      .catch((error) => {
+        const message = error && error.message ? error.message : String(error)
+        setSaveNote('渲染给 AI 失败：' + message)
+        reportRenderResult(requestId, { ok: false, error: message })
+      })
+  }, [lookRequest])
+
+  React.useEffect(() => {
+    if (client === null) {
+      setStatus({ kind: 'error', path: target, error: '客户端根 ctx 尚未绑定（apply 还没跑）', absolute: '' })
+      return undefined
+    }
+
+    // 告诉宿主"用户在看哪张画布" —— AI 不传 path 时就改它。
+    // 放在这里而不是渲染期：渲染期发网络请求会在每次重渲染都打一次。
+    reportFocus()
+
+    // 空舞台：一张画布都还没打开 —— **不造任何文档、不读也不写任何文件**，由 UI 给出提示。
+    // 这里曾经造一份"未命名/未绑定"的本地空文档让用户"自救"，结果面板一打开就是个幽灵画布：
+    // 屏幕上有一张空白图、却没有任何文件，用户以为在编辑什么、其实什么都没绑定。
+    // 现在改成真正的空：要画布就自己「新建画布…」或「打开…」（两个入口都在工作栏里）。
+    if (!hasPath) {
+      docRef.current = null
+      revisionRef.current = 0
+      dirtyRef.current = false
+      resetHistory()
+      setDoc(null)
+      setStatus({ kind: 'empty', path: '', error: '', absolute: '' })
+      return undefined
+    }
+
+    let alive = true
+    // 非活动标签不轮询：它只是被 display:none 藏着，没必要继续打宿主。
+    // （但内容仍在内存里 —— 这正是"切换回来还是原样"的代价与收益。）
+    if (!active) return undefined
+    const controller = typeof AbortController === 'function' ? new AbortController() : null
+    const signal = controller === null ? undefined : controller.signal
+
+    /**
+     * 拉取当前文档：**经宿主读**（`action: 'read'`），客户端不碰 mxfile。
+     *
+     * 走写回路由而不是 workspaceFiles Remote，是因为 `.drawio` 可能被 drawio 压过
+     * （base64 + raw deflate），浏览器解不开；而这条路由本来就有信任围栏（POST + 自定义头 + 同源）。
+     */
+    async function pull() {
+      let payload = null
+      const requestedRevision = revisionRef.current
+      try {
+        const raw = await fetch(SAVE_ENDPOINT, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', [SAVE_HEADER]: '1' },
+          body: JSON.stringify({ action: 'read', sessionId: sessionId, path: target, page: pageIndex, revision: requestedRevision }),
+          signal: signal,
+        })
+        payload = await raw.json()
+      } catch (error) {
+        if (!alive) return
+        const message = error && error.message ? error.message : String(error)
+        setStatus((prev) => (prev.kind === 'error' && prev.error === message ? prev : { kind: 'error', path: target, error: message, absolute: prev.absolute }))
+        return
+      }
+      if (!alive) return
+
+      const parsed = docFromPayload(payload)
+      const absolute = parsed.absolute !== undefined && parsed.absolute.length > 0 ? parsed.absolute : target
+      // AI 的两件事顺路带回来（在 revision 去重之前处理 —— 它们和文件变没变无关）：
+      //   highlight —— AI 用 `{op:'highlight', ids}` 请求"你来看这几个"，取到就选中；
+      //   canRevert —— 宿主那边有没有可退回的 AI 改动，编辑菜单据此启用。
+      const wantHighlight = Array.isArray(payload.highlight) ? payload.highlight : []
+      if (wantHighlight.length > 0) {
+        setSelectedIds(wantHighlight)
+        setSaveNote('AI 选中了 ' + wantHighlight.length + ' 项')
+      }
+      setCanRevert(payload.canRevert === true)
+      // AI 请求的导出（宿主挂在 read 回执上）：交给渲染那一帧去做，结果再回执给宿主。
+      // 用 requestId 去重 —— 轮询每 3 秒一次，不去重就会反复渲染/反复下载。
+      const wantExport = payload.export
+      if (
+        wantExport !== null &&
+        typeof wantExport === 'object' &&
+        typeof wantExport.requestId === 'string' &&
+        exportHandledRef.current !== wantExport.requestId
+      ) {
+        exportHandledRef.current = wantExport.requestId
+        // 先清掉选中：等这一帧渲染完（DOM 里没有手柄与选中框）再序列化，产物才干净。
+        setSelectedIds([])
+        setExportRequest({
+          format: wantExport.format === 'png' ? 'png' : 'svg',
+          requestId: wantExport.requestId,
+          name: typeof wantExport.name === 'string' ? wantExport.name : '',
+        })
+      }
+      // AI 的「看一眼」（diagram_read {render:true}）：渲成 PNG 回执给宿主存进**附件库**，
+      // 工作区零文件；宿主下一次把 image 块交给模型。
+      const wantLook = payload.render
+      if (
+        wantLook !== null &&
+        typeof wantLook === 'object' &&
+        typeof wantLook.requestId === 'string' &&
+        lookHandledRef.current !== wantLook.requestId
+      ) {
+        lookHandledRef.current = wantLook.requestId
+        // 同样先清选中：图片里不该有手柄/选中框。
+        setSelectedIds([])
+        setLookRequest({ requestId: wantLook.requestId })
+      }
+      // AI 下发的抽帧计划（宿主挂在 read 回执上）：在浏览器里解码视频、按计划写 stills/，
+      // 完成后 POST 回 media-extract-result。同一条 requestId 只跑一次（抽帧要几十秒，轮询不停）。
+      const wantExtract = payload.media
+      if (
+        wantExtract !== null &&
+        typeof wantExtract === 'object' &&
+        typeof wantExtract.requestId === 'string' &&
+        mediaHandledRef.current !== wantExtract.requestId
+      ) {
+        const liveNodes = docRef.current !== null && Array.isArray(docRef.current.nodes) ? docRef.current.nodes : []
+        let videoNode = null
+        for (let ni = 0; ni < liveNodes.length; ni += 1) {
+          const vm = videoMetaOf(liveNodes[ni])
+          if (vm !== null && vm.clip === wantExtract.clip) {
+            videoNode = liveNodes[ni]
+            break
+          }
+        }
+        // 节点还没到手上（比如刚 importMedia，文档还没轮询回来）→ 这次不标记，下次再试。
+        if (videoNode !== null) {
+          mediaHandledRef.current = wantExtract.requestId
+          setSaveNote('按 AI 计划抽帧：' + wantExtract.seconds + 's @' + wantExtract.fps + 'fps …')
+          extractStillsFromVideo(videoNode, wantExtract).catch((error) => {
+            setSaveNote('抽帧失败：' + (error && error.message ? error.message : String(error)))
+          })
+        }
+      }
+      if (parsed.error !== undefined) {
+        setStatus({ kind: 'error', path: absolute, error: parsed.error, absolute: absolute })
+        return
+      }
+      // 去重与防回环：revision（文件内容指纹）是这里唯一可靠的身份。
+      //  - 本地有未落盘的改动 → 不要用服务端版本盖掉工作副本（否则用户正拖着的节点会被弹回去）
+      //  - 指纹与我们手上那份相同 → 这就是我们自己刚写出去的文件回声，忽略
+      if (dirtyRef.current === true || saveInFlightRef.current !== null) {
+        setStatus((prev) => (prev.kind === 'ready' ? prev : { kind: 'ready', path: absolute, error: '', absolute: absolute }))
+        return
+      }
+      if (revisionRef.current !== requestedRevision) return
+      if (loadedDocumentRef.current === videoTraceRun && parsed.doc.revision === revisionRef.current && docRef.current !== null) {
+        setStatus((prev) => (prev.kind === 'ready' && prev.absolute === absolute ? prev : { kind: 'ready', path: absolute, error: '', absolute: absolute }))
+        return
+      }
+      docRef.current = parsed.doc
+      loadedDocumentRef.current = videoTraceRun
+      canvasSessions.restore(videoTraceRun, parsed.doc)
+      revisionRef.current = parsed.doc.revision
+      if (payload.backgroundPatch) mergeBackgroundHistory(payload.backgroundPatch)
+      else resetHistory()
+      setDoc(parsed.doc)
+      if (Number.isFinite(Number(payload.pageCount))) setPageCount(Math.max(1, Number(payload.pageCount)))
+      if (Number.isFinite(Number(payload.pageIndex))) setPageIndex(Number(payload.pageIndex))
+      setStatus({ kind: 'ready', path: absolute, error: '', absolute: absolute })
+      // 文件里"画布表示不了、但会原样保留"的东西（多页、图层、图片、HTML 标签…）
+      // 必须在工作栏上说清楚 —— 不然用户以为画布就是全部，导出/分享时才发现在别处。
+      const notes = Array.isArray(parsed.notes) ? parsed.notes : []
+      setSaveNote(notes.length === 0 ? '' : '⚠ ' + notes.join('；'))
+    }
+
+    pull()
+
+    // 主通道：宿主变更流（只报告经 ctx.fs 的"被观测"写入）。
+    // 失败不致命 —— 下面的兜底轮询继续工作。
+    // 0.2 要按路径订阅（传当前标签的 target）；0.1 仍是会话级两参，见 openWorkspaceFileChanges。
+    if (client.remote !== undefined && client.remote.workspaceFiles !== undefined && typeof client.remote.workspaceFiles.changes === 'function') {
+      ;(async () => {
+        try {
+          for await (const rawFrame of openWorkspaceFileChanges(client.remote.workspaceFiles, sessionId, target, signal)) {
+            if (!alive) break
+            // 变更流的帧同样可能被信封包着，防御性拆一次。
+            let frame = rawFrame
+            if (frame !== null && frame !== undefined && typeof frame === 'object' && typeof frame.ok === 'boolean') frame = frame.value
+            if (frame !== null && frame !== undefined && frame.kind === 'change') pull()
+          }
+        } catch (error) {
+          // 变更流不可用时静默降级到轮询
+        }
+      })()
+    }
+
+    const dispose = client.interval(pull, POLL_MS)
+    return () => {
+      alive = false
+      if (controller !== null) controller.abort()
+      if (typeof dispose === 'function') dispose()
+    }
+  }, [target, sessionId, nonce, active, pageIndex])
+
+  // 切换活动标签 / 页时重新上报聚焦：reportFocus 内部按 target#page 去重。
+  React.useEffect(() => {
+    reportFocus()
+  }, [active, target, pageIndex])
+
+  /**
+   * 把"用户现在选中了哪几个单元"告诉宿主 —— AI 的 `diagram_read` 会把它们带回去。
+   *
+   * 为什么需要：用户说"把这几个换成绿色""把它们往右挪一点"时，AI 原来只能靠坐标猜
+   * "这几个"是哪几个（画布只上报了"在看哪一张"，从没说过"选中了谁"）。
+   *
+   * 三条实现上的注意：
+   *   · **防抖**：框选时指针每动一下就 `setSelectedIds`，直接发请求等于按帧打宿主；
+   *   · 请求带着 `path`：宿主按"文件"配对，切了标签之后的旧选区不会串到新画布上
+   *     （两个文件里都叫 n1 太常见了）；
+   *   · 失败静默：主机没这条路由（老宿主）或网络抖动时只是"AI 少知道一次选区"，
+   *     不该在用户界面上冒一个错误（画布该怎么用还怎么用）。
+   */
+  React.useEffect(() => {
+    if (client === null || !active) return undefined
+    const handle = setTimeout(() => {
+      fetch(SAVE_ENDPOINT, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [SAVE_HEADER]: '1' },
+        body: JSON.stringify({ action: 'selection', sessionId: sessionId, path: hasPath ? target : '', ids: selectedIds }),
+      }).catch(() => {})
+    }, SELECTION_REPORT_MS)
+    return () => clearTimeout(handle)
+  }, [selectedIds, target, sessionId, active, hasPath])
+
+  // 视口：宽高比跟着容器走（h 由 aspect 推出），所以容器尺寸变化时不会变形。
+  const aspect = size.w > 0 && size.h > 0 ? size.h / size.w : 1
+  const fitView = doc === null ? null : computeFitView(contentBounds(doc), aspect)
+  // 视口**必须把高也存下来**，不能每帧按容器宽高比现算：
+  // h = w * aspect 时，只要容器宽高比变了（右栏被拖宽、面板高度变化），
+  // x/y/w 不变而 h 变 —— 视野中心跟着偏，用户看到的就是"缩放/移动后元素突变位置"。
+  // 存下来的 h 是"这一帧用户看到的那个视口"，缩放与平移都基于它算，视野才稳定。
+  const view =
+    viewOverride === null
+      ? fitView
+      : { x: viewOverride.x, y: viewOverride.y, w: viewOverride.w, h: viewOverride.h }
+  // 只发布已提交且尺寸匹配的视口。快速拖动时，旧的并发渲染可能晚于
+  // ResizeObserver；不能让旧视口覆盖新尺寸对应的引用，导致下一次测量缩放漂移。
+  function syncCommittedViewport() {
+    const measured = measuredRef.current
+    if (size.w !== measured.w || size.h !== measured.h) return
+    viewRef.current = view
+    measuredRef.current = { w: size.w, h: size.h, view }
+  }
+  ;(React.useLayoutEffect || React.useEffect)(syncCommittedViewport, [view, size])
+  const zoomPercent = view === null || size.w <= 0 ? 100 : Math.round((size.w / view.w) * 100)
+
+  const singleSelectedNodeId = selectedIds.length === 1 && nodeById(selectedIds[0]) !== null ? selectedIds[0] : null
+  // 正在就地编辑的那个节点：渲染时要把它的标签**让位**给编辑框（否则两层字叠在一起）。
+  const editingNodeId = editing !== null && editing.kind === 'node' ? editing.id : null
+
+  const ui = {
+    viewportSize: size,
+    selectedIds: selectedIds,
+    guides: guides,
+    routeMemory: routeMemoryRef.current,
+    marquee: marquee,
+    singleSelectedNodeId: singleSelectedNodeId,
+    editingNodeId: editingNodeId,
+    editingEdgeId: editing !== null && editing.kind === 'edge' ? editing.id : null,
+    showGrid: showGrid,
+    connectFrom: connectFrom,
+    connectTo: connectTo,
+    connectSide: connectSide,
+    connectHover: connectHover,
+    connectPreview: connectPreview,
+    edgePreview: edgePreview,
+    videoController: videoController,
+    onVideoPlay: (id) => { setSelectedIds([id]); setMenu(null) },
+    traceDrawing,
+    onTraceDrawingComplete: finishTraceDrawing,
+    onNodePointerDown: onNodePointerDown,
+    onNodePointerUp: onNodePointerUp,
+    onNodePointerEnter: onNodePointerEnter,
+    onNodePointerLeave: onNodePointerLeave,
+    onNodeDoubleClick: onNodeDoubleClick,
+    onNodeContextMenu: onNodeContextMenu,
+    onHandlePointerDown: onHandlePointerDown,
+    onSelectEdge: (id) => setSelectedIds([id]),
+    onEdgePointerDown: onEdgePointerDown,
+    onEdgeLabelPointerDown: onEdgeLabelPointerDown,
+    onBackgroundPointerDown: onBackgroundPointerDown,
+    onEdgeContextMenu: onEdgeContextMenu,
+    onEdgeDoubleClick: onEdgeDoubleClick,
+    onEdgeHandlePointerDown: onEdgeHandlePointerDown,
+    onResizePointerDown: onResizePointerDown,
+  }
+
+  function menuTitle(text) {
+    return React.createElement('div', { className: 'drawai-menu-title' }, text)
+  }
+
+  /**
+   * 色板。
+   *
+   * `kind === 'font'` 时预览的是**字色**（= 点下去会写进 `fontColor` 的那个值，调色板取 stroke 那一支，
+   * 与 styleWithTextColorName 同一套）。不这么做的话，字色那一行会显示一排填充色，
+   * 用户点"黄"却得到黄边色的字，看着像点错了。
+   *
+   * 字色那一行里 `plain` 就是**黑**：它写出去是"删掉 fontColor 键"，而画出来就是缺省黑字 ——
+   * 所以叫「黑」（用户要的是"把字弄成黑色"）。叫「默认」在颜色行里没有意义：一排颜色里
+   * 混一个"默认"，既说不清它是什么色，又和"选个深色"是同一件事。
+   */
+  function swatchRow(onPick, activeColor, kind) {
+    const forFont = kind === 'font'
+    const buttons = []
+    // 调色板来自样式内核（PALETTE）：这里的"名字"只是 UI 的叫法，点下去生成 fillColor/strokeColor 键。
+    for (let i = 0; i < PALETTE.length; i += 1) {
+      const entry = PALETTE[i]
+      const isPlain = entry.name === 'plain'
+      const label = forFont && isPlain ? '黑' : entry.name
+      buttons.push(
+        React.createElement('button', {
+          key: 'swatch-' + entry.name,
+          className: activeColor === entry.name ? 'drawai-swatch on' : 'drawai-swatch',
+          title: (forFont ? '字色：' : '') + label,
+          style: forFont
+            ? { background: isPlain ? '#000000' : entry.stroke, borderColor: isPlain ? '#9aa0a6' : entry.stroke }
+            : { background: entry.fill, borderColor: entry.stroke },
+          onClick: () => onPick(entry.name),
+        }),
+      )
+    }
+    return React.createElement('div', { className: 'drawai-swatches' }, buttons)
+  }
+
+  /**
+   * 元素库缩略图格（偏好面板等仍用）。
+   * 主放置入口已迁到右侧常驻条 `renderShapeRail`；这里留给偏好"默认形状"挑选。
+   *
+   * @param {(shape: string) => void} onPick
+   * @param {{ color?: string, current?: string }} opts
+   */
+  function shapeGrid(onPick, opts) {
+    const options = opts === undefined || opts === null ? {} : opts
+    const color = typeof options.color === 'string' ? options.color : menuStyle
+    const current = typeof options.current === 'string' ? options.current : ''
+    const buttons = []
+    for (let i = 0; i < SHAPE_LIBRARY.length; i += 1) {
+      const entry = SHAPE_LIBRARY[i]
+      // 位图不能空手换形（没有 data URI = 空框）；粘贴 / 拖入 / 侧栏选文件才是入口。
+      if (entry.shape === 'image' || entry.shape === 'video') continue
+      // node 与 palette 必须来自同一个 colorOf —— shapeElement 的描边取自 style，填充取自 palette，
+      // 只传 palette 不传 style 的话，缩略图会变成"默认填充 + 主题描边"。
+      // svg 缩略图用**放下来会得到的那张占位图**（所见即所得）；它的颜色写在标记自己身上。
+      const chipNode = { style: styleForShapePick(styleWithColorName(styleWithNodeShape('', entry.shape), color), entry.shape) }
+      const palette = colorOf(chipNode, 'light')
+      buttons.push(
+        React.createElement(
+          'button',
+          {
+            key: 'shape-' + entry.shape,
+            className: current === entry.shape ? 'drawai-chip on' : 'drawai-chip',
+            title: entry.label,
+            onClick: () => onPick(entry.shape),
+          },
+          React.createElement(
+            'svg',
+            { width: 44, height: 30, viewBox: '0 0 44 30' },
+            shapeElement(chipNode, { x: 3, y: 3, w: 38, h: 24 }, palette, 'light'),
+          ),
+        ),
+      )
+    }
+    return React.createElement('div', { className: 'drawai-grid' }, buttons)
+  }
+
+  /** 只对明确选中的节点换形，悬停不驱动右侧工具栏。 */
+  function railReplaceTargets() {
+    const selectedNodes = []
+    for (let i = 0; i < selectedIds.length; i += 1) {
+      if (nodeById(selectedIds[i]) !== null) selectedNodes.push(selectedIds[i])
+    }
+    if (selectedNodes.length > 0) return selectedNodes
+    return []
+  }
+
+  /**
+   * 右侧条点某个**族**入口：
+   *  · 目标已是同族 → 多变体族靠侧面板换形（单变体族无需动作）；
+   *  · 否则武装该族的放置工具（再点画布落下**一次**）。
+   */
+  function pickFamilyFromRail(family) {
+    if (doc === null) return
+    const shape = defaultShapeOfFamily(family, menuShape)
+    const targets = railReplaceTargets()
+    if (family === 'video') {
+      pendingVideoRef.current = null
+      setPlaceTool(null); setPlaceEdgeKind(null); setRailOpenFamily(null)
+      openVideoFilePicker()
+      return
+    }
+    // 线条族：悬停出四种线型；点击武装放置（空白单击或拖拽定起终点）；选中连线时打开气泡换线型。
+    if (family === 'edge') {
+      if (placeEdgeKind !== null) {
+        setPlaceEdgeKind(null)
+        setRailOpenFamily(null)
+        setSaveNote('')
+        return
+      }
+      setPlaceTool(null)
+      setSelectedIds([])
+      setPlaceEdgeKind(lastLineKindRef.current)
+      setSaveNote('放置线条：可在气泡里选线型，再在空白处单击落下或拖拽定起终点（单次，Esc 取消）')
+      return
+    }
+    // 图片族：直接选文件（或换掉当前选中/悬停节点的图），不走"点空白落下"——
+    // 空手落下没有 data URI，只会得到占位空框。
+    if (family === 'image') {
+      if (targets.length > 0) {
+        const first = nodeById(targets[0])
+        const currentShape = first === null ? '' : nodeShapeFromStyle(typeof first.style === 'string' ? first.style : '')
+        if (shapeFamilyOf(currentShape) === 'image') {
+          openImageFilePicker({ replaceIds: targets })
+          return
+        }
+        setSelectedIds([])
+        setHoverNodeId(null)
+      }
+      openImageFilePicker({})
+      setSaveNote('选一张图片放进画布（也可直接 Ctrl+V 粘贴截图，或把图片拖进画布）')
+      return
+    }
+    if (targets.length > 0) {
+      const first = nodeById(targets[0])
+      const currentShape = first === null ? '' : nodeShapeFromStyle(typeof first.style === 'string' ? first.style : '')
+      if (shapeFamilyOf(currentShape) === family) {
+        // 同族：悬停/点开气泡换形；单变体族已经是对的类型。
+        if (shapesInFamily(family).length <= 1) setSaveNote('已是「' + familyLabelOf(family) + '」')
+        else openRailFamilyPanel(family)
+        return
+      }
+      setSelectedIds([])
+      setHoverNodeId(null)
+    }
+    if (placeTool !== null && shapeFamilyOf(placeTool) === family) {
+      setPlaceTool(null)
+      setPlaceEdgeKind(null)
+      setRailOpenFamily(null)
+      setSaveNote('')
+      return
+    }
+    setMenuShape(shape)
+    setPlaceEdgeKind(null)
+    setPlaceTool(shape)
+    if (shapesInFamily(family).length > 1) openRailFamilyPanel(family)
+    setSaveNote(
+      '放置「' +
+        familyLabelOf(family) +
+        '」：' +
+        (shapesInFamily(family).length > 1 ? '可在气泡里选具体形状，' : '') +
+        '在画布空白处点一下（单次，Esc 取消）',
+    )
+  }
+
+  /**
+   * 气泡里点某个**同族变体**：有换形/换线型目标就换；否则只改即将落下的子类型（仍等画布点一下）。
+   */
+  function pickVariantFromRail(shape) {
+    if (doc === null) return
+    // 线条族：kind 与节点 shape 名可能撞车（都有 rounded），以当前打开的族为准。
+    if (railOpenFamily === 'edge' || (placeEdgeKind !== null && isEdgeLineKind(shape))) {
+      if (!isEdgeLineKind(shape)) return
+      lastLineKindRef.current = shape
+      setSelectedIds([])
+      setPlaceTool(null)
+      setPlaceEdgeKind(shape)
+      setRailOpenFamily(null)
+      setSaveNote('放置「' + edgeLineLabelOf(shape) + '」：空白处单击落下，或拖拽定起终点（单次，Esc 取消）')
+      return
+    }
+    setMenuShape(shape)
+    const targets = railReplaceTargets()
+    if (targets.length > 0) {
+      // 混合选区不可跨类别转换；逐节点保留各自的样式与内容。
+      const family = shapeFamilyOf(shape)
+      if (!targets.every((id) => {
+        const node = nodeById(id)
+        return node !== null && shapeFamilyOf(nodeShapeFromStyle(node.style || '')) === family &&
+          (family !== 'shape' || isBasicShapeStyle(node.style || ''))
+      })) return
+      applyLocal((next) => {
+        for (const node of next.nodes) {
+          if (targets.indexOf(node.id) >= 0) node.style = styleForShapePick(node.style || '', shape)
+        }
+      })
+      setPlaceTool(null)
+      setPlaceEdgeKind(null)
+      setRailOpenFamily(null)
+      return
+    }
+    setPlaceEdgeKind(null)
+    setPlaceTool(shape)
+    setSaveNote('放置「' + shapeLabelOf(shape) + '」：在画布空白处点一下（单次，Esc 取消）')
+  }
+
+  /**
+   * 主条线稿按钮。`face` 有值时用它当图标（选中/放置的子类型），否则用族缺省 `iconKind`。
+   * 悬停气泡用自定义 tip 时不要再挂原生 title（会叠两层）。
+   */
+  function railIconButton(key, iconKind, on, title, onClick, hover, face) {
+    const props = {
+      key: key,
+      type: 'button',
+      className: 'drawai-rail-chip' + (on ? ' on' : ''),
+      onClick: onClick,
+      'aria-label': title,
+    }
+    if (hover !== undefined && hover !== null) {
+      if (typeof hover.onEnter === 'function') props.onPointerEnter = hover.onEnter
+      if (typeof hover.onLeave === 'function') props.onPointerLeave = hover.onLeave
+    } else if (typeof title === 'string' && title.length > 0) {
+      props.title = title
+    }
+    return React.createElement('button', props, face !== undefined && face !== null ? face : railIcon(iconKind))
+  }
+
+  /** 图形族母图标：跟当前子形状走（选中菱形 → 母图标也是菱形）。 */
+  function railShapeFace(shape) {
+    const name = typeof shape === 'string' && shape.length > 0 ? shape : 'rounded'
+    const chipNode = {
+      style: styleForShapePick(styleWithColorName(styleWithNodeShape('', name), menuStyle), name),
+    }
+    const palette = colorOf(chipNode, 'light')
+    return React.createElement(
+      'svg',
+      { width: 22, height: 22, viewBox: '0 0 24 24', 'aria-hidden': true },
+      shapeElement(chipNode, { x: 3, y: 4, w: 18, h: 16 }, palette, 'light'),
+    )
+  }
+
+  /** 线条族母图标：跟当前线型走（选中直线 → 母图标也是直线）。 */
+  function railEdgeFace(kind) {
+    const lineKind = isEdgeLineKind(kind) ? kind : 'rounded'
+    return React.createElement(
+      'svg',
+      { width: 22, height: 22, viewBox: '0 0 44 30', 'aria-hidden': true },
+      railLineKindIcon(lineKind),
+    )
+  }
+
+  /** 侧面板形状缩略图（要辨认矩形/菱形等，仍用真实形状预览）。 */
+  function railShapeButton(key, shape, on, title, onClick) {
+    const chipNode = {
+      style: styleForShapePick(styleWithColorName(styleWithNodeShape('', shape), menuStyle), shape),
+    }
+    const palette = colorOf(chipNode, 'light')
+    return React.createElement(
+      'button',
+      {
+        key: key,
+        type: 'button',
+        className: 'drawai-rail-chip' + (on ? ' on' : ''),
+        title: title,
+        onClick: onClick,
+      },
+      React.createElement(
+        'svg',
+        { width: 40, height: 28, viewBox: '0 0 44 30', 'aria-hidden': true },
+        shapeElement(chipNode, { x: 3, y: 3, w: 38, h: 24 }, palette, 'light'),
+      ),
+    )
+  }
+
+  /** 线条族气泡里的线型按钮。 */
+  function railLineButton(key, kind, on, title, onClick) {
+    return React.createElement(
+      'button',
+      {
+        key: key,
+        type: 'button',
+        className: 'drawai-rail-chip' + (on ? ' on' : ''),
+        title: title,
+        onClick: onClick,
+      },
+      React.createElement(
+        'svg',
+        { width: 40, height: 28, viewBox: '0 0 44 30', 'aria-hidden': true },
+        railLineKindIcon(kind),
+      ),
+    )
+  }
+
+  function startVideoPlayback(node) {
+    const meta = videoMetaOf(node)
+    return meta === null ? Promise.resolve() : videoController.play(node, meta)
+  }
+
+  /**
+   * 抽帧：把 clip 的源视频用 `<video>` + canvas 解成 `stills/NNNN.png`。
+   *
+   * 两种调用：
+   *   - `extractStillsFromVideo(node, { requestId, from, seconds, fps, width, max })` —— AI 下发的计划
+   *     （宿主挂在 `read` 回执上）：按 `from + i/fps` 均匀采 `seconds` 秒，缩放到底宽 `width`
+   *     （4K 源原样写盘会把 stills/ 撑到 GB 级），完成后回执 `media-extract-result`。
+   *   - `extractStillsFromVideo(node, every, max)` —— 工具栏「抽帧」按钮的老路径：t = i/12、步长 every。
+   */
+  async function extractStillsFromVideo(node, planOrEvery, legacyMax) {
+    if (videoMetaOf(node)?.kind === 'raster') {
+      const options = planOrEvery && typeof planOrEvery === 'object'
+        ? { ...planOrEvery, range: 'segment' }
+        : { range: 'all', fps: DEFAULT_MEDIA_FPS / Math.max(1, Number(planOrEvery) || 1), width: 480, max: legacyMax || 1200 }
+      try { return await submitBackgroundDrawing('extract', node, options) }
+      catch (error) { setSaveNote('后台抽帧失败：' + String(error.message || error)); return }
+    }
+    const meta = videoMetaOf(node)
+    if (meta === null) return
+    const plan =
+      planOrEvery !== null && typeof planOrEvery === 'object'
+        ? {
+            requestId: typeof planOrEvery.requestId === 'string' ? planOrEvery.requestId : '',
+            from: Math.max(0, Number(planOrEvery.from) || 0),
+            seconds: Math.max(0, Number(planOrEvery.seconds) || 0),
+            fps: Math.max(0.1, Math.min(60, Number(planOrEvery.fps) || DEFAULT_MEDIA_FPS)),
+            width: Math.max(16, Math.min(2048, Math.round(Number(planOrEvery.width) || 480))),
+            max: Math.max(1, Math.min(1200, Math.floor(Number(planOrEvery.max) || 360))),
+          }
+        : null
+    const src = await mediaAction('media-source-bytes', { clip: meta.clip })
+    if (src === null) return
+    const bin = atob(src.base64)
+    const bytes = new Uint8Array(bin.length)
+    for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i)
+    const blobUrl = URL.createObjectURL(new Blob([bytes], { type: src.mime || 'video/webm' }))
+    const video = document.createElement('video')
+    video.src = blobUrl
+    video.muted = true
+    video.playsInline = true
+    await new Promise((resolve, reject) => {
+      video.onloadeddata = () => resolve()
+      video.onerror = () => reject(new Error('video load failed'))
+    })
+    const duration = Number.isFinite(video.duration) ? video.duration : 0
+    // 采样时刻：计划路径按 fps 均匀采；老路径 t = i/12、步长 step。
+    const times = []
+    if (plan !== null && plan.seconds > 0) {
+      const count = Math.min(plan.max, Math.max(1, Math.ceil(plan.seconds * plan.fps)))
+      for (let i = 0; i < count; i += 1) {
+        const t = plan.from + i / plan.fps
+        if (duration > 0 && t > duration - 0.02) break
+        times.push(Math.max(0, duration > 0 ? Math.min(duration - 0.01, t) : 0))
+      }
+    } else {
+      const step = Math.max(1, Math.floor(Number(planOrEvery) || 1))
+      const limit = Math.max(1, Math.floor(Number(legacyMax) || 24))
+      const fpsGuess = 12
+      for (let i = 0; times.length < limit; i += step) {
+        const t = duration > 0 ? Math.min(duration - 0.01, i / fpsGuess) : 0
+        times.push(t)
+        if (duration <= 0) break
+        if (t >= duration - 0.02) break
+      }
+    }
+    // 计划路径缩放到底宽 width（高度按源比例）；老路径沿用源尺寸。
+    const canvas = document.createElement('canvas')
+    if (plan !== null) {
+      const srcW = Math.max(1, video.videoWidth || plan.width)
+      const srcH = Math.max(1, video.videoHeight || Math.round((plan.width * 9) / 16))
+      canvas.width = plan.width
+      canvas.height = Math.max(1, Math.round((plan.width * srcH) / srcW))
+    } else {
+      canvas.width = Math.max(1, video.videoWidth || 320)
+      canvas.height = Math.max(1, video.videoHeight || 180)
+    }
+    const ctx2d = canvas.getContext('2d')
+    let written = 0
+    let failure = ''
+    for (let i = 0; i < times.length; i += 1) {
+      video.currentTime = times[i]
+      await new Promise((resolve) => {
+        video.onseeked = () => resolve()
+      })
+      ctx2d.drawImage(video, 0, 0, canvas.width, canvas.height)
+      const dataUrl = canvas.toDataURL('image/png')
+      const b64 = dataUrl.replace(/^data:image\/png;base64,/, '')
+      const ok = await mediaAction('media-write-still', { clip: meta.clip, index: i, pngBase64: b64 })
+      if (ok === null) {
+        failure = '第 ' + i + ' 帧写盘失败'
+        break
+      }
+      written += 1
+      if (plan !== null && (i % 10 === 0 || i === times.length - 1)) setSaveNote('抽帧 ' + written + '/' + times.length + ' …')
+    }
+    try {
+      URL.revokeObjectURL(blobUrl)
+    } catch (error) {
+      // ignore
+    }
+    if (plan !== null && plan.requestId.length > 0) {
+      await mediaAction('media-extract-result', { requestId: plan.requestId, written: written, error: failure })
+    }
+    setSaveNote(
+      '已抽取 ' + written + ' 帧到 stills/，可用 AI traceFrame 转 SVG' + (failure.length > 0 ? '（' + failure + '）' : ''),
+    )
+  }
+
+  async function exportVideoFile(node, format) {
+    if (videoExportRun.current) throw new Error('已有视频正在导出，请等待完成')
+    videoExportRun.current = true
+    try { await encodeVideoToFile(node, format) }
+    finally { videoExportRun.current = false }
+  }
+
+  async function encodeVideoToFile(node, format = 'webm') {
+    const perf = createMediaPerformance()
+    const meta = videoMetaOf(node)
+    if (!meta) return
+    const request = async (action, extra = {}) => {
+      const result = await perf.measure('request.' + action, () => mediaAction(action, Object.assign({ clip: meta.clip }, extra), { throwOnError: true }))
+      if (!result) throw new Error('视频导出请求失败')
+      return result
+    }
+    const info = await request('media-manifest')
+    if (info.missing) throw new Error('媒体包缺失，无法导出')
+    if (format === 'mp4' && meta.kind === 'raster' && /.mp4$/i.test(info.source || info.manifest.source || '')) {
+      const result = await request('media-export-source')
+      setSaveNote('已导出 MP4 ' + result.path + '（保留源视频画质与音频）')
+      return
+    }
+    setSaveNote('正在准备逐帧导出 ' + format.toUpperCase() + '…')
+    const pack = await request('media-video-export-start', { format })
+    perf.enable(pack.performanceEnabled)
+    if (!pack.token) throw new Error('后台导出任务未返回令牌')
+    setVideoExportJobs((jobs) => [pack, ...jobs.filter((job) => job.token !== pack.token)])
+    setSaveNote('已在后台开始导出 ' + format.toUpperCase() + '，完成后自动保存到画布文件旁，可切换标签页或对话')
+  }
+
+  async function downloadVideoExport(job) {
+    const chunks = []
+    for (let offset = 0; offset < job.bytes;) {
+      const part = await mediaAction('media-video-export-read', { clip: job.clip, token: job.token, offset }, { throwOnError: true })
+      const bytes = Uint8Array.from(atob(part.base64), (c) => c.charCodeAt(0))
+      if (part.offset !== offset || !bytes.length || bytes.length !== part.bytes || part.total !== job.bytes) throw new Error('导出文件下载不完整')
+      chunks.push(bytes); offset += bytes.length
+    }
+    const blob = new Blob(chunks, { type: job.format === 'gif' ? 'image/gif' : 'video/' + job.format })
+    if (!blob.size) throw new Error('导出文件为空')
+    const url = URL.createObjectURL(blob)
+    try {
+      const anchor = document.createElement('a'); anchor.href = url
+      anchor.download = job.path ? job.path.split(/[\\/]/).pop() : job.clip + '.' + job.format
+      anchor.click()
+    } finally { URL.revokeObjectURL(url) }
+    setSaveNote('已下载 ' + job.format.toUpperCase() + '；后台保存的文件仍然保留')
+  }
+
+  async function grabVideoStill(node) {
+    const meta = videoMetaOf(node)
+    if (!meta) throw new Error('视频缺少媒体信息，请重新导入')
+    const before = videoController.get(node.id)
+    if (before.status === 'loading') throw new Error('正在加载视频')
+    const needLoad = !before.kind || before.status === 'idle' || before.status === 'error'
+    if (needLoad) await videoController.play(node, meta)
+    let shot = null
+    let lastError = null
+    for (let i = 0; i < 50; i += 1) {
+      const state = videoController.get(node.id)
+      if (state.status === 'error') throw new Error(state.error || '无法读取视频')
+      try { shot = videoController.still(node.id); break }
+      catch (error) { lastError = error; await new Promise((resolve) => setTimeout(resolve, 60)) }
+    }
+    if (!shot) throw lastError || new Error('无法读取当前画面')
+    if (needLoad && videoController.get(node.id).status === 'playing') videoController.pause(node.id)
+    applyLocal((next) => placeVideoStill(next, node.id, shot))
+    setSaveNote(shot.kind === 'svg' ? '已把当前 SVG 帧抽到右侧' : '已把当前帧抽成右侧的图像节点')
+  }
+
+  function renderSelectionToolbar() {
+    if (doc === null || view === null || editing !== null || menu !== null || placeEdgeKind !== null || placeTool !== null) return null
+    const ids = filterEditableIds(doc, selectedIds)
+    const nodes = doc.nodes.filter((n) => ids.indexOf(n.id) >= 0)
+    const edges = doc.edges.filter((e) => ids.indexOf(e.id) >= 0)
+    if (nodes.length + edges.length === 0) return null
+    const cells = nodes.concat(edges)
+    const boxes = nodes.map((n) => nodeBoxOf(n))
+    for (const edge of edges) {
+      const points = edgeRoutePoints(doc, edge, routeMemoryRef.current) || []
+      for (const p of points) boxes.push({ x: p.x, y: p.y, w: 0, h: 0 })
+    }
+    const bounds = boxOfBoxes(boxes)
+    if (bounds === null) return null
+    const scale = size.w / view.w
+    const center = (bounds.x + bounds.w / 2 - view.x) * scale
+    const top = (bounds.y - view.y) * scale
+    const bottom = (bounds.y + bounds.h - view.y) * scale
+    const width = Math.min(460, Math.max(0, size.w - 16))
+    if (nodes.length === 1 && edges.length === 0 && isVideoNodeData(nodes[0].data)) {
+      const node = nodes[0]
+      const meta = videoMetaOf(node)
+      const mediaWidth = Math.min(meta && meta.kind === 'raster' ? 300 : 220, Math.max(0, size.w - 16))
+      const position = { width: mediaWidth + 'px',
+        left: clampNumber(center - mediaWidth / 2, 8, Math.max(8, size.w - mediaWidth - 8)) + 'px',
+        top: clampNumber(top >= 84 ? top - 72 : bottom + 12, 8, Math.max(8, size.h - 72)) + 'px' }
+      const reportError = (error) => setSaveNote('媒体操作失败：' + (error.message || String(error)))
+      const actions = [
+        { label: '绘制复刻…', primary: true, mediaKind: 'raster', disabled: () => !hasPath || !meta || meta.kind !== 'raster',
+          run: () => { setVideoTraceSource({ id: node.id, clip: meta.clip, w: Number(node.data.mediaW), h: Number(node.data.mediaH),
+            duration: Number(node.data.mediaDuration) || videoController.get(node.id).duration }); setVideoTraceJob(null) } },
+        { label: '抽帧', grab: true, disabled: (state) => state.status === 'loading', run: () => grabVideoStill(node) },
+        { label: '导出 SVG 视频', export: true, mediaKind: 'svg', disabled: () => !hasPath || !meta || meta.kind !== 'svg', run: async () => {
+          if (!meta) return
+          const result = await mediaAction('media-pack-svgvideo', { clip: meta.clip })
+          if (result) setSaveNote('已导出 ' + result.path)
+        } },
+        { label: '导出 MP4', export: true, disabled: () => !hasPath || !meta || videoExportRun.current, run: () => exportVideoFile(node, 'mp4') },
+        { label: '导出 GIF', export: true, disabled: () => !hasPath || !meta || videoExportRun.current, run: () => exportVideoFile(node, 'gif') },
+        { label: '导出 WebM', export: true, mediaKind: 'svg', disabled: () => !hasPath || !meta || meta.kind !== 'svg' || videoExportRun.current, run: () => exportVideoFile(node, 'webm') },
+        { label: '导出源视频', export: true, mediaKind: 'raster', disabled: () => !hasPath || !meta || meta.kind !== 'raster', run: async () => {
+          if (!meta) return
+          const result = await mediaAction('media-export-source', { clip: meta.clip })
+          if (result) setSaveNote('已导出源视频 ' + result.path)
+        } },
+      ]
+      return React.createElement('div', { className: 'drawai-selection-toolbar drawai-video-toolbar', style: position },
+        React.createElement(VideoControls, { compact: true, controller: videoController, node, meta, actions, onError: reportError,
+          renderDraw: (action, state, icon) => React.createElement(ToolbarPopover, {
+            key: 'video-draw-' + node.id, label: '绘制复刻', icon, group: 'drawai-video-' + uid,
+
+            disabled: action.disabled(state), disabledTitle: '请先保存画布',
+            renderPanel: (close) => React.createElement(VideoTracePanel, { inline: true, queued: true, source: {
+              id: node.id, clip: meta.clip, w: Number(node.data.mediaW), h: Number(node.data.mediaH),
+              duration: Number(node.data.mediaDuration) || videoController.get(node.id).duration,
+            }, onClose: close, onStart: async (options) => {
+              const source = { id: node.id, clip: meta.clip, w: Number(node.data.mediaW), h: Number(node.data.mediaH),
+                duration: Number(node.data.mediaDuration) || videoController.get(node.id).duration }
+              await enqueueVideoTrace(options, source); close()
+            } }),
+          }),
+          renderExport: (items, state, run, icon) => React.createElement(ToolbarPopover, {
+            key: 'video-export-' + node.id, label: '导出', icon, group: 'drawai-video-' + uid,
+            disabled: items.every((action) => action.disabled(state)), disabledTitle: '请先保存画布后再导出',
+            renderPanel: (close) => React.createElement('div', { className: 'drawai-video-export-options' },
+              React.createElement('div', { className: 'drawai-popover-title' }, '导出视频'),
+              items.map((action) => React.createElement('button', { key: action.label, type: 'button', className: 'drawai-choice-button',
+                disabled: action.disabled(state), onClick: () => { close(); run(action) },
+              }, action.label))),
+          }),
+        }))
+    }
+    const styleOf = (cell) => typeof cell.style === 'string' ? cell.style : ''
+    // 每个对象只更新本次指定的键，混合选区保留各自其余样式。
+    const patch = (change, targets = ids, coalesceKey) => applyLocal((next) => {
+      for (const cell of next.nodes.concat(next.edges)) {
+        if (targets.indexOf(cell.id) >= 0) cell.style = stylePatch(styleOf(cell), change)
+      }
+    }, coalesceKey)
+    const uniform = (targets, read) => {
+      const value = read(targets[0])
+      return targets.every((cell) => read(cell) === value) ? value : ''
+    }
+    const select = (label, value, options, onChange, footer) => React.createElement(ColorPalette, {
+      key: label, label, value, group: 'drawai-colors-' + uid, options, onChange, footer,
+      icon: (options.find(([v]) => v === value) || [])[2] || React.createElement('span', { className: 'drawai-value-icon' }, value || '—'),
+    })
+    const strokeSample = (dash, width) => React.createElement('svg', { width: 28, height: 24, viewBox: '0 0 28 24', 'aria-hidden': true },
+      React.createElement('line', { x1: 3, x2: 25, y1: 12, y2: 12, stroke: 'currentColor', strokeWidth: width, strokeDasharray: dash === 'dashed' ? '5 4' : dash === 'dotted' ? '1 4' : undefined, strokeLinecap: 'round' }))
+    const color = (label, key, targets, fallback) => {
+      const value = uniform(targets, (cell) => styleGet(styleOf(cell), key, fallback))
+      const opacityKey = key === 'fontColor' ? 'textOpacity' : key === 'fillColor' ? 'fillOpacity' : 'strokeOpacity'
+      return React.createElement(ColorPalette, { key, label, value, group: 'drawai-colors-' + uid,
+        kind: key === 'fontColor' ? 'font' : key === 'strokeColor' ? 'stroke' : 'fill',
+        header: key === 'strokeColor' ? React.createElement('div', { className: 'drawai-stroke-options' },
+          React.createElement('div', { className: 'drawai-popover-title' }, '边框样式'),
+          React.createElement('div', { className: 'drawai-option-strip' }, ['solid', 'dashed', 'dotted'].map((dash) => React.createElement('button', {
+            key: dash, type: 'button', className: 'drawai-choice-button' + (uniform(cells, (cell) => dashFromStyle(styleOf(cell))) === dash ? ' on' : ''),
+            'aria-label': '边框：' + dash, title: { solid: '实线', dashed: '虚线', dotted: '点线' }[dash],
+            onClick: () => applyLocal((next) => {
+              for (const cell of next.nodes.concat(next.edges)) if (ids.indexOf(cell.id) >= 0) cell.style = styleWithDash(styleOf(cell), dash)
+            }),
+          }, strokeSample(dash, 2)))),
+          React.createElement('div', { className: 'drawai-option-strip' }, [1, 2, 3, 4, 6, 8].map((width) => React.createElement('button', {
+            key: width, type: 'button', className: 'drawai-choice-button' + (uniform(cells, (cell) => String(styleNumber(styleOf(cell), 'strokeWidth', 1))) === String(width) ? ' on' : ''),
+            'aria-label': '线宽：' + width, title: width + ' px', onClick: () => patch({ strokeWidth: String(width) }),
+          }, React.createElement('span', { className: 'drawai-width-dot', style: { width: Math.max(5, width * 3) + 'px', height: Math.max(5, width * 3) + 'px' } })))),
+        ) : null,
+        opacity: uniform(targets, (cell) => String(styleNumber(styleOf(cell), opacityKey, 100))),
+        onOpacityChange: (value) => patch({ [opacityKey]: String(clampNumber(value, 0, 100)) }, targets.map((cell) => cell.id), 'opacity:' + key + ':' + ids.join(',')),
+        onOpacityEnd: () => { lastCoalesceRef.current = null },
+        customColors: prefs.customColors,
+        onOpen: () => setPrefs((current) => Object.assign({}, current, { customColors: customColorList(loadDrawaiPrefs().customColors) })),
+        onPick: (color) => patch({ [key]: color }, targets.map((cell) => cell.id)),
+        onSaveColor: (color) => patchPrefs({ customColors: customColorList(customColorList(loadDrawaiPrefs().customColors).concat(color)) }),
+      })
+    }
+    const controls = []
+    if (nodes.length === 1 && edges.length === 0 && nodeImageExportInfo(nodes[0])) {
+      const node = nodes[0]
+      const info = nodeImageExportInfo(node)
+      if (info.mime === 'image/svg+xml') controls.push(React.createElement(ToolbarPopover, {
+        key: 'image-export-' + node.id, label: '导出图片', group: 'drawai-colors-' + uid,
+        icon: React.createElement('span', { 'aria-hidden': true }, '↓'),
+        renderPanel: (close) => React.createElement('div', { className: 'drawai-video-export-options' },
+          React.createElement('div', { className: 'drawai-popover-title' }, '导出图片'),
+          [['svg', '导出 SVG'], ['png', '导出 PNG（透明背景 · 4×）']].map(([format, label]) => React.createElement('button', {
+            key: format, type: 'button', className: 'drawai-choice-button',
+            onClick: () => { close(); exportNodeImage(node, format) },
+          }, label))),
+      }))
+      else controls.push(React.createElement('button', {
+        key: 'image-export-' + nodes[0].id, type: 'button', className: 'drawai-toolbar-button',
+        title: '导出原图（保留原始格式和清晰度）', 'aria-label': '导出图片', onClick: () => exportNodeImage(nodes[0]),
+      }, React.createElement('span', { 'aria-hidden': true }, '↓'), React.createElement('span', null, '导出图片')))
+    }
+    if (nodes.length === 1 && edges.length === 0 && !isVideoNodeData(nodes[0].data) &&
+      (nodeShapeFromStyle(styleOf(nodes[0])) === 'image' ||
+        (styleGet(styleOf(nodes[0]), 'shape', '') === 'image' && !isSvgDataUri(imageValueFromStyle(styleOf(nodes[0])))))) {
+      const image = imageValueFromStyle(styleOf(nodes[0]))
+      const canTrace = isRasterDataUri(image)
+      controls.push(React.createElement(ImageTraceControl, {
+        key: 'image-trace-' + nodes[0].id, group: 'drawai-colors-' + uid,
+
+        source: { id: nodes[0].id, image: canTrace ? image : '' },
+        disabled: !canTrace, onGenerate: generateImageTrace, onApply: applyImageTrace,
+        onEnqueue: hasPath ? enqueueImageTrace : undefined,
+      }))
+    }
+    if (nodes.length > 0) {
+      // 只有基础图形之间可以直接换形；SVG/图片/文字/分区保留自身类别。
+      const canChangeShape = nodes.every((n) => isBasicShapeStyle(styleOf(n)))
+      if (canChangeShape) controls.push(select('形状', uniform(nodes, (n) => nodeShapeFromStyle(styleOf(n))),
+        SHAPE_LIBRARY.filter((entry) => shapeFamilyOf(entry.shape) === 'shape').map((entry) => [entry.shape, entry.label, railShapeFace(entry.shape)]),
+        (shape) => applyLocal((next) => {
+          if (!SHAPE_LIBRARY.some((entry) => entry.shape === shape && shapeFamilyOf(shape) === 'shape')) return
+          for (const node of next.nodes) {
+            if (ids.indexOf(node.id) >= 0 && isBasicShapeStyle(styleOf(node))) {
+              node.style = styleForShapePick(styleOf(node), shape)
+            }
+          }
+        })))
+      const filled = nodes.filter((n) => {
+        if (isVideoNodeData(n.data)) return false
+        return !['text', 'svg', 'image'].includes(nodeShapeFromStyle(styleOf(n)))
+      })
+      if (filled.length > 0) controls.push(color('填充', 'fillColor', filled, '#ffffff'))
+    }
+    const strokeCells = cells.filter((cell) => edges.includes(cell) || (!isVideoNodeData(cell.data) && !['text', 'svg', 'image'].includes(nodeShapeFromStyle(styleOf(cell)))))
+    if (strokeCells.length) controls.push(color('描边', 'strokeColor', strokeCells, '#000000'))
+    const labelCells = cells.filter((cell) => edges.includes(cell) || nodeShowsLabel(cell))
+    if (labelCells.length > 0) controls.push(color('字色', 'fontColor', labelCells, '#000000'))
+    if (labelCells.length > 0) controls.push(select('字号', uniform(labelCells, (cell) => String(styleGet(styleOf(cell), 'fontSize', edges.indexOf(cell) >= 0 ? '10' : '12'))),
+      [10, 12, 14, 18, 24, 36, 48, 72].map((n) => [String(n), String(n)]), (value) => patch({ fontSize: value }),
+      React.createElement('label', { className: 'drawai-font-custom' }, '自定义字号',
+      React.createElement('input', { type: 'number', min: 8, max: 72, 'aria-label': '字号', placeholder: '混合',
+        key: ids.join(',') + cells.map((cell) => styleGet(styleOf(cell), 'fontSize', '')).join(','),
+        defaultValue: uniform(cells, (cell) => String(styleGet(styleOf(cell), 'fontSize', edges.indexOf(cell) >= 0 ? '10' : '12'))),
+        onBlur: (event) => {
+          const value = clampFontSize(event.target.value)
+          if (value !== null) patch({ fontSize: String(value) })
+        },
+        onKeyDown: (event) => {
+          event.stopPropagation()
+          if (event.key === 'Enter' && !event.isComposing) { event.preventDefault(); event.target.blur() }
+        },
+      }))))
+    if (edges.length > 0) {
+      const edgeIds = edges.map((edge) => edge.id)
+      controls.push(select('线型', uniform(edges, (edge) => lineKindFromStyle(styleOf(edge))),
+        ['straight', 'sharp', 'rounded', 'curved'].map((kind) => [kind, edgeLineLabelOf(kind), railEdgeFace(kind)]),
+        (kind) => applyLineKind(edgeIds, kind)))
+      controls.push(select('箭头', uniform(edges, (edge) => arrowFromStyle(styleOf(edge))),
+        [['end', '单向', '→'], ['both', '双向', '↔'], ['none', '无', '—'], ['start', '反向', '←']],
+        (arrow) => updateEdge(edgeIds, { arrow })))
+    }
+    return React.createElement('div', {
+      className: 'drawai-selection-toolbar', role: 'toolbar', 'aria-label': '选区样式',
+      style: { width: width + 'px', left: clampNumber(center - width / 2, 8, Math.max(8, size.w - width - 8)) + 'px',
+        top: clampNumber(top >= 84 ? top - 72 : bottom + 12, 8, Math.max(8, size.h - 72)) + 'px' },
+      onPointerDown: (event) => event.stopPropagation(),
+      onDoubleClick: (event) => event.stopPropagation(),
+      onContextMenu: (event) => { event.preventDefault(); event.stopPropagation() },
+    }, controls)
+  }
+
+  function renderShapeRail() {
+    if (doc === null) return null
+    const targets = railReplaceTargets()
+    const edgeTargets = railReplaceEdgeTargets()
+    let focusShape = ''
+    let focusFamily = null
+    if (targets.length > 0) {
+      const n = nodeById(targets[0])
+      focusShape = nodeShapeFromStyle(n === null || typeof n.style !== 'string' ? '' : n.style)
+      focusFamily = shapeFamilyOf(focusShape)
+    }
+    let focusEdgeKind = ''
+    if (edgeTargets.length > 0) {
+      const e = edgeById(edgeTargets[0])
+      focusEdgeKind = lineKindFromStyle(e === null || typeof e.style !== 'string' ? DEFAULT_EDGE_STYLE : e.style)
+      focusFamily = 'edge'
+    }
+    const placeFamily =
+      typeof placeEdgeKind === 'string' && placeEdgeKind.length > 0
+        ? 'edge'
+        : typeof placeTool === 'string' && placeTool.length > 0
+          ? shapeFamilyOf(placeTool)
+          : null
+    // 气泡只在悬停打开（railOpenFamily）；选中/放置本身不自动铺开。
+    const panelFamily =
+      typeof railOpenFamily === 'string' && shapesInFamily(railOpenFamily).length > 1 ? railOpenFamily : null
+    const tipLabel = panelFamily === null ? railHoverTipLabel(railOpenFamily) : null
+    const panelCurrent =
+      panelFamily === null
+        ? ''
+        : panelFamily === 'edge'
+          ? typeof placeEdgeKind === 'string' && placeEdgeKind.length > 0
+            ? placeEdgeKind
+            : lastLineKindRef.current
+          : placeFamily === panelFamily && typeof placeTool === 'string'
+            ? placeTool
+            : focusFamily === panelFamily
+              ? focusShape
+              : defaultShapeOfFamily(panelFamily, menuShape)
+
+    const hoverHandlers = (key) => ({
+      onEnter: () => openRailHover(key),
+      onLeave: () => scheduleCloseRailFamilyPanel(),
+    })
+
+    const chips = [React.createElement('div', { key: 'rail-cap', className: 'drawai-rail-cap' })]
+    for (let i = 0; i < RAIL_FAMILIES.length; i += 1) {
+      const entry = RAIL_FAMILIES[i]
+      const on = placeFamily === entry.family || railOpenFamily === entry.family || focusFamily === entry.family
+      const armed = entry.family === 'edge' ? placeEdgeKind !== null : placeFamily === entry.family
+      // 母图标跟当前子类型走：放置中 > 选中/悬停 > 族缺省。
+      let face = null
+      if (entry.family === 'edge') {
+        const kind =
+          typeof placeEdgeKind === 'string' && placeEdgeKind.length > 0
+            ? placeEdgeKind
+            : lastLineKindRef.current
+        face = railEdgeFace(kind)
+      } else if (entry.family === 'shape') {
+        const shape =
+          placeFamily === 'shape' && typeof placeTool === 'string'
+            ? placeTool
+            : focusFamily === 'shape' && focusShape.length > 0
+              ? focusShape
+              : defaultShapeOfFamily('shape', menuShape)
+        face = railShapeFace(shape)
+      }
+      chips.push(
+        railIconButton(
+          'rail-fam-' + entry.family,
+          entry.icon,
+          on,
+          armed ? '取消放置' : entry.label,
+          () => pickFamilyFromRail(entry.family),
+          hoverHandlers(entry.family),
+          face,
+        ),
+      )
+    }
+
+    const activeTaskCount = backgroundDrawingJobs.concat(videoExportJobs).filter((job) =>
+      !['succeeded', 'done', 'cancelled', 'failed', 'error'].includes(job.status)).length
+    chips.push(React.createElement('div', { key: 'tasks-separator', className: 'drawai-rail-sep', style: { marginTop: 'auto' } }),
+      React.createElement('button', {
+        key: 'rail-tasks', type: 'button', className: 'drawai-rail-chip' + (showTaskList ? ' on' : ''),
+        style: { position: 'relative' }, 'aria-label': showTaskList ? '隐藏任务列表' : '展开任务列表', 'aria-expanded': showTaskList,
+        title: '后台任务' + (activeTaskCount ? ' · ' + activeTaskCount + ' 项进行中' : ''),
+        onClick: () => patchPrefs({ showTaskList: !showTaskList }),
+      }, railIcon('tasks'), activeTaskCount ? React.createElement('span', { 'aria-hidden': true,
+        style: { position: 'absolute', top: 0, right: 0, borderRadius: 8, padding: '1px 4px', fontSize: 10, background: 'var(--dsw-alias-brand-primary,#3370ff)', color: '#fff', lineHeight: '14px' },
+      }, activeTaskCount > 99 ? '99+' : activeTaskCount) : null))
+
+    const rail = React.createElement(
+      'div',
+      { className: 'drawai-rail', 'aria-label': '元素工具栏' },
+      chips,
+    )
+
+    let panel = null
+    if (panelFamily !== null) {
+      const variants = shapesInFamily(panelFamily)
+      const replacing = panelFamily === 'edge' ? false : focusFamily === panelFamily
+      const topPx = railHoverTopPx(panelFamily)
+      const panelChips = [
+        React.createElement(
+          'div',
+          { key: 'panel-title', className: 'drawai-rail-panel-title' },
+          panelFamily === 'edge'
+            ? replacing
+              ? '换成线型'
+              : '选择线型'
+            : replacing
+              ? '换成同族形状'
+              : '选择形状',
+        ),
+      ]
+      for (let i = 0; i < variants.length; i += 1) {
+        const entry = variants[i]
+        if (panelFamily === 'edge') {
+          panelChips.push(
+            railLineButton(
+              'rail-line-' + entry.shape,
+              entry.shape,
+              panelCurrent === entry.shape,
+              entry.label,
+              () => pickVariantFromRail(entry.shape),
+            ),
+          )
+        } else {
+          panelChips.push(
+            railShapeButton(
+              'rail-var-' + entry.shape,
+              entry.shape,
+              panelCurrent === entry.shape,
+              entry.label,
+              () => pickVariantFromRail(entry.shape),
+            ),
+          )
+        }
+      }
+      panel = React.createElement(
+        'div',
+        {
+          className: 'drawai-rail-panel',
+          style: { top: topPx + 'px' },
+          onPointerEnter: () => openRailHover(panelFamily),
+          onPointerLeave: () => scheduleCloseRailFamilyPanel(),
+        },
+        panelChips,
+      )
+    } else if (typeof tipLabel === 'string' && tipLabel.length > 0) {
+      panel = React.createElement(
+        'div',
+        {
+          className: 'drawai-rail-tip',
+          style: { top: railHoverTopPx(railOpenFamily) + 6 + 'px' },
+          role: 'tooltip',
+        },
+        tipLabel,
+      )
+    }
+
+    return React.createElement('div', { className: 'drawai-rail-wrap' }, rail, panel)
+  }
+
+  /**
+   * 字号行：节点标签、边标签、独立文字**共用**这一个控件（"文字的字号均可修改"）。
+   *
+   * 落盘还是 drawio 的 `fontSize` 键（缺省不写键）。「默认」= 删键回到各自缺省
+   * （节点/文字 12、连线 10），其余是常用档位。
+   */
+  function fontSizeRow(style, apply) {
+    const current = styleNumber(style, 'fontSize', null)
+    // 档位里**没有「默认」这一项**：它唯一的作用是删掉 fontSize 键，而看到的样子和"选中那个
+    // 等价档位"完全一样（节点缺省 12、连线缺省 10 —— 两个都在下面这排档位里）。
+    // 一个"选了等于没选"的选项只会让人犹豫。
+    const items = FONT_SIZE_PRESETS.map((n) => [n, String(n)])
+    const cells = items.map((it) =>
+      React.createElement(
+        'button',
+        {
+          key: 'fs-' + String(it[0]),
+          className: 'drawai-btn' + (String(current) === String(it[0]) ? ' on' : ''),
+          title: '字号 ' + it[0] + 'px',
+          onClick: () => {
+            if (String(current) !== String(it[0])) apply(it[0])
+            closeSelect()
+          },
+        },
+        it[1],
+      ),
+    )
+    // 手动调节：`−` [输入框] `＋` —— 档位之外的任意整数（8…72）都能用。
+    // 输入框是**非受控**的：key 里带上当前值，值一变就重挂（于是步进之后显示的就是新值），
+    // 而打字过程中不改文档（回车或失焦才落盘），与"双击改标签"同一套节奏。
+    const commit = (raw, close) => {
+      const next = clampFontSize(raw)
+      if (next === null) return
+      if (next !== current) apply(next)
+      if (close === true) closeSelect()
+    }
+    const step = (delta) => {
+      const base = current === null ? FONT_SIZE_PRESETS[1] : current
+      const next = Math.min(FONT_SIZE_MAX, Math.max(FONT_SIZE_MIN, base + delta))
+      if (next !== current) apply(next)
+    }
+    cells.push(
+      React.createElement('button', { key: 'fs-minus', className: 'drawai-btn', title: '小一号', onClick: () => step(-1) }, '−'),
+      React.createElement('input', {
+        key: 'fs-input-' + String(current),
+        className: 'drawai-fontsize',
+        type: 'number',
+        min: FONT_SIZE_MIN,
+        max: FONT_SIZE_MAX,
+        step: 1,
+        defaultValue: current === null ? '' : String(current),
+        placeholder: '字号',
+        'aria-label': '字号',
+        onKeyDown: (event) => {
+          if (event.key === 'Enter') {
+            event.preventDefault()
+            commit(event.target.value, true)
+          } else if (event.key === 'Escape') {
+            event.preventDefault()
+            closeSelect()
+          }
+        },
+        onBlur: (event) => commit(event.target.value, false),
+      }),
+      React.createElement('button', { key: 'fs-plus', className: 'drawai-btn', title: '大一号', onClick: () => step(1) }, '＋'),
+    )
+    return React.createElement('div', { className: 'drawai-fontrow' }, cells)
+  }
+
+  /**
+   * 把若干"类"渲染成**一行横排的当前值按钮** + （打开的那一类的）选项体。
+   *
+   * 一类只占一个按钮：`配色：蓝 ▾`，几个类并排在同一行里（放不下就换行 —— 右栏窄，
+   * 连线的四类会折成两行）。点某一类才把它的选项铺在下面**整行**里。
+   *
+   * 以前两类做法都试过：全部选项铺在菜单里（一屏都是按钮、看不出现在是什么）、
+   * 一类占一整行（菜单太矮太长的竖条）。现在这样菜单更矮，一眼能看到每一类的当前值。
+   *
+   * **形状不走这里**：入口是右侧常驻元素条（`renderShapeRail`）。这里剩下的是配色/字色/字号/线型/箭头。
+   *
+   * 展开状态记在 menu 对象上（`menu.openKey`）—— 换一个元素右键时 menu 是新对象，下拉自然收起；
+   * 同一个菜单里点另一类会把上一类收起来。
+   *
+   * @param {Array} cats [{ key, label, value, hint, body }]
+   * @returns 要 push 进 rows 的元素数组
+   */
+  function menuSelectRow(cats) {
+    const chips = cats.map((cat) => {
+      const open = menu.openKey === cat.key
+      return React.createElement(
+        'button',
+        {
+          key: 'sel-' + cat.key,
+          className: 'drawai-btn drawai-select-chip' + (open ? ' on' : ''),
+          'aria-label': cat.label,
+          onClick: () => setMenu(Object.assign({}, menu, { openKey: open ? null : cat.key })),
+        },
+        cat.label + '：' + cat.value,
+        React.createElement('span', { className: 'drawai-menu-caret' }, open ? '▴' : '▾'),
+      )
+    })
+    const out = [React.createElement('div', { key: 'chips', className: 'drawai-select-chips' }, chips)]
+    for (let i = 0; i < cats.length; i += 1) {
+      if (menu.openKey !== cats[i].key) continue
+      out.push(React.createElement('div', { key: 'body-' + cats[i].key, className: 'drawai-menu-select-body' }, cats[i].body))
+    }
+    return out
+  }
+
+  /** 选完一个值就把下拉收起来（菜单回到"只有那一行当前值"的样子）。 */
+  function closeSelect() {
+    setMenu(Object.assign({}, menu, { openKey: null }))
+  }
+
+  function renderMenu() {
+    if (menu === null) return null
+    const rows = []
+
+    // 「编辑数据…」面板：数据就是 drawio 用户对象上的自定义属性，摊成 key=value 几行来改。
+    if (menu.kind === 'data') {
+      const dataKind = menu.dataKind === 'edge' ? 'edge' : 'node'
+      rows.push(menuTitle(dataKind === 'edge' ? '连线的数据' : '节点的数据'))
+      rows.push(
+        React.createElement('textarea', {
+          key: 'data-text',
+          className: 'drawai-data',
+          autoFocus: true,
+          rows: 6,
+          value: typeof menu.text === 'string' ? menu.text : '',
+          placeholder: '每行一项，形如：\nsubnet=192.168.0\nowner=我',
+          onChange: (event) => setMenu(Object.assign({}, menu, { text: event.target.value })),
+          onKeyDown: (event) => {
+            if (event.key === 'Escape') {
+              event.preventDefault()
+              setMenu(null)
+            }
+          },
+        }),
+      )
+      rows.push(React.createElement('div', { className: 'drawai-note' }, '空行与 # 开头的行忽略；没有 = 的行也忽略。这些属性写在 <object> 上，drawio 同样认。'))
+      rows.push(
+        React.createElement(
+          'div',
+          { className: 'drawai-menu-row' },
+          React.createElement('button', { className: 'drawai-btn', onClick: () => commitDataEditor(dataKind, menu.id, menu.text) }, '保存'),
+          React.createElement('button', { className: 'drawai-btn', onClick: () => setMenu(null) }, '取消'),
+        ),
+      )
+      const leftD = Math.max(0, Math.min(menu.left, size.w - 214))
+      const topD = Math.max(0, Math.min(menu.top, size.h - 8))
+      return React.createElement('div', { className: 'drawai-menu', style: { left: leftD + 'px', top: topD + 'px' } }, rows)
+    }
+
+    // 「SVG 内容…」面板：svg 节点的图形标记就是一段文本，摊在多行框里改（与「编辑数据…」同一套）。
+    if (menu.kind === 'svg') {
+      rows.push(menuTitle('SVG 图形内容'))
+      rows.push(
+        React.createElement('textarea', {
+          key: 'svg-text',
+          className: 'drawai-data',
+          autoFocus: true,
+          // 8 行 + 可拖高（resize:vertical）：右栏窄，行数再大一点这个面板就会顶到画布下沿。
+          rows: 8,
+          value: typeof menu.text === 'string' ? menu.text : '',
+          placeholder: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">\n  <circle cx="12" cy="12" r="9"/>\n</svg>',
+          onChange: (event) => setMenu(Object.assign({}, menu, { text: event.target.value })),
+          onKeyDown: (event) => {
+            if (event.key === 'Escape') {
+              event.preventDefault()
+              setMenu(null)
+            }
+          },
+        }),
+      )
+      rows.push(
+        React.createElement(
+          'div',
+          { className: 'drawai-note' },
+          '整段替换（没有"只改某一根线"）。要带 viewBox（否则放大缩小时图形不跟着变）；' +
+            '颜色写在标记自己身上（fill/stroke）。留空保存 = 清掉内容、这个节点回到矩形。',
+        ),
+      )
+      rows.push(
+        React.createElement(
+          'div',
+          { className: 'drawai-menu-row' },
+          React.createElement('button', { className: 'drawai-btn', onClick: () => commitSvgEditor(menu.id, menu.text) }, '保存'),
+          React.createElement('button', { className: 'drawai-btn', onClick: () => setMenu(null) }, '取消'),
+        ),
+      )
+      const leftS = Math.max(0, Math.min(menu.left, size.w - 214))
+      const topS = Math.max(0, Math.min(menu.top, size.h - 8))
+      return React.createElement('div', { className: 'drawai-menu', style: { left: leftS + 'px', top: topS + 'px' } }, rows)
+    }
+
+    if (menu.kind === 'canvas') {
+      rows.push(menuTitle('画布'))
+      rows.push(React.createElement('div', { className: 'drawai-menu-row' },
+        React.createElement('button', { className: 'drawai-btn', disabled: !canUndo, onClick: () => { undo(); setMenu(null) }, title: 'Ctrl+Z' }, '撤销'),
+        React.createElement('button', { className: 'drawai-btn', disabled: !canRedo, onClick: () => { redo(); setMenu(null) }, title: 'Ctrl+Shift+Z' }, '重做'),
+        React.createElement('button', { className: 'drawai-btn', onClick: selectAll, title: 'Ctrl+A' }, '全选'),
+      ))
+    } else if (menu.kind === 'multi') {
+      // 多选右键：对齐 / 分布。放在菜单而不是常驻工具条，是为了不挤压右栏宽度 ——
+      // 这两个操作是"偶尔批量收拾一下"，不是常驻动作。
+      const count = selectedIds.length
+      rows.push(menuTitle('已选 ' + count + ' 个节点 —— 对齐 / 分布'))
+      const alignRow = (items) =>
+        React.createElement(
+          'div',
+          { className: 'drawai-menu-row' },
+          items.map((it) => React.createElement('button', { key: it[0], className: 'drawai-btn', onClick: () => alignSelection(it[0]) }, it[1])),
+        )
+      rows.push(alignRow([['left', '左对齐'], ['centerX', '水平居中'], ['right', '右对齐']]))
+      rows.push(alignRow([['top', '顶对齐'], ['centerY', '垂直居中'], ['bottom', '底对齐']]))
+      // 分布至少需要 3 个节点（两个之间没有"间距"可均分），不够就给禁用态而不是点了没反应。
+      const canDistribute = count >= 3
+      rows.push(
+        React.createElement(
+          'div',
+          { className: 'drawai-menu-row' },
+          React.createElement('button', { className: 'drawai-btn', onClick: () => alignSelection('distributeX'), disabled: !canDistribute, title: canDistribute ? '水平等距' : '需要选中至少 3 个节点' }, '水平等距'),
+          React.createElement('button', { className: 'drawai-btn', onClick: () => alignSelection('distributeY'), disabled: !canDistribute, title: canDistribute ? '垂直等距' : '需要选中至少 3 个节点' }, '垂直等距'),
+        ),
+      )
+    } else if (menu.kind === 'node') {
+      const node = nodeById(menu.id)
+      const label = node !== null && typeof node.label === 'string' ? node.label : menu.id
+      const nodeStyle = node === null || typeof node.style !== 'string' ? '' : node.style
+      // 点中的节点在选区里 → 形状/配色对**整组节点**生效（与删除/拖动/对齐一致）。
+      const nodeTargets = styleTargets(selectedIds, menu.id, (id) => nodeById(id) !== null)
+      rows.push(menuTitle('节点：' + label + (nodeTargets.length > 1 ? '（共 ' + nodeTargets.length + ' 个）' : '')))
+      // 换形走右侧常驻元素条（悬停/选中后点同族形状）；右键只留配色/字色/字号与动作。
+      const currentShape = nodeShapeFromStyle(nodeStyle)
+      const showsLabel = node !== null && nodeShowsLabel(node)
+      const labelOnlyColor = showsLabel && ['text', 'svg'].includes(currentShape)
+      if (showsLabel) rows.push.apply(
+        rows,
+        menuSelectRow([
+          {
+            key: 'color',
+            label: labelOnlyColor ? '字色' : '配色',
+            value: styleSummary(nodeStyle, 'color'),
+            hint: labelOnlyColor ? '标签文字的颜色' : '填充与描边',
+            body: swatchRow(
+              (color) => {
+                applyLocal((next) => {
+                  for (const target of next.nodes) {
+                    if (!nodeTargets.includes(target.id)) continue
+                    const nodeStyle = target.style || ''
+                    target.style = labelOnlyColor ? styleWithTextColorName(nodeStyle, color) : styleWithColorName(nodeStyle, color)
+                  }
+                })
+                closeSelect()
+              },
+              labelOnlyColor ? textColorNameFromStyle(nodeStyle) : colorNameFromStyle(nodeStyle),
+              labelOnlyColor ? 'font' : undefined,
+            ),
+          },
+          // 字色：普通节点也能改标签颜色（`fontColor` 键）。独立文字上面那一类已经是字色了，
+          // 再给一类就是同一件事的两个入口 —— 所以只对"有填充描边"的元素出现。
+          ...(labelOnlyColor
+            ? []
+            : [
+                {
+                  key: 'fontColor',
+                  label: '字色',
+                  value: styleSummary(nodeStyle, 'fontColor'),
+                  hint: '标签文字的颜色',
+                  body: swatchRow(
+                    (color) => {
+                      updateNode(nodeTargets, { style: styleWithTextColorName(nodeStyle, color) })
+                      closeSelect()
+                    },
+                    textColorNameFromStyle(nodeStyle),
+                    'font',
+                  ),
+                },
+              ]),
+          {
+            key: 'fontSize',
+            label: '字号',
+            value: styleSummary(nodeStyle, 'fontSize'),
+            body: fontSizeRow(nodeStyle, (v) => {
+              updateNode(nodeTargets, { style: stylePatch(nodeStyle, { fontSize: v === null ? null : String(v) }) })
+            }),
+          },
+        ]),
+      )
+      rows.push(
+        React.createElement(
+          'div',
+          { className: 'drawai-menu-row' },
+          showsLabel ? React.createElement('button', { className: 'drawai-btn', onClick: () => openNodeEditor(menu.id) }, '改标签') : null,
+          nodeImageExportInfo(node) ? React.createElement('button', {
+            className: 'drawai-btn', onClick: () => exportNodeImage(node),
+          }, currentShape === 'svg' ? '导出 SVG' : '导出图片') : null,
+          nodeImageExportInfo(node)?.mime === 'image/svg+xml' ? React.createElement('button', {
+            className: 'drawai-btn', onClick: () => exportNodeImage(node, 'png'),
+          }, '导出 PNG') : null,
+          // 仅编辑已有 SVG 内容；右键不提供跨类别创建或转换入口。
+          currentShape === 'svg' && isVideoNodeData(node.data) === false ? React.createElement(
+            'button',
+            {
+              className: 'drawai-btn',
+              onClick: () => openSvgEditor(menu.id),
+            },
+            'SVG 内容…',
+          ) : null,
+          isVideoNodeData(node.data)
+            ? React.createElement(
+                'button',
+                {
+                  className: 'drawai-btn',
+                  onClick: async () => {
+                    setMenu(null)
+                    const meta = videoMetaOf(node)
+                    if (meta === null) return
+                    const r = await mediaAction('media-export-source', { clip: meta.clip })
+                    if (r !== null) setSaveNote('已导出源视频 ' + r.path)
+                  },
+                },
+                '导出源视频…',
+              )
+            : null,
+          isVideoNodeData(node.data)
+            ? React.createElement(
+                'button',
+                {
+                  className: 'drawai-btn',
+                  onClick: async () => {
+                    setMenu(null)
+                    await startVideoPlayback(node)
+                  },
+                },
+                '播放视频',
+              )
+            : null,
+          currentShape === 'section'
+            ? React.createElement(
+                'button',
+                {
+                  className: 'drawai-btn',
+                  onClick: () => dissolveSection(menu.id),
+                },
+                '解散分区',
+              )
+            : null,
+          React.createElement('button', { className: 'drawai-btn', onClick: () => deleteById(menu.id) }, '删除'),
+          React.createElement('button', { className: 'drawai-btn', onClick: () => openDataEditor('node', menu.id) }, '编辑数据…'),
+        ),
+      )
+      // 字号：节点标签与独立文字共用这套控件（文字元素没有填充描边，字号是它少数能改的东西）。
+      // 已在上面那排"当前值"里，这里不再重复。
+      rows.push(
+        React.createElement(
+          'div',
+          { className: 'drawai-menu-row' },
+          React.createElement('button', { className: 'drawai-btn', onClick: () => reorderItem('node', menu.id, 'front'), title: '置顶（压在其它节点上面）' }, '置顶'),
+          React.createElement('button', { className: 'drawai-btn', onClick: () => reorderItem('node', menu.id, 'up'), title: '上移一层' }, '上移'),
+          React.createElement('button', { className: 'drawai-btn', onClick: () => reorderItem('node', menu.id, 'down'), title: '下移一层' }, '下移'),
+          React.createElement('button', { className: 'drawai-btn', onClick: () => reorderItem('node', menu.id, 'back'), title: '置底（压到其它节点下面）' }, '置底'),
+        ),
+      )
+    } else {
+      const edge = edgeById(menu.id)
+      const hasLabel = edge !== null && typeof edge.label === 'string' && edge.label.length > 0
+      // 「自动路由」的显示条件：有折点**或**两端被钉住了侧（两者都属于"人工干预过"）。
+      const edgeStyleText = edge !== null && typeof edge.style === 'string' ? edge.style : ''
+      const hasWaypoints =
+        edge !== null &&
+        ((Array.isArray(edge.points) && edge.points.length > 0) ||
+          sideFromStyle(edgeStyleText, 'source') !== null ||
+          sideFromStyle(edgeStyleText, 'target') !== null)
+      // 连线菜单同理：点中的连线在选区里 → 线型/箭头/颜色对**整组连线**生效。
+      const edgeTargets = styleTargets(selectedIds, menu.id, (id) => edgeById(id) !== null)
+      rows.push(menuTitle('连线' + (hasLabel ? '：' + edge.label : '') + (edgeTargets.length > 1 ? '（共 ' + edgeTargets.length + ' 条）' : '')))
+      const actions = [React.createElement('button', { key: 'edit', className: 'drawai-btn', onClick: () => openEdgeEditor(menu.id) }, '改标签')]
+      // 拖过标签才会出现：把它放回弧长中点（drawio 里是"把标签拖回去"）。
+      if (edge !== null && Number.isFinite(Number(edge.labelX)) && Number.isFinite(Number(edge.labelY))) {
+        actions.push(React.createElement('button', { key: 'center', className: 'drawai-btn', onClick: () => centerEdgeLabel(menu.id), title: '标签回到线段中点' }, '标签居中'))
+      }
+      if (hasWaypoints) {
+        actions.push(React.createElement('button', { key: 'auto', className: 'drawai-btn', onClick: () => clearEdgeWaypoints(menu.id) }, '自动路由'))
+      }
+      actions.push(React.createElement('button', { key: 'del', className: 'drawai-btn', onClick: () => deleteById(menu.id) }, '删除'))
+      rows.push(React.createElement('div', { className: 'drawai-menu-row' }, actions))
+
+      // 连线的画法。落盘是 style 键（dashed/dashPattern/endArrow/startArrow/strokeColor），
+      // 这里只是它的手工入口 —— AI 侧走同一个 setStyle（dash/arrow/color 是糖），两边改的是同一批键。
+      // 四类各占一行、**只显示当前值**（线型：直角折线 ▾ / 样式：实线 ▾ / 箭头：→ 单向 ▾ / 字号：默认 ▾），
+      // 选项在各自的下拉里 —— 以前一屏铺 3+4+4+6 个按钮，看不出"现在是什么"。
+      const edgeBaseStyle = edge === null || typeof edge.style !== 'string' ? DEFAULT_EDGE_STYLE : edge.style
+      const edgeDashNow = edge === null ? 'solid' : dashFromStyle(edgeBaseStyle)
+      const edgeArrowNow = edge === null ? 'end' : arrowFromStyle(edgeBaseStyle)
+      const dashRow = (items) =>
+        React.createElement(
+          'div',
+          { className: 'drawai-menu-row', style: { marginTop: 0, paddingTop: 0, borderTop: 'none' } },
+          items.map((it) =>
+            React.createElement(
+              'button',
+              {
+                key: it[0],
+                className: 'drawai-btn' + (edgeDashNow === it[0] ? ' on' : ''),
+                onClick: () => {
+                  updateEdge(edgeTargets, { dash: it[0] })
+                  closeSelect()
+                },
+              },
+              it[1],
+            ),
+          ),
+        )
+      // 字号那一行由 menuSelectRow 统一收进去（点 `＋`/`−` 或输入框时**不收起**，
+      // 这样才能连点几下微调；档位按钮自己会收起）。
+      // 线型（drawio 的两组键压平成四选一，见内核 styleWithLineKind）：
+      //   直线 / 直角折线 / 圆角折线（只在折点处倒角，rounded=1）/ 曲线（curved=1）。
+      // 直线会顺手清掉折点，曲线会给"本来就笔直"的那种边补一个弓形中点 —— 理由见 applyLineKind。
+      const edgeLineNow = edge === null ? 'sharp' : lineKindFromStyle(edgeBaseStyle)
+      const lineRow = (items) =>
+        React.createElement(
+          'div',
+          { className: 'drawai-menu-row', style: { marginTop: 0, paddingTop: 0, borderTop: 'none' } },
+          items.map((it) =>
+            React.createElement(
+              'button',
+              {
+                key: it[0],
+                className: 'drawai-btn' + (edgeLineNow === it[0] ? ' on' : ''),
+                title: it[2],
+                onClick: () => {
+                  applyLineKind(edgeTargets, it[0])
+                  closeSelect()
+                },
+              },
+              it[1],
+            ),
+          ),
+        )
+      const arrowRow = (items) =>
+        React.createElement(
+          'div',
+          { className: 'drawai-menu-row', style: { marginTop: 0, paddingTop: 0, borderTop: 'none' } },
+          items.map((it) =>
+            React.createElement(
+              'button',
+              {
+                key: it[0],
+                className: 'drawai-btn' + (edgeArrowNow === it[0] ? ' on' : ''),
+                onClick: () => {
+                  updateEdge(edgeTargets, { arrow: it[0] })
+                  closeSelect()
+                },
+              },
+              it[1],
+            ),
+          ),
+        )
+      // 四类并排在同一行里（右栏放不下会自动折成两行），各自只显示当前值；
+      // 点开的那一类把选项铺在下面整行里。
+      // 字号那一类是唯一**点了不收起**的：`−`/`＋`/输入框要能连点微调（档位按钮自己会收起）。
+      rows.push.apply(
+        rows,
+        menuSelectRow([
+          {
+            key: 'line',
+            label: '线型',
+            value: LINE_KIND_LABELS[edgeLineNow],
+            body: lineRow([
+              ['straight', '直线', '两点之间一条直线，不带折点'],
+              ['sharp', '直角折线', '正交折线，折点是尖角（drawio 的 Sharp）'],
+              ['rounded', '圆角折线', '正交折线，只在折点处倒圆角（rounded=1；半径跟 drawio 一样，缺省 10px）'],
+              ['curved', '曲线', '把整条折线抹成平滑曲线；本来笔直的那种会补一个弓形中点，弧才看得见'],
+            ]),
+          },
+          {
+            key: 'dash',
+            label: '样式',
+            value: DASH_LABELS[edgeDashNow],
+            body: dashRow([['solid', '实线'], ['dashed', '虚线'], ['dotted', '点线']]),
+          },
+          {
+            key: 'arrow',
+            label: '箭头',
+            value: ARROW_LABELS[edgeArrowNow],
+            body: arrowRow([['end', '→ 单向'], ['both', '↔ 双向'], ['none', '— 无箭头'], ['start', '← 反向']]),
+          },
+          {
+            key: 'fontSize',
+            label: '字号',
+            value: styleSummary(edgeBaseStyle, 'fontSize'),
+            hint: '线上的文字（边自己的 value 与挂在上面的标签）',
+            body: fontSizeRow(edgeBaseStyle, (v) => {
+              updateEdge(edgeTargets, { fontSize: v })
+            }),
+          },
+          // 字色：连线上的文字。与上面「字号」同一批作用对象（边自己的 value + 挂在边上的标签单元）。
+          {
+            key: 'fontColor',
+            label: '字色',
+            value: styleSummary(edgeBaseStyle, 'fontColor'),
+            hint: '线上的文字颜色',
+            body: swatchRow(
+              (color) => {
+                updateEdge(edgeTargets, { fontColor: color })
+                closeSelect()
+              },
+              textColorNameFromStyle(edgeBaseStyle),
+              'font',
+            ),
+          },
+        ]),
+      )
+      rows.push(
+        React.createElement(
+          'div',
+          { className: 'drawai-menu-row' },
+          React.createElement('button', { className: 'drawai-btn', onClick: () => reorderItem('edge', menu.id, 'front'), title: '置顶（压在其它连线上面）' }, '置顶'),
+          React.createElement('button', { className: 'drawai-btn', onClick: () => reorderItem('edge', menu.id, 'up'), title: '上移一层' }, '上移'),
+          React.createElement('button', { className: 'drawai-btn', onClick: () => reorderItem('edge', menu.id, 'down'), title: '下移一层' }, '下移'),
+          React.createElement('button', { className: 'drawai-btn', onClick: () => reorderItem('edge', menu.id, 'back'), title: '置底' }, '置底'),
+        ),
+      )
+      rows.push(
+        React.createElement(
+          'div',
+          { className: 'drawai-menu-row' },
+          React.createElement('button', { className: 'drawai-btn', onClick: () => openDataEditor('edge', menu.id) }, '编辑数据…'),
+          React.createElement('button', { className: 'drawai-btn', onClick: () => deleteById(menu.id) }, '删除连线'),
+        ),
+      )
+    }
+
+    // 所有普通右键菜单共用编辑入口，不再承担创建元素的职责。
+    const canCopy = collectClipboard(docRef.current, selectedIds) !== null
+    rows.push(React.createElement('div', { className: 'drawai-menu-row' },
+      React.createElement('button', { className: 'drawai-btn', disabled: !canCopy, onClick: copySelection, title: 'Ctrl+C' }, '复制'),
+      React.createElement('button', { className: 'drawai-btn', disabled: !canCopy, onClick: cutSelection, title: 'Ctrl+X' }, '剪切'),
+      React.createElement('button', { className: 'drawai-btn', disabled: clipboard === null || activeLayerLocked(), onClick: pasteClipboard, title: 'Ctrl+V' }, '粘贴'),
+      menu.kind === 'multi' ? React.createElement('button', { className: 'drawai-btn', onClick: deleteSelected }, '删除') : null,
+    ))
+
+    // 夹在画布内：容器是 overflow:hidden，菜单贴边弹出会被裁掉。
+    const left = Math.max(0, Math.min(menu.left, size.w - 214))
+    const top = Math.max(0, Math.min(menu.top, size.h - 8))
+    // 菜单宽度由内容决定，而"当前值"chips 横排之后可能比 214px 宽（连线的四类放不下会折行）。
+    // 再夹一道最大宽度，保证它绝不越过画布右边缘 —— 多出来的宽度由 chips 自己换行消化。
+    const maxWidth = size.w > 0 ? Math.max(180, size.w - left - 8) : undefined
+    return React.createElement(
+      'div',
+      { className: 'drawai-menu', style: { left: left + 'px', top: top + 'px', maxWidth: maxWidth === undefined ? undefined : maxWidth + 'px' } },
+      rows,
+    )
+  }
+
+  /** 新建 / 打开 的弹出面板。复用 drawai-menu 的样式，位置固定在画布左上角下面。 */
+  function renderDocMenu() {
+    if (docMenu === null) return null
+    if (docMenu === 'export') {
+      const width = Math.min(300, Math.max(180, size.w - 8))
+      return React.createElement('div', { className: 'drawai-menu drawai-docmenu drawai-special-panel', style: Object.assign({}, panelStyle(docMenuPos, width), { width: width + 'px', maxHeight: Math.max(150, size.h - 12) + 'px', overflowY: 'auto' }) },
+        React.createElement(ExportPanel, { doc, path: hasPath ? target : 'diagram', selectedIds, prefs, mode, activeLayerId, pageIndex, onPrefs: patchPrefs,
+          onEstimate: prepareExport,
+          onExport: (request) => { setExportRequest(request); setDocMenu(null); setDocMenuPos(null) },
+        }))
+    }
+    if (docMenu === 'layers') {
+      const width = Math.min(360, Math.max(180, size.w - 8))
+      return React.createElement('div', { className: 'drawai-menu drawai-docmenu drawai-special-panel', style: Object.assign({}, panelStyle(docMenuPos, width), { width: width + 'px', maxHeight: Math.max(150, size.h - 12) + 'px' }) },
+        React.createElement(LayersPanel, { doc, activeId: activeLayerId, selectedIds, mode, uid,
+          onSelect: setCurrentLayerId, onVisible: toggleLayerVisible, onLocked: toggleLayerLocked,
+          onRename: (id, name) => {
+            const current = docRef.current
+            const layer = current && Array.isArray(current.layers) ? current.layers.find((layer) => layer.id === id) : null
+            if (!layer || layer.name === name) return
+            applyLocal((next) => renameLayerInDoc(next, id, name))
+          },
+          onCreate: createLayer, onRemove: removeLayer, onMove: moveSelectionToLayer,
+        }))
+    }
+    // **先把状态归一化**，后面的代码才敢直接读 .error / .files。
+    //
+    // 这里崩过一次，报错就长这样：
+    //   DrawAI 渲染异常（已降级，画布未渲染）Cannot read properties of null (reading 'length')
+    // 原因是 fileList 有三个字段（files / error）却被当成"一定有"来读，
+    // 只要任何一处 setState 传进来的形状差一点（null、缺字段），整个画布就直接降级成红底错误页。
+    // 渲染函数不该假设状态形状 —— 拿不准的就当场兜住。
+    const list = fileList !== null && typeof fileList === 'object' ? fileList : null
+    const listError = list !== null && typeof list.error === 'string' ? list.error : ''
+    const listFiles = list !== null && Array.isArray(list.files) ? list.files : null
+
+    // 工具条下拉菜单（文件 / 编辑 / 视图 / 导出）：docMenu 的值就是菜单的 key。
+    const toolbarMenu = toolbarMenus().filter((m) => m.key === docMenu)[0]
+    if (toolbarMenu !== undefined) {
+      const rows = [menuTitle(toolbarMenu.label)]
+      for (let i = 0; i < toolbarMenu.items.length; i += 1) {
+        const entry = toolbarMenu.items[i]
+        if (i > 0 && entry.group !== toolbarMenu.items[i - 1].group) rows.push(React.createElement('div', { key: 'sep-' + i, className: 'drawai-menu-separator' }))
+        rows.push(
+          React.createElement(
+            'button',
+            {
+              key: 'mi' + i,
+              className: 'drawai-btn drawai-menu-item',
+              disabled: entry.disabled === true,
+              onClick: () => {
+                // keepOpen：图层的显示/隐藏、切换当前层要能连点几下（drawio 的图层面板也不关）。
+                if (entry.keepOpen !== true) {
+                  setDocMenu(null)
+                  setDocMenuPos(null)
+                }
+                entry.onClick()
+              },
+            },
+            React.createElement('span', { className: 'drawai-menu-label' }, entry.label),
+            entry.shortcut ? React.createElement('span', { className: 'drawai-menu-shortcut' }, entry.shortcut) : null,
+            entry.hint.length > 0 ? React.createElement('span', { className: 'drawai-menu-hint' }, entry.hint) : null,
+          ),
+        )
+      }
+      if (docMenu === 'view' && pageCount > 1) rows.push(React.createElement('label', { className: 'drawai-page-picker' }, '页面',
+        React.createElement('select', { 'aria-label': '切换页面', value: pageIndex, onChange: (event) => switchPage(Number(event.target.value)) },
+          Array.from({ length: pageCount }, (_, index) => React.createElement('option', { key: index, value: index }, '第 ' + (index + 1) + ' / ' + pageCount + ' 页')))))
+      return React.createElement('div', { className: 'drawai-menu drawai-docmenu', style: panelStyle(docMenuPos) }, rows)
+    }
+    // 宿主把"列不出来"的原因也带回来了 —— 必须显示，否则用户只看到"找不到文件"，无从判断。
+    const listNotes = list !== null && Array.isArray(list.notes) ? list.notes : []
+    const rows = []
+    if (docMenu === 'open') {
+      rows.push(menuTitle('打开画布 —— 用文件管理器选一个目录'))
+      if (list === null) {
+        rows.push(React.createElement('div', { className: 'drawai-note' }, '读取中…'))
+      } else if (listError.length > 0) {
+        rows.push(React.createElement('div', { className: 'drawai-err' }, listError))
+      } else if (listFiles === null) {
+        rows.push(React.createElement('div', { className: 'drawai-note' }, '读取中…'))
+      } else if (listFiles.length === 0) {
+        rows.push(React.createElement('div', { className: 'drawai-note' }, '这个目录里没有 .drawio —— 换一个目录，或用「新建」建一张'))
+      } else {
+        const items = []
+        for (let i = 0; i < listFiles.length; i += 1) {
+          const item = listFiles[i]
+          // 每一项形如 { path, display }：path 是身份（绝对路径，用于去重和绑定），
+          // display 是给人看/点的名字。宿主若没给 absolute，path 就是相对路径，照样能用。
+          const identity = item !== null && typeof item === 'object' && typeof item.path === 'string' ? item.path : null
+          const label = item !== null && typeof item === 'object' && typeof item.display === 'string' ? item.display : identity
+          if (identity === null || identity.length === 0 || label === null) continue
+          const current = identity === target
+          items.push(
+            React.createElement(
+              'button',
+              {
+                key: identity,
+                className: 'drawai-btn' + (current ? ' on' : ''),
+                style: { display: 'block', width: '100%', textAlign: 'left', marginBottom: '3px' },
+                onClick: () => switchTo(identity),
+              },
+              label + (current ? '  ← 当前' : ''),
+            ),
+          )
+        }
+        rows.push(React.createElement('div', null, items))
+      }
+      for (let i = 0; i < listNotes.length; i += 1) {
+        rows.push(React.createElement('div', { className: 'drawai-note', key: 'note' + i }, '⚠ ' + listNotes[i]))
+      }
+      rows.push(
+        React.createElement(
+          'div',
+          { className: 'drawai-menu-row' },
+          React.createElement('button', { className: 'drawai-btn', onClick: pickDirectoryAndList, title: '打开系统文件管理器，另选一个目录' }, '选择目录…'),
+          React.createElement(
+            'button',
+            {
+              className: 'drawai-btn',
+              onClick: () => fetchFileList(lastPickedDirRef.current),
+              title: '重新读取当前目录',
+            },
+            '重新读取',
+          ),
+          React.createElement('button', { className: 'drawai-btn', onClick: () => setDocMenu(null) }, '关闭'),
+        ),
+      )
+    } else if (docMenu === 'renameLayer') {
+      rows.push(menuTitle('重命名图层'))
+      rows.push(
+        React.createElement('input', {
+          className: 'drawai-edit doc-menu-input',
+          autoFocus: true,
+          onFocus: (event) => {
+            try {
+              event.target.select()
+            } catch (error) {
+              /* ignore */
+            }
+          },
+          value: newName,
+          placeholder: '图层名（可留空）',
+          onChange: (event) => setNewName(event.target.value),
+          onKeyDown: (event) => {
+            if (event.key === 'Enter') commitRenameLayer(newName)
+            else if (event.key === 'Escape') {
+              setDocMenu(null)
+              setRenameLayerId(null)
+            }
+          },
+        }),
+      )
+      rows.push(React.createElement('div', { className: 'drawai-note' }, '空名字会显示为「第 N 层」。'))
+      rows.push(
+        React.createElement(
+          'div',
+          { className: 'drawai-menu-row' },
+          React.createElement('button', { className: 'drawai-btn', onClick: () => commitRenameLayer(newName) }, '确定'),
+          React.createElement(
+            'button',
+            {
+              className: 'drawai-btn',
+              onClick: () => {
+                setDocMenu(null)
+                setRenameLayerId(null)
+              },
+            },
+            '取消',
+          ),
+        ),
+      )
+    } else if (docMenu === 'find') {
+      const hits = findInDoc(docRef.current, findQuery)
+      rows.push(menuTitle('查找'))
+      rows.push(
+        React.createElement('input', {
+          className: 'drawai-edit doc-menu-input',
+          autoFocus: true,
+          value: findQuery,
+          placeholder: '标签或 id 子串',
+          onChange: (event) => setFindQuery(event.target.value),
+          onKeyDown: (event) => {
+            if (event.key === 'Escape') setDocMenu(null)
+            else if (event.key === 'Enter' && hits.length > 0) jumpToFindHit(hits[0])
+          },
+        }),
+      )
+      if (findQuery.trim().length === 0) {
+        rows.push(React.createElement('div', { className: 'drawai-note' }, '输入关键字，匹配节点/连线的标签或 id。'))
+      } else if (hits.length === 0) {
+        rows.push(React.createElement('div', { className: 'drawai-note' }, '没有匹配项'))
+      } else {
+        rows.push(React.createElement('div', { className: 'drawai-note' }, hits.length + ' 项匹配（点一项选中并跳转）'))
+        for (let i = 0; i < Math.min(hits.length, 24); i += 1) {
+          const hit = hits[i]
+          rows.push(
+            React.createElement(
+              'button',
+              {
+                key: hit.id,
+                className: 'drawai-btn',
+                style: { display: 'block', width: '100%', textAlign: 'left', marginBottom: '3px' },
+                onClick: () => jumpToFindHit(hit),
+              },
+              (hit.kind === 'edge' ? '线 ' : '节点 ') + hit.id + (hit.label.length > 0 ? ' · ' + hit.label : ''),
+            ),
+          )
+        }
+        if (hits.length > 24) {
+          rows.push(React.createElement('div', { className: 'drawai-note' }, '只显示前 24 项，请再缩小关键字'))
+        }
+      }
+      rows.push(
+        React.createElement(
+          'div',
+          { className: 'drawai-menu-row' },
+          React.createElement('button', { className: 'drawai-btn', onClick: () => setDocMenu(null) }, '关闭'),
+        ),
+      )
+    } else if (docMenu === 'prefs') {
+      rows.push(menuTitle('偏好（本机）'))
+      rows.push(
+        React.createElement(
+          'div',
+          { className: 'drawai-note' },
+          '只记在这台电脑上，不写进 .drawio。新建节点时默认用下面的形状与配色。',
+        ),
+      )
+      rows.push(
+        React.createElement(
+          'label',
+          { className: 'drawai-menu-row', style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+          React.createElement('input', {
+            type: 'checkbox',
+            checked: showGrid,
+            onChange: (event) => setShowGrid(event.target.checked === true),
+          }),
+          '显示网格',
+        ),
+      )
+      rows.push(React.createElement('div', { className: 'drawai-note' }, '默认形状'))
+      rows.push(
+        React.createElement(
+          'div',
+          { className: 'drawai-pick' },
+          shapeGrid(
+            (shape) => {
+              if (shape === 'text' || shape === 'svg' || shape === 'image' || shape === 'video') return
+              patchPrefs({ defaultShape: shape })
+            },
+            { color: prefs.defaultColor || menuStyle, current: prefs.defaultShape || menuShape },
+          ),
+        ),
+      )
+      rows.push(React.createElement('div', { className: 'drawai-note' }, '默认配色'))
+      rows.push(
+        swatchRow((style) => {
+          patchPrefs({ defaultColor: style })
+        }, prefs.defaultColor || menuStyle),
+      )
+      rows.push(
+        React.createElement(
+          'div',
+          { className: 'drawai-menu-row' },
+          React.createElement(
+            'button',
+            {
+              className: 'drawai-btn',
+              onClick: () => {
+                patchPrefs(Object.assign({}, DEFAULT_DRAWAI_PREFS))
+              },
+            },
+            '恢复默认',
+          ),
+          React.createElement('button', { className: 'drawai-btn', onClick: () => setDocMenu(null) }, '关闭'),
+        ),
+      )
+    } else {
+      // 需要输入名字的两种情形：新建 / 另存为。**共用同一个输入框**，
+      // 差别只在确认时调哪个函数、以及默认值从哪来。
+      const isNew = docMenu === 'new'
+      rows.push(menuTitle(isNew ? '新建画布' : '另存为'))
+      rows.push(
+        React.createElement('input', {
+          className: 'drawai-edit doc-menu-input',
+          autoFocus: true,
+          // onFocus 里全选：默认名是"建议值"，用户直接打字即替换 —— 否则还得先手动删掉
+          onFocus: (event) => {
+            try {
+              event.target.select()
+            } catch (error) {
+              /* 某些环境不支持 select()，忽略即可 */
+            }
+          },
+          ref: (el) => {
+            nameInputRef.current = el
+          },
+          value: newName,
+          placeholder: '文件名，例如 my-flow',
+          onChange: (event) => {
+            setNewName(event.target.value)
+            setFileList(null)
+          },
+          onKeyDown: (event) => {
+            if (event.key === 'Enter') {
+              if (isNew) createCanvasNamed(newName)
+              else saveAs(newName)
+            } else if (event.key === 'Escape') {
+              setDocMenu(null)
+            }
+          },
+        }),
+      )
+      rows.push(
+        React.createElement(
+          'div',
+          { className: 'drawai-note' },
+          isNew
+            ? '不填扩展名会自动补 .drawio；只落在工作区根目录。同名会提示换名，不会覆盖。'
+            : '不填扩展名会自动补 .drawio；只落在工作区根目录。同名文件不会被覆盖。',
+        ),
+      )
+      if (listError.length > 0) {
+        rows.push(React.createElement('div', { className: 'drawai-err' }, listError))
+      }
+      rows.push(
+        React.createElement(
+          'div',
+          { className: 'drawai-menu-row' },
+          React.createElement(
+            'button',
+            { className: 'drawai-btn', onClick: () => (isNew ? createCanvasNamed(newName) : saveAs(newName)) },
+            isNew ? '创建并打开' : '保存',
+          ),
+          React.createElement('button', { className: 'drawai-btn', onClick: () => setDocMenu(null) }, '取消'),
+        ),
+      )
+    }
+    return React.createElement('div', { className: 'drawai-menu drawai-docmenu', style: panelStyle(docMenuPos) }, rows)
+  }
+
+  const modeTag = mode === 'light' ? 'draw.io 外观' : '暗色外观'
+  const canUndo = historyRef.current.past.length > 0
+  const canRedo = historyRef.current.future.length > 0
+  const canSave = hasPath && dirtyRef.current === true
+
+  /** 打开「另存为」面板。 */
+  function openSaveAsPanel() {
+    setDocMenu('saveAs')
+    setNewName('')
+    setFileList(null)
+    setDocMenuPos(null)
+  }
+
+  /**
+   * 打开「新建」面板：先向宿主**探**一个没被占用的默认名（untitled / untitled-2 …），
+   * 预填进输入框并全选 —— 用户直接打字即替换，不改就直接回车。
+   *
+   * 探名不落盘（宿主 action:'suggest'）：用户可能取消，不该留下空文件。
+   */
+  async function openNewCanvasPanel() {
+    setDocMenu('new')
+    setFileList(null)
+    setNewName('untitled')
+    setNameInputRef.current = null
+    // 拉一个更准确的默认名（可能是 untitled-3 之类）
+    if (client === null) return
+    let suggested = null
+    try {
+      const raw = await fetch(SAVE_ENDPOINT, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [SAVE_HEADER]: '1' },
+        body: JSON.stringify({ action: 'suggest', sessionId: sessionId, base: 'untitled' }),
+      })
+      const payload = await raw.json()
+      if (payload !== null && payload.ok === true && typeof payload.name === 'string') suggested = payload.name
+    } catch (error) {
+      suggested = null
+    }
+    if (suggested === null) return
+    // 用户可能已经开始打字了 —— 那就不覆盖他输入的内容。
+    if (nameInputRef.current !== null && nameInputRef.current.value !== 'untitled') return
+    setNewName(suggested)
+  }
+
+  /** 用给定名字新建并打开。名字由用户在面板里确认。 */
+  async function createCanvasNamed(name) {
+    const trimmed = String(name === undefined || name === null ? '' : name).trim()
+    if (trimmed.length === 0) {
+      setFileList({ files: null, error: '请填一个文件名' })
+      return
+    }
+    if (/[\\/]/.test(trimmed)) {
+      setFileList({ files: null, error: '文件名不能包含路径分隔符' })
+      return
+    }
+    const withExt = trimmed.toLowerCase().endsWith('.drawio') ? trimmed : trimmed + '.drawio'
+    if (client === null) return
+    setSaveNote('新建 ' + withExt + ' …')
+    let raw = null
+    try {
+      raw = await fetch(SAVE_ENDPOINT, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', [SAVE_HEADER]: '1' },
+        body: JSON.stringify({ action: 'create', sessionId: sessionId, name: withExt }),
+      })
+    } catch (error) {
+      setFileList({ files: null, error: '新建失败：' + (error && error.message ? error.message : String(error)) })
+      return
+    }
+    let payload = null
+    try {
+      payload = await raw.json()
+    } catch (error) {
+      setFileList({ files: null, error: '新建失败：返回不是 JSON（HTTP ' + raw.status + '）' })
+      return
+    }
+    if (payload === null || payload.ok !== true) {
+      const message = String(payload !== null && payload.error ? payload.error : 'HTTP ' + raw.status)
+      const exists = payload !== null && payload.exists === true
+      setFileList({ files: null, error: exists ? '已存在同名文件：换个名字，或用「打开…」' : message })
+      return
+    }
+    setDocMenu(null)
+    setNewName('')
+    setFileList(null)
+    onOpenTab(String(payload.path))
+    setSaveNote('已新建 ' + String(payload.path))
+  }
+
+  /**
+   * 算出某个工作栏按钮在**本视图根元素**里的位置，好把菜单展开在它正下方。
+   *
+   * 参照系必须是 `.drawai-root`（position:absolute，是定位上下文），而菜单就是它的绝对定位子元素。
+   * 曾经拿 `.drawai-canvas` 当参照 —— 那时菜单也挂在画布里。现在工作栏在上面、标签条在中间，
+   * 若还按画布算，top 会变成负数（跑到画布上方）、被画布的 overflow:hidden 裁掉。
+   * 也曾经拿 `.drawai-tools` 当参照：那个容器没有 position:relative，偏移量与定位上下文不一致，菜单会横着跑偏。
+   *
+   * 用 DOM 量而不是自己攒坐标：按钮宽度随文案变（"导出 ▾" 比 "文件 ▾" 宽），
+   * 右栏也随时可能被拖动改宽，量当下这一帧最省事也最准。
+   * 量不到（首帧 ref 还没挂）就返回 null，调用方退回固定位置。
+   */
+  function menuPosFor(key) {
+    const root = rootRef.current
+    const btn = toolBtnRefs.current[key]
+    if (root === null || root === undefined || btn === null || btn === undefined) return null
+    try {
+      const a = btn.getBoundingClientRect()
+      const c = root.getBoundingClientRect()
+      // 用按钮**左边缘**对齐菜单左边缘（不居中）：右栏窄，居中更容易被右侧夹取挤回去。
+      return { left: Math.round(a.left - c.left), top: Math.round(a.bottom - c.top) + 2 }
+    } catch (error) {
+      return null
+    }
+  }
+
+  /** 从工具条开一个下拉菜单（点同一个按钮则收起）。 */
+  function toggleToolbarMenu(key) {
+    if (docMenu === key) {
+      setDocMenu(null)
+      setDocMenuPos(null)
+      return
+    }
+    setDocMenu(key)
+    setDocMenuPos(menuPosFor(key))
+  }
+
+  /**
+   * root 上的**捕获阶段**按下处理：管两件"点到外面就收"的事。
+   *
+   * ① **输入框外面按一下 → 提交并退出**（节点文字与线上的文字共用同一个输入框）。
+   *    不能指望 `onBlur`：画布的按下处理里普遍有 `preventDefault()`（框选、拖动、右键），
+   *    而 preventDefault 会挡掉**焦点变化**，于是输入框根本不 blur ——
+   *    用户点空白处，编辑框还杵在那里，而且那一下点击也被输入框"吃掉"了。
+   *    所以在捕获阶段自己判：目标不在输入框里就提交（提交=把改好的文字落盘，与失焦一致）。
+   * ② **下拉菜单/面板外面按一下 → 收掉**（理由见下）。
+   *
+   * 挂在 root 的捕获阶段：画布、标签条、工作栏都在 root 里，捕获能保证在任何子元素的
+   * 按下处理（画布框选、右键菜单、拖动）之前先判完，不必给每个区域各挂一遍。
+   *
+   * 菜单那部分，两种"不算外面"的地方：
+   *   · 菜单/面板自己（点选项、点输入框、点按钮 —— 关了就没法用了）；
+   *   · 工作栏那些**开菜单的按钮**（`.drawai-menu-trigger`）—— 它们自己有 toggle 语义
+   *     （点同一个是关、点另一个是换），交给它们判断；否则捕获阶段先关一次、按钮的 onClick
+   *     又开一次，点同一个按钮就永远关不掉。
+   *     这里只放过"开菜单的按钮"而不是整个工作栏：点在按钮之间的缝里、或者点标签条，
+   *     都应该算"外面"（用户眼里那都是画布/别的东西，不是菜单）。
+   */
+  function onRootPointerDown(event) {
+    const target = event === null || event === undefined ? null : event.target
+    if (isSelectableTextTarget(target)) return
+    const closest = target !== null && target !== undefined && typeof target.closest === 'function' ? target.closest.bind(target) : null
+    // ③ 在画布上按下 = "我要操作画布了"：把残留在别处（比如对话里）的文字选区清掉。
+    //    不清的话，画布的新元素会因为"外面还有选中文字"而复制不了（见 clearStaleTextSelection）。
+    clearStaleTextSelection(target, event === null || event === undefined ? undefined : event.button)
+    // ④ 同时把焦点收到面板根：否则 DSH 0.2 下对话 contenteditable 不放焦点，
+    //    canvasOwnsKeyboard 一直 false，Delete / Ctrl+C/V 全部没反应。
+    claimCanvasKeyboard(rootRef.current, target)
+    if (editing !== null && (closest === null || closest('.drawai-edit') === null)) commitEdit()
+    if (docMenu === null) return
+    if (closest !== null && closest('.drawai-menu') !== null) return
+    if (closest !== null && closest('.drawai-menu-trigger') !== null) return
+    setDocMenu(null)
+    setDocMenuPos(null)
+  }
+
+  /**
+   * 面板的定位样式：贴在触发它的按钮下方，并夹在画布范围内。
+   *
+   * 为什么用 inline style 而不是 CSS 类：位置随按钮宽度和右栏宽度变，属于运行期数据。
+   * 夹取用画布的当前尺寸（size）—— 右栏很窄，靠右的菜单（「导出」）不夹会伸到面板外面看不见。
+   */
+  function panelStyle(pos, preferredWidth) {
+    if (pos === null || pos === undefined) return undefined
+    const width = preferredWidth || 240
+    const maxLeft = Math.max(0, (size.w > 0 ? size.w : width) - width - 4)
+    const maxTop = Math.max(0, (size.h > 0 ? size.h : 200) - 60)
+    return { left: Math.min(Math.max(0, pos.left), maxLeft) + 'px', top: Math.min(Math.max(0, pos.top), maxTop) + 'px' }
+  }
+
+  /**
+   * 菜单项的构造器。
+   *
+   * **必须放在 `layerMenuItems` 与 `toolbarMenus` 的公共外层**：它原来定义在 toolbarMenus
+   * 肚子里，而 layerMenuItems 是外层函数 —— 于是「图层」菜单一被调用就
+   * `ReferenceError: item is not defined`，整个画布降级成"未渲染"（用户看到的就是这一句）。
+   * 自测没抓到是因为 harness 当时把 layerMenuItems 整个桩成了 `() => []`：真实函数体
+   * 一次都没跑过。现在 harness 把这段作用域整体抽出来真跑一遍，这类"自由变量对不上"会立刻炸。
+   */
+  const item = (label, onClick, opts) => ({
+    label: label,
+    onClick: onClick,
+    hint: opts !== undefined && opts.hint !== undefined ? opts.hint : '',
+    disabled: opts !== undefined && opts.disabled === true,
+    keepOpen: opts !== undefined && opts.keepOpen === true,
+    group: opts && opts.group || '',
+    shortcut: opts && opts.shortcut || '',
+  })
+
+  /**
+   * 「图层」菜单的内容。
+   *
+   * 菜单原语只有"一项一个动作"，而一层有两个动作（显示/隐藏、设为当前），所以分两段列：
+   * 上半段点一下切换显示，下半段点一下切换"当前图层"。两段都 keepOpen —— 连点几层不用重开菜单。
+   */
+  function layerMenuItems() {
+    const out = []
+    if (layerList.length === 0) {
+      out.push(item('（这张画布没有图层信息）', () => {}, { disabled: true, hint: '打开一张 drawio 文件或新建画布后就有' }))
+      return out
+    }
+    const canDelete = layerList.length > 1
+    for (let i = 0; i < layerList.length; i += 1) {
+      const layer = layerList[i]
+      const name = layerLabelOf(layer, i)
+      const eye = layer.visible === false ? '🚫' : '👁'
+      const lock = layer.locked === true ? '🔒' : '🔓'
+      const on = layer.id === activeLayerId
+      out.push(
+        item(eye + ' ' + name, () => toggleLayerVisible(layer.id), {
+          hint: layer.visible === false ? '现在是隐藏的，点一下显示（写进文件）' : '现在是显示的，点一下隐藏（写进文件）',
+          keepOpen: true,
+        }),
+      )
+      out.push(
+        item(lock + ' ' + (layer.locked === true ? '解锁：' : '锁定：') + name, () => toggleLayerLocked(layer.id), {
+          hint: layer.locked === true ? '解锁后可以选中、拖动、删除这一层上的单元' : '锁定后看得见但点不到、也改不了',
+          keepOpen: true,
+        }),
+      )
+      out.push(
+        item((on ? '● ' : '○ ') + '当前：' + name, () => setCurrentLayerId(layer.id), {
+          hint: '新建的节点/连线/粘贴会落进「当前图层」',
+          keepOpen: true,
+        }),
+      )
+      out.push(item('✏ 重命名「' + name + '」…', () => openRenameLayer(layer.id), { hint: '改图层显示名（写进文件）' }))
+      out.push(
+        item('🗑 删除「' + name + '」', () => removeLayer(layer.id), {
+          hint: canDelete ? '层内单元会并入下一层（最后一层并入上一层）' : '不能删除最后一层',
+          disabled: !canDelete,
+        }),
+      )
+    }
+    out.push(item('＋ 新建图层', createLayer, { hint: '自动命名「图层 N」并设为当前图层' }))
+    if (selectedIds.length > 0) {
+      for (let i = 0; i < layerList.length; i += 1) {
+        const layer = layerList[i]
+        const name = layerLabelOf(layer, i)
+        out.push(
+          item('选中 → ' + name, () => moveSelectionToLayer(layer.id), {
+            hint: '把当前选中的单元移到这一层（锁定层上的单元会跳过）',
+          }),
+        )
+      }
+    }
+    return out
+  }
+
+  /**
+   * 工具条的**下拉菜单**：同类型的操作收进一个入口。
+   *
+   * 为什么改：右栏本来就窄，11 个按钮排成两行既挤又难扫。按"文件 / 编辑 / 图层 / 视图 / 导出"
+   * 分类后工具条只剩 5 个入口，而且每项都能带一句说明（按钮上放不下）。
+   *
+   * 面板沿用 docMenu 那套绝对定位（在画布左上角展开），而不是 CSS hover 弹出 ——
+   * 这里是窄栏，hover 弹出很难点，鼠标一移开就收起。
+   */
+  function toolbarMenus() {
+    return [
+      {
+        key: 'file',
+        label: '文件',
+        title: '新建 / 打开 / 保存',
+        items: [
+          item('新建画布…', openNewCanvasPanel, { group: 'open' }),
+          item('打开…', openFilePicker, { group: 'open' }),
+          item(hasPath ? '保存' : '另存为…', () => (hasPath ? saveNow() : openSaveAsPanel()), {
+            group: 'save',
+            disabled: empty || (hasPath && !canSave),
+          }),
+          ...(hasPath ? [item('另存为…', openSaveAsPanel, { group: 'save', disabled: empty })] : []),
+          ...(hasPath
+            ? [
+                item('导出画布包…', async () => {
+                  const r = await mediaAction('media-pack-bundle', {})
+                  if (r !== null) setSaveNote('已导出画布包 ' + r.path)
+                }, { group: 'bundle', hint: '打包 .drawio + *.media 为 .drawai.zip' }),
+                item('导入画布包…', async () => {
+                  const file = typeof window !== 'undefined' ? window.prompt('工作区内的 .drawai.zip / .zip 路径', '') : null
+                  if (typeof file !== 'string' || file.trim().length === 0) return
+                  const r = await mediaAction('media-unpack-bundle', { file: file.trim() })
+                  if (r !== null) {
+                    setSaveNote('已导入 ' + r.path)
+                    if (typeof onOpenTab === 'function') onOpenTab(r.path)
+                  }
+                }, { group: 'bundle', hint: '解压 zip 得到 .drawio + *.media' }),
+                item('清理未引用媒体', async () => {
+                  const r = await mediaAction('media-cleanup', { doc: docRef.current })
+                  if (r !== null) setSaveNote('已清理 ' + (Array.isArray(r.removed) ? r.removed.length : 0) + ' 个未引用 clip')
+                }, { group: 'bundle', hint: '删除 *.media 里没有节点引用的 clip' }),
+              ]
+            : []),
+          item('重新载入', () => setNonce((n) => n + 1), { group: 'reload', disabled: empty }),
+        ],
+      },
+      {
+        key: 'edit',
+        label: '编辑',
+        title: '撤销 / 重做 / 复制粘贴',
+        items: [
+          item('撤销', undo, { shortcut: 'Ctrl+Z', group: 'history', disabled: empty || !canUndo }),
+          item('重做', redo, { shortcut: 'Ctrl+Shift+Z', group: 'history', disabled: empty || !canRedo }),
+          item('剪切', cutSelection, { shortcut: 'Ctrl+X', group: 'clipboard', disabled: empty || selectedIds.length === 0 }),
+          item('复制', copySelection, { shortcut: 'Ctrl+C', group: 'clipboard', disabled: empty || selectedIds.length === 0 }),
+          item('粘贴', pasteClipboard, { shortcut: 'Ctrl+V', group: 'clipboard', disabled: empty }),
+          item('全选', selectAll, { shortcut: 'Ctrl+A', group: 'selection', disabled: empty }),
+          item('查找…', openFindPanel, { shortcut: 'Ctrl+F', group: 'selection', disabled: empty }),
+          item('撤销 AI 改动', revertAiChange, {
+            hint: '与人工撤销分开', group: 'ai',
+            disabled: empty || !canRevert,
+          }),
+          item('对齐到网格', normalizeGeometry, { group: 'arrange', disabled: empty }),
+        ],
+      },
+      {
+        key: 'layers',
+        label: '图层',
+        title: '显示 / 隐藏 / 锁定 / 移层',
+        items: [],
+      },
+      {
+        key: 'view',
+        label: '视图',
+        title: '缩放与外观',
+        items: [
+          item('适应内容', () => setViewOverride(null), { group: 'zoom', disabled: empty }),
+          item('100%', () => { const current = viewRef.current; if (current && size.w > 0) setViewOverride(zoomViewAt(current, { x: current.x + current.w / 2, y: current.y + current.h / 2 }, size.w / current.w)) }, { group: 'zoom', disabled: empty }),
+          item(modeTag, () => setMode(mode === 'light' ? 'dark' : 'light'), { group: 'appearance', keepOpen: true }),
+          item(showGrid ? '隐藏网格' : '显示网格', () => setShowGrid(!showGrid), { group: 'appearance', keepOpen: true }),
+          item('偏好…', openPrefsPanel, { group: 'settings' }),
+        ],
+      },
+      {
+        key: 'export',
+        label: '导出',
+        title: '导出',
+        items: [],
+      },
+    ]
+  }
+
+  const head = React.createElement(
+    'div',
+    { className: 'drawai-head' },
+    React.createElement('span', { className: 'drawai-path', title: status.path }, status.path),
+    React.createElement(
+      'div',
+      { className: 'drawai-tools' },
+      // 四个分类入口（菜单在**各自按钮正下方**展开，见 renderDocMenu）。
+      toolbarMenus().map((m) =>
+        React.createElement(
+          'button',
+          {
+            key: m.key,
+            ref: (el) => {
+              toolBtnRefs.current[m.key] = el
+            },
+            className: 'drawai-btn drawai-menu-trigger' + (docMenu === m.key ? ' on' : ''),
+            onClick: () => toggleToolbarMenu(m.key),
+            'aria-label': m.label,
+          },
+          m.label + ' ▾',
+        ),
+      ),
+    ),
+  )
+
+
+  let body
+  if (status.kind === 'error') {
+    body = React.createElement('div', { className: 'drawai-err' }, status.error)
+  } else if (empty) {
+    // 空舞台：一张画布都没打开。这里**不画任何画布**，只给出两条出路 ——
+    // 新建/打开都在上面那条工作栏的「文件」菜单里（工作栏在标签页之上，空舞台也有它）。
+    body = React.createElement(
+      'div',
+      { className: 'drawai-empty' },
+      React.createElement('div', { className: 'drawai-empty-title' }, '还没有打开画布'),
+      React.createElement('div', { className: 'drawai-empty-hint' }, '用工作栏的「文件 → 新建画布…」创建一个新画布'),
+      React.createElement('div', { className: 'drawai-empty-hint' }, '或用「文件 → 打开…」挑一个已有的 .drawio（drawio 自己也能打开同一份文件）'),
+    )
+  } else if (doc === null) {
+    body = React.createElement('div', { className: 'drawai-note' }, '读取中…')
+  } else {
+    // 草稿仅用于预览几何：编辑中撑高的节点与提交后的排版一致，不提前写盘。
+    let previewDoc = doc
+    if (editing !== null) {
+      previewDoc = cloneDoc(doc)
+      const cells = editing.kind === 'edge' ? previewDoc.edges : previewDoc.nodes
+      for (const cell of cells) if (cell.id === editing.id) cell.label = editing.text
+    }
+    const canvasChildren = [renderDiagram(previewDoc, mode, uid, svgRef, ui, view)]
+    const selectionToolbar = renderSelectionToolbar()
+    if (selectionToolbar !== null) canvasChildren.push(selectionToolbar)
+    const menuNode = renderMenu()
+    if (menuNode !== null) canvasChildren.push(menuNode)
+    if (editing !== null) {
+      // 就地改标签：用**绝对定位的元素盖在节点的文字区上**。
+      // 不用 SVG foreignObject —— React 会把 <svg> 后代一律建成 SVG 命名空间元素，
+      // 里面的输入控件不会按 HTML 渲染。
+      //
+      // 节点与连线标签都用多行输入框。
+      const editorScale = numberOr(editing.scale, 1)
+      const editorStyle = {
+        left: editing.left + 'px',
+        top: editing.top + 'px',
+        width: Math.max(1, editing.width / editorScale) + 'px',
+        height: Math.max(1, editing.height / editorScale) + 'px',
+        transform: 'scale(' + editorScale + ')', transformOrigin: 'top left',
+        fontFamily: FONT,
+        fontWeight: 'normal', fontStyle: 'normal', letterSpacing: '0px', textIndent: 0,
+        textAlign: editing.textAlign || 'center',
+        opacity: editing.opacity === undefined ? 1 : editing.opacity,
+      }
+      {
+        // 字号/行高/字色按这个节点给：编辑时看到的字，就是提交后画出来的字。
+        editorStyle.fontSize = Math.max(1, numberOr(editing.fontSize, FSIZE) / editorScale) + 'px'
+        editorStyle.lineHeight = Math.max(1, numberOr(editing.lineHeight, LHEIGHT) / editorScale) + 'px'
+        editorStyle.color = editing.color === undefined || editing.color === null ? '#000000' : editing.color
+        editorStyle.wordBreak = 'break-all'
+        editorStyle.overflowWrap = 'normal'
+        // whiteSpace=nowrap 的标签在编辑框里也不换行（否则一打字就换行、一提交又缩回一行）。
+        if (editing.wraps === false) {
+          editorStyle.whiteSpace = 'pre'
+          editorStyle.wordBreak = 'normal'
+          editorStyle.overflowX = 'auto'
+        }
+      }
+      const editorProps = {
+        key: 'label-editor',
+        className: 'drawai-edit',
+        autoFocus: true,
+        value: editing.text,
+        style: editorStyle,
+        // 保留 kind 等全部字段：这里曾经重建对象时漏了 kind，于是"编辑过再平移"会走错分支。
+        onChange: (event) => setEditing(Object.assign({}, editing, { text: event.target.value })),
+        onBlur: commitEdit,
+        onKeyDown: (event) => {
+          event.stopPropagation()
+          // 输入法确认键不结束编辑；Enter / Shift+Enter 均换行。
+          if (event.isComposing || event.keyCode === 229) return
+          if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+            event.preventDefault()
+            commitEdit()
+          } else if (event.key === 'Escape') {
+            event.preventDefault()
+            setEditing(null)
+          }
+        },
+      }
+      canvasChildren.push(
+        React.createElement('textarea', Object.assign({ 'aria-label': '编辑标签' }, editorProps)),
+      )
+    }
+    const canvasEl = React.createElement(
+      'div',
+      {
+        className: 'drawai-canvas' + (placeTool !== null || placeEdgeKind !== null ? ' placing' : ''),
+        ref: canvasRef,
+        // 空白处不挂 title：悬停整块画布会反复冒浏览器提示，很吵；操作说明在状态栏 / 放置时的 saveNote。
+        onContextMenu: onCanvasContextMenu,
+        onPointerDown: onCanvasPointerDown,
+        onPointerMove: onCanvasPointerMove,
+        onPointerUp: onCanvasPointerUp,
+        onPointerLeave: onCanvasPointerUp,
+        // 中键在 Chrome 上默认触发自动滚动（那个四向圆盘），必须拦掉它的默认行为。
+        // pointerdown 的 preventDefault 管不住它，要在 mousedown 上拦。
+        onMouseDown: (event) => {
+          if (event.button === 1) event.preventDefault()
+        },
+        onAuxClick: (event) => {
+          if (event.button === 1) event.preventDefault()
+        },
+        onDragOver: (event) => {
+          if (!hasMediaFileDrag(event.dataTransfer)) return
+          event.preventDefault()
+          event.dataTransfer.dropEffect = 'copy'
+        },
+        onDrop: (event) => {
+          const files = mediaFilesFromDataTransfer(event.dataTransfer)
+          if (files.length === 0) {
+            if (hasMediaFileDrag(event.dataTransfer)) event.preventDefault()
+            return
+          }
+          event.preventDefault()
+          const point = toUserSpace(event)
+          const at = point === null ? viewportCenterUser() : point
+          insertMediaFiles(files, at.x, at.y)
+        },
+      },
+      canvasChildren,
+    )
+    body = React.createElement('div', { className: 'drawai-body' }, canvasEl, renderShapeRail())
+  }
+
+  const note =
+    (empty ? '还没有打开画布 —— 用「文件 → 新建画布…」或「文件 → 打开…」开始' : '') +
+    (status.kind === 'ready' && doc !== null
+      ? '节点 ' + doc.nodes.length + ' · 边 ' + doc.edges.length + ' · revision ' + doc.revision + ' · 缩放 ' + zoomPercent + '%'
+      : empty ? '' : '数据源：' + (target.length > 0 ? target : '(未知)')) +
+    (saveNote.length > 0 ? ' ｜ ' + saveNote : '') +
+    (infoError.length > 0 ? ' ｜ ⚠ ' + infoError : '')
+
+  return React.createElement(
+    'div',
+    {
+      className: 'drawai-root',
+      ref: rootRef,
+      // 可聚焦但不进 Tab 序：点画布时 claimCanvasKeyboard 把焦点收到这里，
+      // 快捷键才能通过 canvasOwnsKeyboard（见该函数注释）。
+      tabIndex: -1,
+      onPointerDownCapture: onRootPointerDown,
+    },
+    // 1) 工作栏（文件/编辑/视图/导出）—— 层级在标签页**之上**
+    head,
+    // 2) 标签页：由 CanvasTabs 构造、只在活动窗格里渲染（保证 DOM 里只有一份）
+    active && props.tabStrip !== null && props.tabStrip !== undefined ? props.tabStrip : null,
+    // 3) 画布 / 空舞台
+    body,
+    // 4) 工作栏的下拉与「打开/新建/另存为」面板：挂在 root 上（不在画布里），
+    //    否则插进标签条之后它们的参照系会算成画布上方的负坐标，被 overflow:hidden 裁掉。
+    renderDocMenu(),
+    active ? React.createElement(BackgroundTaskPanel, { jobs: backgroundDrawingJobs, exports: videoExportJobs,
+      hidden: !showTaskList, onHide: () => patchPrefs({ showTaskList: false }),
+      path: target, page: pageIndex, error: backgroundQueueError, onCommand: backgroundTaskCommand,
+      onOpen: (job) => job.scope.path === target ? switchPage(job.scope.page) : onOpenTab(job.scope.path, job.scope.page) }) : null,
+    videoTraceSource && videoTraceJob && !videoTraceRun.queueId ? React.createElement(VideoTraceStatusCard, { job: videoTraceJob,
+      onRetry: () => videoTraceRun.result ? applyPendingVideoTrace() : startVideoTrace(videoTraceJob.options, videoTraceSource), onCancel: () => {
+        setVideoTraceJob((job) => Object.assign({}, job, { message: '正在取消并清理临时帧…' }))
+        videoTraceRun.current?.abort()
+      },
+      onClose: () => { setVideoTraceSource(null); setVideoTraceJob(null) } }) : null,
+    React.createElement(VideoPreview, { controller: videoController, nodes: doc === null ? [] : doc.nodes,
+      metaOf: videoMetaOf, posterOf: videoPosterOf }),
+    React.createElement(CopyableStatus, { text: note }),
+  )
+}
+
+/**
+ * 渲染边界。
+ *
+ * 教训：这个画布前后出现过两次"tab 主体完全空白"。空白是最不可诊断的失败形态 ——
+ * 它和"插件没加载"、"座位没派发到我的 key"、"组件自己抛异常"长得**一模一样**，
+ * 光看屏幕无法区分，只能靠额外探针一轮轮排除。
+ *
+ * 所以从此以后：任何渲染期异常都必须变成一块**看得见的错误面板**，
+ * 而不是静默的空白。这也是之前的排查走错两次方向的根本原因。
+ */
+class CanvasBoundary extends React.Component {
+  constructor(props) {
+    super(props)
+    this.state = { error: null }
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error: error }
+  }
+
+  render() {
+    const error = this.state.error
+    if (error !== null) {
+      const message = error && error.message ? error.message : String(error)
+      const stack = error && error.stack ? String(error.stack).split('\n').slice(0, 8).join('\n') : '(无 stack)'
+      return React.createElement(
+        'div',
+        {
+          style: {
+            background: '#7a1f1f',
+            color: '#ffffff',
+            padding: '12px',
+            font: '12px/1.6 monospace',
+            whiteSpace: 'pre-wrap',
+            overflow: 'auto',
+            height: '100%',
+            boxSizing: 'border-box',
+          },
+        },
+        'DrawAI 渲染异常（已降级，画布未渲染）\n\n' + message + '\n\n' + stack,
+      )
+    }
+    return this.props.children
+  }
+}
+
+/**
+ * 真正调用 useTabInfo 的地方，故意不加 try/catch：
+ * 钩子函数抛错时若被就地吞掉，React 的钩子指针会失配，后续渲染会以更难懂的方式失败。
+ * 交给边界干净地卸载这一棵子树，才是 React 认得的做法。
+ */
+function CanvasStage(props) {
+  const hook = props.useTabInfo
+  const info = typeof hook === 'function' ? hook() : null
+  const address = info && info.tab && info.tab.navigation ? info.tab.navigation.address : undefined
+  // 诊断：把"画布实际拿到的地址"显示出来。
+  //
+  // 为什么留着：tab 的地址来源有两处 —— `tab.contentId`（资源 tab 的真实地址）
+  // 与 `tab.navigation.address`（最后一次导航的地址）。两者在"页面 tab"下都是
+  // `sidebar://<kind>`，只有在资源 tab 下才是 `dsh-resource://...`。
+  // 到底是哪一个，只能在真实页面上看 —— 拿不到就无从判断，而这个值直接决定
+  // 画布"绑没绑上文件"。显示出来比反复猜测便宜得多。
+  const contentId = info && info.tab && typeof info.tab.contentId === 'string' ? info.tab.contentId : ''
+  const shown = address !== undefined && address !== null && String(address).length > 0 ? String(address) : contentId
+  return React.createElement(CanvasTabs, {
+    key: props.sessionId || '',
+    sessionId: props.sessionId,
+    tabPath: pathFromAddress(shown),
+    infoError: shown.length > 0 && pathFromAddress(shown) === undefined ? 'tab 地址无法解析为文件：' + shown : '',
+  })
+}
+
+/**
+ * 多画布标签页。
+ *
+ * 设计取舍（值得写下来，否则很容易改坏）：
+ *  - **所有标签都保持挂载**，非活动的用 `display:none` 藏起来。这样每个画布的
+ *    视口、选中、撤销历史都留在各自的 CanvasView 里 —— 切换回来还是原来的样子。
+ *    换成"只渲染活动标签"的话，每次切换都会重建组件，撤销历史和视口全丢。
+ *  - 代价是非活动标签的组件仍然存在（会记住 doc 副本），但**不会轮询**：
+ *    加载 effect 里判断 !active 就直接返回。
+ *  - 标签只存"路径"（一个标签 = 一个已绑定的文件），文档内容归各自的 CanvasView 管 ——
+ *    这里不做第二份文档状态，否则两边会不一致。
+ *  - **标签条由活动窗格渲染**（工作栏之下、画布之上）：工作栏在层级上要高于标签条，
+ *    而标签条又必须只有一份 —— 交给活动窗格渲染一次正好同时满足这两条。
+ *  - **一张标签都没有 = 空舞台**：不造任何画布，用户自己「新建画布…」或「打开…」。
+ *    没有"未绑定画布"这种中间态（那套代码已按需求删除）。
+ */
+function CanvasTabs(props) {
+  const tabPath = typeof props.tabPath === 'string' && props.tabPath.length > 0 ? props.tabPath : null
+  const tabError = typeof props.infoError === 'string' ? props.infoError : ''
+  const workspace = canvasSessions.workspace(props.sessionId)
+  const [tabs, setTabsState] = React.useState(() => workspace.tabs)
+  const [activeKey, setActiveKeyState] = React.useState(() => workspace.activeKey)
+  function setTabs(value) {
+    workspace.tabs = typeof value === 'function' ? value(workspace.tabs) : value
+    setTabsState(workspace.tabs)
+  }
+  function setActiveKey(key) {
+    workspace.activeKey = key
+    setActiveKeyState(key)
+  }
+  /** 只做一次"开哪个标签"的决定；之后标签的增减交给用户操作。 */
+  const bootstrappedRef = React.useRef(workspace.bootstrapped)
+
+  React.useEffect(() => {
+    if (bootstrappedRef.current) return
+    // 地址给不出（页面 tab / 解析不出路径）→ **保持空舞台**，什么都不开。
+    // 这里刻意不再造"占位/自救"的幽灵画布：屏幕上凭空多一张空白图、却没有对应文件，
+    // 用户根本分不清自己在编辑什么。要画布就自己新建或打开。
+    if (tabPath === null) return
+    bootstrappedRef.current = true
+    workspace.bootstrapped = true
+    const key = 'tab:' + tabPath
+    setTabs([{ key: key, path: tabPath }])
+    setActiveKey(key)
+  }, [tabPath])
+
+  /** 打开一个路径：已经在标签里就切过去，否则新开一个。规则在 openTabIn（可自测）。 */
+  function openPath(path, page) {
+    const next = openTabIn(tabs, path)
+    if (next.active === null) return
+    bootstrappedRef.current = true
+    workspace.bootstrapped = true
+    if (Number.isInteger(page) && page >= 0) {
+      setTabs(next.tabs.map((tab) => tab.key === next.active ? { ...tab, pageRequest: { page } } : tab))
+    } else if (next.tabs !== tabs) setTabs(next.tabs)
+    setActiveKey(next.active)
+  }
+
+  /** 某个标签改名了（另存为 / 切文件）——只更新它自己那条记录。 */
+  function rebind(key, path) {
+    setTabs((list) => list.map((t) => (t.key === key ? Object.assign({}, t, { path: path }) : t)))
+    setActiveKey(key)
+  }
+
+  /** 关一个标签。**允许关到 0 个**：那就回到空舞台（再要画布就自己新建/打开）。 */
+  function closeTab(key) {
+    const closing = tabs.find((tab) => tab.key === key)
+    if (closing) canvasSessions.close(props.sessionId, closing.path)
+    const next = tabs.filter((t) => t.key !== key)
+    if (key === activeKey) setActiveKey(next.length === 0 ? '' : next[next.length - 1].key)
+    setTabs(next)
+  }
+
+  // 标签条：源码里**只有这一处**构造它（自测盯着这条），渲染则由活动窗格代劳。
+  const tabBar =
+    tabs.length === 0
+      ? null
+      : React.createElement(
+          'div',
+          { className: 'drawai-tabs', key: 'tabbar' },
+          tabs.map((t) =>
+            React.createElement(
+              'span',
+              { key: t.key, className: 'drawai-tab' + (t.key === activeKey ? ' on' : '') },
+              React.createElement('button', { className: 'drawai-tab-name', title: String(t.path), onClick: () => setActiveKey(t.key) }, tabLabelOf(t.path)),
+              tabs.length > 1 ? React.createElement('button', { className: 'drawai-tab-x', title: '关闭这个标签', onClick: () => closeTab(t.key) }, '×') : null,
+            ),
+          ),
+        )
+
+  const children = []
+  if (tabs.length === 0) {
+    // 空舞台：没有任何标签，也**没有任何画布**。仍然渲染一个 empty 模式的 CanvasView ——
+    // 工作栏（文件/编辑/视图/导出）住在它的 head 里，而「新建画布…／打开…」就在那个菜单里。
+    children.push(
+      React.createElement(
+        'div',
+        { key: 'pane:empty', className: 'drawai-pane', style: { display: 'flex' } },
+        React.createElement(
+          CanvasBoundary,
+          null,
+          React.createElement(CanvasView, {
+            sessionId: props.sessionId,
+            empty: true,
+            active: true,
+            infoError: tabError,
+            onOpenTab: openPath,
+            onRebind: () => {},
+            tabStrip: null,
+          }),
+        ),
+      ),
+    )
+  } else {
+    for (let i = 0; i < tabs.length; i += 1) {
+      const t = tabs[i]
+      const isActive = t.key === activeKey
+      children.push(
+        React.createElement(
+          'div',
+          {
+            key: 'pane:' + t.key,
+            className: 'drawai-pane',
+            // display:none 而不是不渲染 —— 保住各标签的视口与撤销历史。
+            style: { display: isActive ? 'flex' : 'none' },
+          },
+          React.createElement(
+            CanvasBoundary,
+            null,
+            React.createElement(CanvasView, {
+              sessionId: props.sessionId,
+              path: t.path,
+              pageRequest: t.pageRequest,
+              active: isActive,
+              infoError: '',
+              onOpenTab: openPath,
+              onRebind: (path) => rebind(t.key, path),
+              // 标签条只给活动窗格：DOM 里永远只有一份。
+              tabStrip: isActive ? tabBar : null,
+            }),
+          ),
+        ),
+      )
+    }
+  }
+  return React.createElement('div', { className: 'drawai-tabs-wrap' }, React.createElement('div', { className: 'drawai-panes' }, children))
+}
+
+function CanvasBody(props) {
+  const sessionId = props ? props.sessionId : undefined
+  const hook = props ? props.useTabInfo : undefined
+  return React.createElement(CanvasTabsStage, { sessionId: sessionId, useTabInfo: hook })
+}
+
+/** 包一层边界：useTabInfo 抛错时由 CanvasBoundary 接住，不静默空白。 */
+function CanvasTabsStage(props) {
+  return React.createElement(
+    CanvasBoundary,
+    null,
+    React.createElement(CanvasStage, { sessionId: props.sessionId, useTabInfo: props.useTabInfo }),
+  )
+}
+
+function TitleWithTab(props) {
+  let info = null
+  try {
+    info = props.useTabInfo()
+  } catch (error) {
+    info = null
+  }
+  const address = info && info.tab && info.tab.navigation ? info.tab.navigation.address : undefined
+  const name = basename(address)
+  return React.createElement('span', null, '📐 ' + (name.length > 0 && name !== KIND ? name : 'DrawAI 画布'))
+}
+
+function CanvasTitle(props) {
+  const hook = props ? props.useTabInfo : undefined
+  if (typeof hook === 'function') return React.createElement(TitleWithTab, { useTabInfo: hook })
+  return React.createElement('span', null, '📐 DrawAI 画布')
+}
+
+const STYLE_ID = 'dsh-drawai/client.css'
+
+function apply(ctx) {
+  client = ctx
+  ctx.effect(() => () => canvasSessions.dispose())
+
+  const styleEl = document.createElement('style')
+  styleEl.setAttribute('data-plugin', 'dsh-drawai')
+  styleEl.setAttribute('data-plugin-css', STYLE_ID)
+  styleEl.textContent = CSS
+  document.head.appendChild(styleEl)
+  ctx.effect(() => () => {
+    if (styleEl.parentNode !== null) styleEl.parentNode.removeChild(styleEl)
+  })
+
+  ctx.effect(() =>
+    ctx.sidebarRightTabs.register({
+      id: ID,
+      kind: KIND,
+      patterns: ['**/*.drawio'],
+      title: (address) => {
+        const name = basename(address)
+        return name.length > 0 && name !== KIND ? name : 'DrawAI 画布'
+      },
+      guide: [
+        {
+          order: 30,
+          title: () => 'DrawAI 画布',
+          description: () => '把工作区里的 .drawio 渲染成 draw.io 风格的图；AI 改文件，画布自动重绘',
+        },
+      ],
+    }),
+  )
+
+  ctx.effect(() => ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({ name: 'sidebar.right.pane.tab', key: ID }, CanvasBody)))
+  ctx.effect(() => ctx.slots.inject('sidebar.right.pane.tab.title', () => ctx.slots.register({ name: 'sidebar.right.pane.tab.title', key: ID }, CanvasTitle)))
+}
+
+exports.name = 'drawai'
+exports.inject = ['slots', 'sidebarRightTabs', 'sidebarRight', 'timer', 'remote', 'remote.workspaceFiles']
+exports.apply = apply
+
+/**
+ * 路由内核的只读出口，仅供 tools/check-route-preview.mjs 做无浏览器自测。
+ * 这些是纯函数（输入文档 → 输出折点），导出去不增加任何运行时耦合。
+ */
+exports.__routeInternals = {
+  clipboardLabelText: clipboardLabelText,
+  hasTextSelectionInPane: hasTextSelectionInPane,
+  isSelectableTextTarget: isSelectableTextTarget,
+  buildGeometry: buildGeometry,
+  routePreview: routePreview,
+  routePreviewFor: routePreviewFor,
+  edgePreviewRoute: edgePreviewRoute,
+  hitNodeAt: hitNodeAt,
+  pathOf: pathOf,
+  pathCost: pathCost,
+  renderDiagram: renderDiagram,
+  computeAlignMoves: computeAlignMoves,
+  marqueeHits: marqueeHits,
+  dragMoveOf: dragMoveOf,
+  draggedGeometry: draggedGeometry,
+  styleTargets: styleTargets,
+  allIdsOf: allIdsOf,
+  alignGuidesFor: alignGuidesFor,
+  boxOfBoxes: boxOfBoxes,
+  // 图层 / 查找 / 微移 / 分组 / 叠放（纯函数出口，供自测）
+  hiddenLayerIds: hiddenLayerIds,
+  isHiddenCell: isHiddenCell,
+  layerLabelOf: layerLabelOf,
+  layerPreviewDoc: layerPreviewDoc,
+  LayersPanel: LayersPanel,
+  ExportPanel: ExportPanel,
+  ImageTracePanel: ImageTracePanel,
+  VideoTracePanel: VideoTracePanel,
+  VideoTraceStatusCard: VideoTraceStatusCard,
+  videoTracePlan: videoTracePlan,
+  waitForVideoTraceEvent: waitForVideoTraceEvent,
+  applyVideoTraceToDoc: applyVideoTraceToDoc,
+  ImageTraceControl: ImageTraceControl,
+  ToolbarPopover: ToolbarPopover,
+  applyImageTraceToDoc: applyImageTraceToDoc,
+  traceDrawingLayers: traceDrawingLayers,
+  createTraceDrawingPlayback: createTraceDrawingPlayback,
+  TraceDrawingSurface: TraceDrawingSurface,
+  exportDocument: exportDocument,
+  exportGeometry: exportGeometry,
+  exportOutputSize: exportOutputSize,
+  svgTreeToDom: svgTreeToDom,
+  nextLayerIdOf: nextLayerIdOf,
+  layerIsLocked: layerIsLocked,
+  filterEditableIds: filterEditableIds,
+  nudgeSelectionInDoc: nudgeSelectionInDoc,
+  findInDoc: findInDoc,
+  docFilteredToIds: docFilteredToIds,
+  isContainerNode: isContainerNode,
+  expandDragIds: expandDragIds,
+  sectionAtPoint: sectionAtPoint,
+  drawOrderOf: drawOrderOf,
+  ensureDrawOrder: ensureDrawOrder,
+  reorderDrawOrder: reorderDrawOrder,
+  loadDrawaiPrefs: loadDrawaiPrefs,
+  saveDrawaiPrefs: saveDrawaiPrefs,
+  DEFAULT_DRAWAI_PREFS: DEFAULT_DRAWAI_PREFS,
+  docFromPayload: docFromPayload,
+  cloneDoc: cloneDoc,
+  defaultLayer: defaultLayer,
+  styleSummary: styleSummary,
+  clampFontSize: clampFontSize,
+  // 文字自适应高度：纯函数，自测直接喂节点夹具断言高度
+  //（也断言编辑框的定位/宽度与最终标签用的是同一套文字区）。
+  nodeTextFitHeight: nodeTextFitHeight,
+  nodeBoxOf: nodeBoxOf,
+  labelTextBox: labelTextBox,
+  imageContentRect: imageContentRect,
+  labelTextWidth: labelTextWidth,
+  labelWraps: labelWraps,
+  labelLineHeight: labelLineHeight,
+  nodeEditorBox: nodeEditorBox,
+  edgeEditorBox: edgeEditorBox,
+  wrapLabel: wrapLabel,
+  pathFromAddress: pathFromAddress,
+  computeFitView: computeFitView,
+  resizeViewFor: resizeViewFor,
+  zoomViewAt: zoomViewAt,
+  contentBounds: contentBounds,
+  labelPaintBounds: labelPaintBounds,
+  paintedBounds: paintedBounds,
+  edgeLabelPointAt: edgeLabelPointAt,
+  edgeLabelPosition: edgeLabelPosition,
+  relativePointOnPath: relativePointOnPath,
+  labelPosFor: labelPosFor,
+  labelBox: labelBox,
+  labelGapsOnPath: labelGapsOnPath,
+  cutPathByGaps: cutPathByGaps,
+  snapLabelPoint: snapLabelPoint,
+  parseCssColor: parseCssColor,
+  formatDataLines: formatDataLines,
+  parseDataLines: parseDataLines,
+  snapDocGeometry: snapDocGeometry,
+  openTabIn: openTabIn,
+  tabLabelOf: tabLabelOf,
+  edgeRoutePoints: edgeRoutePoints,
+  prunePoints: prunePoints,
+  samePath: samePath,
+  simplifyCollinear: simplifyCollinear,
+  removeRetraces: removeRetraces,
+  isFoldApex: isFoldApex,
+  snapNearAxis: snapNearAxis,
+  anchorSidesOf: anchorSidesOf,
+  pickSides: pickSides,
+  stubPointFor: stubPointFor,
+  borderPointToward: borderPointToward,
+  sidesFromStyle: sidesFromStyle,
+  pinnedSideOf: pinnedSideOf,
+  chainForRoute: chainForRoute,
+  dropTargetOf: dropTargetOf,
+  // 移动单位（节点整格 / 连线半格）：自测直接断言这几个纯函数，规则被改坏就会红。
+  snapTo: snapTo,
+  resizeBox: resizeBox,
+  segmentMoveOf: segmentMoveOf,
+  GRID: GRID,
+  EDGE_GRID: EDGE_GRID,
+  MIN_NODE_W: MIN_NODE_W,
+  MIN_NODE_H: MIN_NODE_H,
+  NEW_NODE_W: NEW_NODE_W,
+  NEW_NODE_H: NEW_NODE_H,
+  // SVG 内容节点：形状格里的占位图 + "换形状时要不要补内容"这条规则（纯函数，自测直接断言）。
+  NEW_SVG_SIZE: NEW_SVG_SIZE,
+  DEFAULT_SVG_MARKUP: DEFAULT_SVG_MARKUP,
+  styleForShapePick: styleForShapePick,
+  SHAPE_LIBRARY: SHAPE_LIBRARY,
+  EDGE_LINE_LIBRARY: EDGE_LINE_LIBRARY,
+  isEdgeLineKind: isEdgeLineKind,
+  edgeLineLabelOf: edgeLineLabelOf,
+  RAIL_FAMILIES: RAIL_FAMILIES,
+  railIcon: railIcon,
+  shapeFamilyOf: shapeFamilyOf,
+  shapesInFamily: shapesInFamily,
+  shapeLabelOf: shapeLabelOf,
+  defaultShapeOfFamily: defaultShapeOfFamily,
+  familyLabelOf: familyLabelOf,
+  FALLBACK_NODE_W: FALLBACK_NODE_W,
+  FALLBACK_NODE_H: FALLBACK_NODE_H,
+  routeThroughWaypoints: routeThroughWaypoints,
+  routeEdge: routeEdge,
+  routeCandidates: routeCandidates,
+  pickCandidate: pickCandidate,
+  applyRouteHysteresis: applyRouteHysteresis,
+  ROUTE_SETTLE_FRAMES: ROUTE_SETTLE_FRAMES,
+  buildGeometry: buildGeometry,
+  pathCost: pathCost,
+  withinSlack: withinSlack,
+  hasMidpointEnds: hasMidpointEnds,
+  ROUTE_LENGTH_SLACK: ROUTE_LENGTH_SLACK,
+  selfLoopPath: selfLoopPath,
+  nextSideOf: nextSideOf,
+  collectClipboard: collectClipboard,
+  pasteInto: pasteInto,
+  imageFilesFromDataTransfer: imageFilesFromDataTransfer,
+  mediaFilesFromDataTransfer: mediaFilesFromDataTransfer,
+  hasMediaFileDrag: hasMediaFileDrag,
+  videoFileExtension: videoFileExtension,
+  readVideoFile: readVideoFile,
+  uploadVideoFile: uploadVideoFile,
+  applyImportedVideoToDoc: applyImportedVideoToDoc,
+  fitImageNodeSize: fitImageNodeSize,
+  IMAGE_PASTE_MAX_SIDE: IMAGE_PASTE_MAX_SIDE,
+  IMAGE_PASTE_MAX_BYTES: IMAGE_PASTE_MAX_BYTES,
+  // 按键归属：谁在打字、这次按键算不算画布的 —— 纯函数，自测直接喂假 DOM 节点。
+  isTextEntry: isTextEntry,
+  canvasOwnsKeyboard: canvasOwnsKeyboard,
+  claimCanvasKeyboard: claimCanvasKeyboard,
+  // 「你有没有选中画布之外的文字」——决定 Ctrl+C/X/A 放不放手让浏览器去复制。
+  hasTextSelectionOutside: hasTextSelectionOutside,
+  drawaiPaneOf: drawaiPaneOf,
+  clearStaleTextSelection: clearStaleTextSelection,
+  ensurePinned: ensurePinned,
+  SIDES: SIDES,
+  HOT_PAD: HOT_PAD,
+  GRID: GRID,
+}

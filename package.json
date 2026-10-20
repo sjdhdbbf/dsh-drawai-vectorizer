@@ -1,0 +1,73 @@
+{
+  "name": "dsh-drawai",
+  "version": "0.4.0",
+  "type": "module",
+  "description": "DSH 右侧栏的可编辑画布 + AI 语义绘图工具（diagram_apply / diagram_read），直接读写原生 .drawio 文件；本版新增 vtracer 高质量矢量化引擎（贝塞尔样条 / 每通道位深 / 一半核心并行）",
+  "license": "MIT",
+  "author": "fourzkw（上游）· HQ fork 增强",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fourzkw/dsh-drawai.git"
+  },
+  "forkOf": {
+    "name": "dsh-drawai",
+    "version": "0.3.2",
+    "url": "https://github.com/fourzkw/dsh-drawai",
+    "changes": "新增 vtracer 引擎（src/vtrace.js）：视频与单图绘制可选 plugin（原版自研描边）/ vtracer（高质量），支持 fast/hifi/pixel 三档与参数覆盖；并行度改为一半逻辑核心（原 min(4, 核-1)）；traceImage op 支持 engine 参数"
+  },
+  "main": "lib/index.js",
+  "scripts": {
+    "build": "node tools/build.mjs",
+    "watch": "node tools/watch.mjs",
+    "check": "node tools/check-package.mjs",
+    "test": "node tools/check-adaptive-palette.mjs && node tools/check-auto-save.mjs && node tools/check-drawing-queue.mjs && node tools/check-background-tasks.mjs && node tools/check-background-ui.mjs && node tools/check-trace-optimization.mjs && node tools/check-performance.mjs && node tools/check-mxfile.mjs && node tools/check-route-preview.mjs && node tools/check-host.mjs && node tools/check-render.mjs && node tools/check-component.mjs && node tools/check-text-copy.mjs && node tools/check-image-export.mjs && node tools/check-canvas-sessions.mjs && node tools/check-trace.mjs && node tools/check-media.mjs && node tools/check-video-player.mjs && node tools/check-image-trace.mjs && node tools/check-video-trace.mjs && node tools/check-video-reuse.mjs && node tools/check-video-audio.mjs && node tools/check-video-export.mjs && node tools/check-video-import.mjs && node tools/check-node-labels.mjs",
+    "bench:performance": "node tools/benchmark-performance.mjs"
+  },
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "FORK-CHANGES.md"
+  ],
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin",
+    "diagram",
+    "drawio",
+    "mxfile",
+    "canvas",
+    "vectorize",
+    "vtracer",
+    "trace-image",
+    "svg"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@neplex/vectorizer": "^0.1.0",
+    "@resvg/resvg-js": "^2.6.2"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.1 <0.1.0 || >=0.1.5-rc.1 <0.2.0-0 || >=0.2.0-rc.1 <0.3.0-0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-sidebar-right",
+        "@deepseek-ai/dsh-api-workspace-files"
+      ]
+    }
+  }
+}

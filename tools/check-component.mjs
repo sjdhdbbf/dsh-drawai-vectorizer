@@ -1,0 +1,1507 @@
+/**
+ * 整组件渲染自测 —— 拿**形状不对的状态**去渲染画布组件，看它会不会整块降级。
+ *
+ * 为什么需要它：CanvasView 有一圈 CanvasBoundary，任何渲染期异常都会
+ * 把整张画布换成一个红底错误页 —— "画布未渲染"，用户什么都干不了。
+ * 而 check-render.mjs 只测 renderDiagram（纯函数），**测不到组件渲染期**，
+ * 所以这类崩溃以前只能靠用户在页面上撞见。
+ *
+ * 真实事故（就是本脚本的由来）：
+ *   DrawAI 渲染异常（已降级，画布未渲染）
+ *   Cannot read properties of null (reading 'length')  at renderDocMenu
+ * —— `fileList` 的某个 setState 少了一个字段，renderDocMenu 直接读 `.error.length` 就炸了。
+ *
+ * 做法：用带 hooks 的最小 React 桩把组件真跑一遍（useState 存值、useEffect 收集后手跑），
+ * 然后逐个畸形状态渲染，只要抛错就失败。
+ *
+ * 用法：node tools/check-component.mjs
+ */
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { dirname, resolve } from 'node:path'
+import { composeClientBody } from './build.mjs'
+import * as styleKernel from '../src/style-kernel.js'
+
+const here = dirname(fileURLToPath(import.meta.url))
+// 与产物同款的组合 body（内联的样式内核 + src/client.js）：组件里会用到内核函数，
+// 裸的 src/client.js 在这里会 ReferenceError。
+const src = composeClientBody()
+
+let failures = 0
+let checks = 0
+
+function ok(condition, label) {
+  checks += 1
+  if (condition) {
+    console.log('  ✓ ' + label)
+    return true
+  }
+  failures += 1
+  console.log('  ✗ ' + label)
+  return false
+}
+
+/** 带 hooks 的最小 React 桩：足以让组件跑完一次渲染。 */
+function makeReact() {
+  const store = []
+  const effects = []
+  let cursor = 0
+  return {
+    Component: class {
+      constructor(p) {
+        this.props = p
+        this.state = {}
+      }
+      setState(s) {
+        this.state = Object.assign({}, this.state, s)
+      }
+    },
+    createElement: (type, props, ...children) => ({ type, props: props || {}, children }),
+    useState: (init) => {
+      const i = cursor++
+      if (!(i in store)) store[i] = typeof init === 'function' ? init() : init
+      return [
+        store[i],
+        (v) => {
+          store[i] = typeof v === 'function' ? v(store[i]) : v
+        },
+      ]
+    },
+    useRef: () => ({ current: null }),
+    useEffect: (fn) => {
+      effects.push(fn)
+    },
+    Fragment: 'Fragment',
+    __reset() {
+      cursor = 0
+    },
+    __runEffects() {
+      for (const fn of effects) {
+        try {
+          fn()
+        } catch (error) {
+          /* 桩里不关心 effect 内部失败 */
+        }
+      }
+      effects.length = 0
+    },
+    __store: store,
+  }
+}
+
+const fakeDocument = {
+  head: { appendChild() {} },
+  createElement: () => ({ setAttribute() {}, removeChild() {}, parentNode: null, textContent: '' }),
+  createElementNS: () => ({ setAttribute() {} }),
+  getElementById: () => null,
+  body: { appendChild() {}, removeChild() {} },
+}
+
+/** 渲染一次；返回 { error } 表示渲染期抛了错。 */
+function renderOnce(seed) {
+  const React = makeReact()
+  const mod = { exports: {} }
+  // 注意：别把 React 当形参传进去 —— 源码里有 `const React = require('react')`，同名形参会撞。
+  new Function('module', 'exports', 'require', 'window', 'document', src)(
+    mod,
+    mod.exports,
+    (s) => {
+      if (s === 'react') return React
+      throw new Error('unexpected require ' + s)
+    },
+    { addEventListener() {}, removeEventListener() {} },
+    fakeDocument,
+  )
+  const slots = []
+  mod.exports.apply({
+    effect: (fn) => {
+      fn()
+      return () => {}
+    },
+    slots: {
+      inject: (name, fn) => fn(),
+      register: (opts, comp) => {
+        slots.push(comp)
+        return () => {}
+      },
+    },
+    sidebarRightTabs: { register: () => () => {} },
+    timeout: () => () => {},
+    interval: () => () => {},
+    get: () => undefined,
+  })
+  const Comp = slots[0]
+  if (typeof Comp !== 'function') return { error: '没拿到画布组件（slot 注册形状变了？）' }
+  if (seed !== undefined) for (const [i, v] of Object.entries(seed)) React.__store[i] = v
+  React.__reset()
+  try {
+    Comp({ sessionId: 's1' })
+    React.__runEffects()
+    Comp({ sessionId: 's1' })
+  } catch (error) {
+    return { error: error && error.message ? error.message : String(error) }
+  }
+  return {}
+}
+
+/**
+ * 按**大括号配平**截出某个函数的函数体。
+ *
+ * 不用正则：正则很容易跨到下一个函数去（我自己就写错过一次，得出了错误的"通过"）。
+ * 多个小节都要用它，所以放在顶层共享。
+ */
+function bodyOf(name) {
+  const start = src.indexOf('function ' + name + '(')
+  if (start < 0) return null
+  const braceOpen = src.indexOf('{', start)
+  let depth = 0
+  for (let i = braceOpen; i < src.length; i += 1) {
+    if (src[i] === '{') depth += 1
+    else if (src[i] === '}') {
+      depth -= 1
+      if (depth === 0) return src.slice(braceOpen, i + 1)
+    }
+  }
+  return null
+}
+
+console.log('整组件渲染：状态形状不对时也不能整块降级\n')
+{
+  const cases = [
+    ['正常（初始状态）', undefined],
+    ['fileList = null（未拉取）', { 2: 'open', 4: null }],
+    ['{ files: null, error: "" }（读取中）', { 2: 'open', 4: { files: null, error: '' } }],
+    ['{ files: [], error: "" }（空列表）', { 2: 'open', 4: { files: [], error: '' } }],
+    ['{ files: ["a.drawio"], error: "" }', { 2: 'open', 4: { files: ['a.drawio'], error: '' } }],
+    ['缺 error 字段 ← 真实事故就是这种', { 2: 'open', 4: { files: ['a.drawio'] } }],
+    ['缺 files 字段', { 2: 'open', 4: { error: 'boom' } }],
+    ['fileList = 字符串（形状完全错）', { 2: 'open', 4: 'oops' }],
+    ['{ files: [1,2], error: 5 }（字段类型也不对）', { 2: 'open', 4: { files: [1, 2], error: 5 } }],
+  ]
+  for (const [label, seed] of cases) {
+    const r = renderOnce(seed)
+    ok(r.error === undefined, label + (r.error === undefined ? '' : ' —— 抛错：' + r.error))
+  }
+
+  // 面板的各种打开状态都不能炸
+  for (const mode of ['open', 'saveAs']) {
+    const r = renderOnce({ 2: mode, 4: { files: [], error: '' } })
+    ok(r.error === undefined, '面板 docMenu=' + mode + ' 渲染正常')
+  }
+}
+
+console.log('\n「打开」与「选择目录…」职责必须分开')
+{
+  // 曾经每次点「打开」都弹一次系统文件管理器 —— 多数时候用户只是想切到另一个画布。
+  // 现在：「打开」直接列上次用过的目录；只有点「选择目录…」才弹选择器。
+  // 用大括号配平截函数体，避免正则跨到下一个函数（这一点我自己就写错过一次）。
+  const bodyOf = (name) => {
+    const start = src.indexOf('async function ' + name + '(')
+    if (start < 0) return null
+    const open = src.indexOf('{', start)
+    let depth = 0
+    for (let i = open; i < src.length; i += 1) {
+      if (src[i] === '{') depth += 1
+      else if (src[i] === '}') {
+        depth -= 1
+        if (depth === 0) return src.slice(open, i + 1)
+      }
+    }
+    return null
+  }
+  const openFn = bodyOf('openFilePicker')
+  const pickFn = bodyOf('pickDirectoryAndList')
+  ok(openFn !== null && !/pickDirectory\s*\(/.test(openFn), '「打开」不再调 pickDirectory()')
+  ok(openFn !== null && /fetchFileList\(lastPickedDirRef\.current\)/.test(openFn), '「打开」只列上次用过的目录')
+  ok(pickFn !== null && /pickDirectory\s*\(/.test(pickFn), '「选择目录…」才调 pickDirectory()')
+  ok(pickFn !== null && /lastPickedDirRef\.current = picked/.test(pickFn), '选中后记住该目录')
+}
+
+console.log('\n「打开」一个文件 = 多出它的标签页（不是改名替换当前标签）')
+{
+  // 之前 switchTo 走的是 onRebind —— 那会把**当前标签改名并替换**，
+  // 于是"打开"完看不到新文件的标签，用户正在编辑的那张也丢了位置。
+  // 现在走 onOpenTab：已开过就切过去，没开过就新增一个标签。
+  const bodyOf = (name) => {
+    const start = src.indexOf('async function ' + name + '(')
+    if (start < 0) return null
+    const open = src.indexOf('{', start)
+    let depth = 0
+    for (let i = open; i < src.length; i += 1) {
+      if (src[i] === '{') depth += 1
+      else if (src[i] === '}') {
+        depth -= 1
+        if (depth === 0) return src.slice(open, i + 1)
+      }
+    }
+    return null
+  }
+  const sw = bodyOf('switchTo')
+  ok(sw !== null && /onOpenTab\(relPath\)/.test(sw), 'switchTo 通过 onOpenTab 打开（新增/切换标签）')
+  ok(sw !== null && !/onRebind\(/.test(sw), 'switchTo 不再用 onRebind（那是改名替换）')
+  ok(sw !== null && !/saveNow\(/.test(sw), '不必先保存：当前标签只是被留在后面，内容没丢')
+  // 另存为仍然要用 onRebind（它确实是"把当前标签改名"）
+  const saveAs = bodyOf('saveAs')
+  ok(saveAs !== null && /onRebind\(/.test(saveAs), 'saveAs 仍然用 onRebind（改名绑定到新文件）')
+
+  // 文件列表项必须带"身份"（绝对路径）——否则同一文件会开出两个标签
+  ok(/isArray\(payload\.absolute\)/.test(src), '客户端读取宿主给的 absolute 数组')
+  ok(/entries\.push\(\{ path: identity, display: rel\[i\] \}\)/.test(src), '列表项形如 { path: identity, display }')
+}
+
+console.log('\n工具条：按类型合并为下拉菜单')
+{
+  // 从源码里抽出**同一段作用域的真实代码**执行它：
+  //   item  →  layerMenuItems  →  toolbarMenus
+  //
+  // 为什么不把 layerMenuItems 桩成 `() => []`（曾经就是这么写的）：
+  // 真实事故 —— `item`（菜单项构造器）原来定义在 toolbarMenus 肚子里，而 layerMenuItems
+  // 是外层函数，于是「图层」菜单一被调用就 `ReferenceError: item is not defined`，
+  // 整张画布降级成"画布未渲染"。桩掉之后真实函数体一次都没跑过，全绿到底。
+  // 现在把这段作用域整体求值并**真的调用两个函数**：自由变量对不上会立刻炸出来。
+  const regionStart = src.indexOf('  const item = (label, onClick, opts) => ({')
+  const tbStart = src.indexOf('  function toolbarMenus() {')
+  ok(regionStart >= 0, '源码里有菜单项构造器 item')
+  ok(tbStart > regionStart, 'layerMenuItems 与 toolbarMenus 在同一段作用域里（能一起抽出来跑）')
+  // layerList / activeLayerId 是**菜单之外**也要用的派生状态（新单元盖章），
+  // 所以它必须定义在组件体靠前的位置 —— 与最早用它的那一行比一比。
+  const layerListDecl = src.indexOf('  const layerList = doc !== null')
+  const firstUse = src.indexOf('if (activeLayerId !== null')
+  ok(layerListDecl >= 0 && firstUse > layerListDecl, 'layerList / activeLayerId 定义在**最早用到它之前**（否则就是 TDZ 地雷）')
+
+  let end = -1
+  if (tbStart >= 0) {
+    const braceOpen = src.indexOf('{', tbStart)
+    let depth = 0
+    for (let i = braceOpen; i < src.length; i += 1) {
+      if (src[i] === '{') depth += 1
+      else if (src[i] === '}') {
+        depth -= 1
+        if (depth === 0) {
+          end = i + 1
+          break
+        }
+      }
+    }
+  }
+  const region = end > regionStart ? src.slice(regionStart, end) : ''
+  const itemDecl = src.indexOf('const item = (label, onClick, opts) => ({')
+  ok(itemDecl >= 0, '源码里有菜单项构造器 item（只此一处）')
+  ok(itemDecl >= 0 && tbStart >= 0 && itemDecl < tbStart, 'item 定义在 toolbarMenus **之外**（否则外层函数看不见它 —— 真实事故）')
+  ok((region.match(/const item = \(label, onClick, opts\)/g) || []).length === 1, '这段作用域里 item 只有一份（两边共用，不各写一份）')
+
+  /** 在沙箱里跑一遍这段真实代码，返回 { menus, items }（失败返回 { error }）。 */
+  const evalMenus = (over) => {
+    const sandbox = {
+      // toolbarMenus / layerMenuItems 引用到的自由变量必须**全部**列在这里，
+      // 否则 new Function 求值或调用时直接 ReferenceError —— 这本身就是一种接线检查。
+      // layerList / activeLayerId 就是组件体里那两个派生常量（这里喂数据当值）。
+      layerList: [
+        { id: '1', name: '主流程', visible: true, locked: false },
+        { id: 'L2', name: '草稿', visible: false, locked: false },
+      ],
+      activeLayerId: '1',
+      layerLabelOf: (layer, i) => (typeof layer.name === 'string' && layer.name.length > 0 ? layer.name : '第 ' + (i + 1) + ' 层'),
+      toggleLayerVisible: () => {},
+      toggleLayerLocked: () => {},
+      openRenameLayer: () => {},
+      removeLayer: () => {},
+      moveSelectionToLayer: () => {},
+      setCurrentLayerId: () => {},
+      createLayer: () => {},
+      openFindPanel: () => {},
+      openPrefsPanel: () => {},
+      dissolveSection: () => {},
+      openNewCanvasPanel: () => {},
+      openFilePicker: () => {},
+      copySelection: () => {},
+      cutSelection: () => {},
+      pasteClipboard: () => {},
+      selectAll: () => {},
+      revertAiChange: () => {},
+      canRevert: true,
+      normalizeGeometry: () => {},
+      saveNow: () => {},
+      openSaveAsPanel: () => {},
+      pickDirectoryAndList: () => {},
+      undo: () => {},
+      redo: () => {},
+      setViewOverride: () => {},
+      setMode: () => {},
+      setNonce: () => {},
+      setSelectedIds: () => {},
+      setExportRequest: () => {},
+      switchPage: () => {},
+      pageCount: 1,
+      pageIndex: 0,
+      hasPath: true,
+      canSave: true,
+      canUndo: true,
+      canRedo: true,
+      // 复制/剪切要在有选区时可用 —— 它也是 toolbarMenus 的自由变量。
+      selectedIds: ['n1'],
+      modeTag: 'draw.io 外观',
+      // 空舞台（一张画布都没打开）时菜单项要禁用 —— 它也是 toolbarMenus 的自由变量。
+      empty: false,
+      showGrid: true,
+    }
+    Object.assign(sandbox, over === undefined ? {} : over)
+    const names = Object.keys(sandbox)
+    try {
+      const out = new Function(...names, region + '\n  return { menus: toolbarMenus(), items: layerMenuItems() }')(
+        ...names.map((n) => sandbox[n]),
+      )
+      return out
+    } catch (error) {
+      return { error: error && error.message ? error.message : String(error) }
+    }
+  }
+
+  const ran = evalMenus()
+  ok(ran.error === undefined, '这一段真实代码能求值并调用（自由变量对不上会在这里炸）：' + (ran.error === undefined ? 'ok' : ran.error))
+  const menus = ran.error === undefined ? ran.menus : null
+  const layerItems = ran.error === undefined ? ran.items : null
+
+  if (layerItems !== null) {
+    // 每层 5 项（显示/锁定/当前/重命名/删除）× 2 + 新建 + 选中移层 × 2 = 13
+    ok(layerItems.length === 13, '两层的图层菜单 = 每层 5 项 ×2 + 新建 + 选中移层 ×2（实际 ' + layerItems.length + '）')
+    ok(layerItems[0].label === '👁 主流程' && layerItems[5].label === '🚫 草稿', '显示/隐藏项：眼睛 + 层名（隐藏的画 🚫）')
+    ok(layerItems[1].label.indexOf('锁定：主流程') >= 0, '锁定项在显示项后面')
+    ok(layerItems[2].label === '● 当前：主流程' && layerItems[7].label === '○ 当前：草稿', '当前图层项标出哪一层是当前层')
+    ok(layerItems[10].label === '＋ 新建图层', '有「新建图层」入口')
+    ok(layerItems[0].keepOpen === true && layerItems[2].keepOpen === true, '显示/当前都 keepOpen（连点几层不用重开菜单）')
+    ok(layerItems[10].keepOpen !== true, '「新建图层」点完收起菜单')
+    ok(layerItems[11].label === '选中 → 主流程' && layerItems[12].label === '选中 → 草稿', '有选区时列出「选中 → 层」')
+
+    // 点下去要打给**对的**函数、带上**对的**层 id（只断言"有 onClick"是不够的）
+    const hits = []
+    const clicked = evalMenus({
+      toggleLayerVisible: (id) => hits.push('显示:' + id),
+      toggleLayerLocked: (id) => hits.push('锁:' + id),
+      setCurrentLayerId: (id) => hits.push('当前:' + id),
+      createLayer: () => hits.push('新建'),
+      moveSelectionToLayer: (id) => hits.push('移:' + id),
+    })
+    ok(clicked.error === undefined, '带记录桩求值成功')
+    if (clicked.error === undefined) {
+      clicked.items[0].onClick()
+      clicked.items[5].onClick()
+      clicked.items[7].onClick()
+      clicked.items[10].onClick()
+      clicked.items[12].onClick()
+      ok(
+        hits.join('|') === '显示:1|显示:L2|当前:L2|新建|移:L2',
+        '点每一项都打给对的函数与层 id（实际 ' + hits.join('|') + '）',
+      )
+    }
+
+    // 空舞台（还没有图层）= 一句禁用说明，不能炸、也不能给出点了没用的项
+    const blank = evalMenus({ layerList: [], activeLayerId: null, selectedIds: [] })
+    ok(blank.error === undefined, '没有图层列表（空舞台）时图层菜单照样算得出来')
+    if (blank.error === undefined) {
+      ok(blank.items.length === 1 && blank.items[0].disabled === true, '没有图层信息时只给一项禁用的说明')
+    }
+  }
+
+  if (menus !== null) {
+    ok(menus.map((m) => m.key).join(',') === 'file,edit,layers,view,export', '恰好 5 类：文件 / 编辑 / 图层 / 视图 / 导出（实际 ' + menus.map((m) => m.key).join(',') + '）')
+    const total = menus.reduce((n, m) => n + m.items.length, 0)
+    // 固定项会随功能增减；只断言「图层」菜单就是 layerMenuItems，且总数 = 非图层固定项 + 图层项
+    const layersMenu = menus.filter((m) => m.key === 'layers')[0]
+    ok(
+      layersMenu !== undefined && layersMenu.items.length === 0 && /React\.createElement\(LayersPanel/.test(src),
+      '图层入口使用列表面板，不再展开每层五个菜单动作',
+    )
+    const fixed = total
+    ok(fixed >= 18, '文件/编辑/视图的常用动作仍然保留（实际 ' + fixed + '）')
+    ok(menus.every((m) => typeof m.title === 'string' && m.title.length > 0), '每个菜单都有悬停说明（title）')
+    ok(menus.every((m) => m.items.every((i) => typeof i.label === 'string' && i.label.length > 0)), '每一项都有 label')
+    ok(menus.every((m) => m.items.every((i) => typeof i.onClick === 'function')), '每一项都有 onClick')
+    const labels = menus.reduce((a, m) => a.concat(m.items.map((i) => i.label)), [])
+    for (const gone of ['新建画布…', '打开…', '撤销', '重做', '适应内容']) {
+      ok(labels.indexOf(gone) >= 0, '旧按钮「' + gone + '」已收进菜单')
+    }
+    ok(/React\.createElement\(ExportPanel/.test(src), '导出入口使用参数面板')
+    ok(/\['transparent', '透明'\]/.test(src), '导出面板提供透明背景选项')
+    ok(labels.indexOf('全选') >= 0, '「全选」在编辑菜单里（Ctrl+A 之外的入口）')
+    ok(labels.indexOf('查找…') >= 0, '「查找…」在编辑菜单里（Ctrl+F）')
+    ok(/\['selection', '当前选区/.test(src), '导出面板提供选区范围')
+    // 工具条本身只应渲染菜单入口
+    const headStart = src.indexOf('const head = React.createElement(')
+    const headEnd = src.indexOf('  let body', headStart)
+    const headSrc = headEnd > headStart ? src.slice(headStart, headEnd) : ''
+    ok(/toolbarMenus\(\)\.map/.test(headSrc), '工具条通过 toolbarMenus().map 渲染入口')
+    ok(!/'撤销'|'重做'|'适应'|'SVG'|'PNG'|'刷新'/.test(headSrc), '工具条不再逐个写旧按钮')
+    // 菜单要贴在**触发它的按钮**下方，而不是统一跑到左上角
+    ok(/onClick: \(\) => toggleToolbarMenu\(m\.key\)/.test(headSrc), '每个入口把自己的 key 交给 toggleToolbarMenu')
+    ok(/toolBtnRefs\.current\[m\.key\] = el/.test(headSrc), '每个入口把 DOM 交给 toolBtnRefs（要量位置）')
+    const posFn = bodyOf('menuPosFor') || ''
+    ok(/rootRef\.current/.test(posFn), 'menuPosFor 以**本视图根元素**为参照系（菜单挂在 root 上）')
+    ok(!/toolsRef/.test(src), '不再用 .drawai-tools 当参照（它没有 position:relative，会横着跑偏）')
+    const toggle = bodyOf('toggleToolbarMenu') || ''
+    ok(/setDocMenuPos\(menuPosFor\(m?key\)\)/.test(toggle) || /setDocMenuPos\(menuPosFor\(/.test(toggle), '开菜单时记下按钮位置')
+    ok(/setDocMenuPos\(null\)/.test(toggle), '收起菜单时清掉位置')
+    const styleFn = bodyOf('panelStyle') || ''
+    ok(/Math\.min/.test(styleFn) && /maxLeft/.test(styleFn), 'panelStyle 把面板夹在画布范围内（右栏窄，不夹会跑到看不见）')
+    ok((src.match(/panelStyle\(docMenuPos\)/g) || []).length >= 2, '面板都用同一套定位')
+  }
+}
+
+console.log('\n启动行为：空舞台（没有"未绑定画布"那一套）')
+{
+  // 需求：打开 drawai 画布后**应该为空**，而不是直接冒出一张未绑定画布；
+  // 要画布就自己「新建画布…」或「打开…」—— 两个入口都在工作栏里，而工作栏在标签页之上。
+  ok(/const \[tabs, setTabsState\] = React\.useState\(\(\) => workspace.tabs\)/.test(src), '标签从会话缓存恢复，首次使用为空舞台')
+  ok(!/provisional/.test(src), '不再有"占位标签"这一套（那是上一版的补丁）')
+  ok(/const bootstrappedRef = React\.useRef\(workspace.bootstrapped\)/.test(src), '会话恢复时保留初始化决定')
+  const boot = src.slice(src.indexOf('if (bootstrappedRef.current) return'), src.indexOf('}, [tabPath])'))
+  ok(boot.length > 0, 'CanvasTabs 里有 bootstrap effect')
+  ok(/setTabs\(\[\{ key: key, path: tabPath \}\]\)/.test(boot), '地址到了 → 开真文件的标签')
+  ok(/if \(tabPath === null\) return/.test(boot), '地址给不出 → 什么都不开（保持空舞台）')
+  const setTabsCalls = boot.match(/setTabs\(/g) || []
+  ok(setTabsCalls.length === 1 && /setTabs\(\[\{ key: key, path: tabPath \}\]\)/.test(boot), 'bootstrap 里只有一次 setTabs，且只开真文件的标签（没有任何空画布兜底）')
+
+  // "未绑定画布"那一整套代码必须消失（注释里提历史可以，用户可见的字符串与标识符不行）
+  ok(!/unbound/.test(src), '源码里不再有 unbound（未绑定画布）')
+  ok(!/UNTITLED/.test(src), '源码里不再有 UNTITLED 哨兵')
+  ok(!/'(\(未绑定\)|未绑定文件|未绑定画布)'/.test(src) && !/AI 对话改不到它/.test(src), '不再有"未绑定"的用户可见文案')
+  ok(!/const blank = \{ version: 2/.test(src), '空舞台不再就地造一份"幽灵空文档"')
+
+  // 空舞台仍然要有工作栏（否则一张画布都没有时连新建/打开都点不到）
+  const emptyStart = src.indexOf('if (tabs.length === 0) {')
+  const emptyBranch = emptyStart >= 0 ? src.slice(emptyStart, src.indexOf('} else {', emptyStart)) : ''
+  ok(/CanvasView/.test(emptyBranch) && /empty: true/.test(emptyBranch), '零标签时渲染 empty 模式的 CanvasView（它带来工作栏）')
+  ok(/tabStrip: null/.test(emptyBranch), '空舞台没有标签条')
+  ok(/还没有打开画布/.test(src), '空舞台给出"还没有打开画布"的提示')
+  ok(/next\.length === 0 \? '' : /.test(bodyOf('closeTab') || ''), '关掉最后一个标签会回到空舞台（不再强制"至少留一个"）')
+}
+
+console.log('\n层级：工作栏在标签页之上')
+{
+  // 工作栏（文件/编辑/视图/导出）要排在标签条**前面**渲染 —— 右栏窄，
+  // "对当前画布做什么"应该一直在最上面，而"现在看哪张"在它下面。
+  const rootStart = src.indexOf("className: 'drawai-root'")
+  const rootEnd = src.indexOf('React.createElement(CopyableStatus', rootStart)
+  const block = rootStart >= 0 && rootEnd > rootStart ? src.slice(rootStart, rootEnd) : ''
+  const iHead = block.indexOf('head,')
+  const iStrip = block.indexOf('props.tabStrip')
+  const iBody = block.indexOf('body,')
+  ok(iHead >= 0 && iStrip > iHead && iBody > iStrip, 'root 的渲染顺序是 工作栏 → 标签条 → 画布（实际 ' + iHead + ' / ' + iStrip + ' / ' + iBody + '）')
+  ok(/tabStrip: isActive \? tabBar : null/.test(src), '标签条只交给活动窗格（DOM 里只有一份）')
+  ok((src.match(/className: 'drawai-tabs'/g) || []).length === 1, '标签条只在一处构造')
+  ok(/const rootRef = React\.useRef\(null\)/.test(src), 'root 上有 ref，供菜单定位')
+}
+
+
+console.log('\n点到外面：收掉下拉菜单，并提交/退出文字输入框')
+{
+  // ① 需求：下拉栏（文件/编辑/图层/视图/导出）与「打开/新建/另存为」面板，
+  //    在**外面**点一下就收掉 —— 不关的话它一直挂在画布上方挡着，而且下次点同一个按钮
+  //    会变成"关掉"而不是"打开"（用户以为按钮坏了）。
+  // ② 需求：点输入框外面就提交并退出（节点文字与线上的文字共用同一个输入框）。
+  //    不能指望 onBlur —— 画布的按下处理里普遍 preventDefault()（框选/拖动/右键），
+  //    而它会挡掉**焦点变化**，输入框根本不 blur。
+  //
+  // 这里把 onRootPointerDown 的**真实函数体**抽出来、喂假事件真的调用一遍
+  // （不是只 grep 源码：这个函数的分支正是"算不算外面"，只能靠跑）。
+  const body = bodyOf('onRootPointerDown')
+  ok(body !== null, '源码里有 onRootPointerDown')
+
+  /** 跑一次：editingValue 是当时的编辑框状态，docMenuValue 是菜单状态，target 是事件目标。 */
+  const runPointer = (docMenuValue, target, editingValue) => {
+    const calls = []
+    const fn = new Function(
+      'docMenu',
+      'setDocMenu',
+      'setDocMenuPos',
+      'editing',
+      'commitEdit',
+      // 这个函数体里调用的每一个自由变量都得从参数里来，否则孤立求值时
+      // 直接 ReferenceError —— 这本身就是一种"接线检查"（新加依赖必须显式登记）。
+      'clearStaleTextSelection',
+      'claimCanvasKeyboard',
+      'rootRef',
+      'isSelectableTextTarget',
+      'return function onRootPointerDown(event) ' + body,
+    )(
+      docMenuValue,
+      (v) => calls.push('menu:' + String(v)),
+      (v) => calls.push('pos:' + String(v)),
+      editingValue === undefined ? null : editingValue,
+      () => calls.push('commit'),
+      (target, button) => calls.push('clear-sel:' + String(button)),
+      (root, target) => calls.push('claim-kb'),
+      { current: {} },
+      new Function('target', bodyOf('isSelectableTextTarget')),
+    )
+    fn({ target: target, button: 0 })
+    return calls
+  }
+
+  // 假事件目标：closest(sel) 命中给定选择器时就返回一个元素，否则 null。
+  const targetInside = (sel) => ({ closest: (s) => (s === sel ? { className: sel } : null) })
+  const targetOutside = { closest: () => null }
+  ok(runPointer(null, targetInside('.drawai-note,.drawai-err,[data-drawai-text]')).length === 0, '提示文字按下时不清选区、不抢画布焦点')
+
+  // `clearStaleTextSelection` + `claimCanvasKeyboard` 每次按下都会被调（在最前面），
+  // 下面这些断言看的是**它们之后**发生了什么 —— 所以统一先摘掉那两格。
+  const CLEAR = 'clear-sel:0'
+  const CLAIM = 'claim-kb'
+  const rest = (calls) => {
+    let out = calls
+    if (out[0] === CLEAR) out = out.slice(1)
+    if (out[0] === CLAIM) out = out.slice(1)
+    return out
+  }
+
+  ok(rest(runPointer(null, targetOutside)).length === 0, '菜单没开、也没在编辑时什么都不做')
+  ok(rest(runPointer('file', targetOutside)).join(',') === 'menu:null,pos:null', '点画布/标签条（外面）→ 关掉菜单与位置：' + rest(runPointer('file', targetOutside)).join(','))
+  ok(rest(runPointer('file', targetInside('.drawai-menu'))).length === 0, '点菜单自己（选项/输入框/按钮）→ 不关')
+  ok(rest(runPointer('file', targetInside('.drawai-menu-trigger'))).length === 0, '点开菜单的那个按钮 → 不在这里关（交给它自己的 toggle：点同一个是关、点另一个是换）')
+  ok(rest(runPointer('file', targetInside('.drawai-tools'))).join(',') === 'menu:null,pos:null', '只放过"开菜单的按钮"，不是整个工作栏（点按钮之间的缝 = 外面 → 关）')
+  ok(rest(runPointer('open', targetOutside)).join(',') === 'menu:null,pos:null', '「打开/新建/另存为」面板同样点外面就关')
+  // 目标没有 closest（例如事件落在 document 上）时，它一定不在菜单里 → 该关
+  ok(rest(runPointer('file', {})).join(',') === 'menu:null,pos:null', '事件目标没有 closest（document 之类）→ 关掉')
+  // 新加的那一步：每次按下都先把"残留在别处的文字选区"清掉（否则会挡住画布的复制）
+  ok(runPointer(null, targetOutside)[0] === CLEAR, '在画布上按下时先清一次别处的文字选区（clearStaleTextSelection 真的被调了）')
+  ok(runPointer(null, targetOutside)[1] === CLAIM, '紧接着收回键盘焦点（claimCanvasKeyboard 真的被调了）')
+  ok(runPointer('file', targetInside('.drawai-menu')).indexOf(CLEAR) === 0, '点菜单里的按钮同样先清（菜单也是画布的一部分）')
+
+  // 文字输入框：外面按一下 → 提交（画布的 preventDefault 挡掉了 blur，只能自己判）
+  const EDIT = { kind: 'node', id: 'n1', text: 'x' }
+  ok(rest(runPointer(null, targetOutside, EDIT)).join(',') === 'commit', '编辑中点到画布空白 → 提交并退出：' + rest(runPointer(null, targetOutside, EDIT)).join(','))
+  ok(rest(runPointer(null, targetInside('.drawai-edit'), EDIT)).length === 0, '点输入框自己（选字/移动光标）→ 不提交')
+  ok(rest(runPointer(null, targetOutside, null)).length === 0, '没在编辑时不会平白提交一次')
+  ok(rest(runPointer('file', targetOutside, EDIT)).join(',') === 'commit,menu:null,pos:null', '两件事可以同时发生：提交文字 + 收掉菜单')
+  // 输入框的 blur 仍然是兜底（点浏览器外、Tab 走焦都会走它）
+  ok(/onBlur: commitEdit/.test(src), '输入框保留 onBlur 兜底（点击浏览器外/Tab 走焦也要提交）')
+
+  // 接线：root 上必须真的挂了这个捕获处理器，否则函数写得再对也没人调
+  ok(/onPointerDownCapture: onRootPointerDown/.test(src), 'root 上挂了 onPointerDownCapture（捕获阶段，早于画布自己的按下处理）')
+  const rootStart = src.indexOf("className: 'drawai-root'")
+  ok(
+    rootStart >= 0 && src.slice(rootStart, rootStart + 280).indexOf('onPointerDownCapture') >= 0 && src.slice(rootStart, rootStart + 280).indexOf('tabIndex') >= 0,
+    '挂的就是 root（画布、标签条、工作栏都在它里面；含 tabIndex 以便收回键盘）',
+  )
+  // 放过的那一类按钮必须真的带这个类名，否则"点同一个按钮关不掉"
+  ok(/className: 'drawai-btn drawai-menu-trigger'/.test(src), '开菜单的按钮带 drawai-menu-trigger 类（与处理器里的选择器对得上）')
+  // 编辑框也要真的带那个类名（否则"点输入框自己"会被判成外面）
+  ok(/className: 'drawai-edit'/.test(src), '输入框带 drawai-edit 类（与处理器里的选择器对得上）')
+  // Esc 同一套语义：菜单开着按 Esc 也该收掉
+  const escStart = src.indexOf("event.key === 'Escape'", src.indexOf('function onKey(event)'))
+  const escBranch = escStart >= 0 ? src.slice(escStart, escStart + 400) : ''
+  ok(/setDocMenu\(null\)/.test(escBranch), 'Esc 也收掉下拉菜单/面板（"退出这一层"的语义要一致）')
+}
+
+console.log('\n双击改标签：按下时不许抢 pointer capture')
+{
+  // 真实事故：`onNodePointerDown` 里按下就 setPointerCapture(画布) —— pointer capture 会把
+  // 随后的 click / dblclick 目标改成**捕获元素**（click 取按下/松开两个目标的公共祖先，
+  // 而被捕获的 pointerup 目标是画布容器），于是节点那个 <g> 不在事件路径里，
+  // "双击节点改内容"彻底失灵（Chrome 判为 working as intended，见 w3c/pointerevents#356）。
+  // 修法：按下只登记，等真的动了（>3px）才在 pointermove 里抢 —— 一次点击完全不抢捕获。
+  const capBody = bodyOf('takePendingCapture')
+  ok(capBody !== null, '源码里有 takePendingCapture')
+
+  // 结构性守卫：全文件里 setPointerCapture 只允许有**一处**调用，并且它在 takePendingCapture 里。
+  // （以前它在 6 个 pointerdown 路径里各抄了一遍，所以双击改标签是全坏的。）
+  const capCalls = src.match(/setPointerCapture\(event\.pointerId\)/g) || []
+  ok(capCalls.length === 1, 'setPointerCapture 全文件只有一处调用（实际 ' + capCalls.length + ' 处）')
+  ok(capBody !== null && capBody.indexOf('setPointerCapture(event.pointerId)') >= 0, '那一处就在 takePendingCapture 里')
+  ok(/function requestCapture\(event\)/.test(src), '按下时走的是 requestCapture（只登记坐标，不抢捕获）')
+  ok((src.match(/requestCapture\(event\)/g) || []).length >= 6, '每个拖动入口都登记（节点/连线/框选/平移/缩放/改接…）：实际 ' + (src.match(/requestCapture\(event\)/g) || []).length + ' 处')
+  ok(/takePendingCapture\(event\)/.test(bodyOf('onCanvasPointerMove') || ''), 'pointermove 里才真正抢捕获')
+  ok(/pendingCaptureRef\.current = null/.test(bodyOf('onCanvasPointerUp') || ''), '手势结束清掉登记（这一轮没拖 = 就是点击，不能在后面的 move 里突然抢）')
+
+  // 行为：喂假事件真的跑一遍
+  const runTake = (pending, move) => {
+    const captured = []
+    const ref = { current: pending }
+    const canvas = { current: { setPointerCapture: (id) => captured.push(id) } }
+    const fn = new Function(
+      'pendingCaptureRef',
+      'canvasRef',
+      'CAPTURE_MOVE_PX',
+      'return function takePendingCapture(event) ' + capBody,
+    )(ref, canvas, 3)
+    fn(move)
+    return { captured: captured, pending: ref.current }
+  }
+
+  const idle = runTake(null, { pointerId: 1, clientX: 10, clientY: 10 })
+  ok(idle.captured.length === 0, '没有登记时什么都不做')
+
+  // 手抖 1px 的点击：不许抢捕获（抢了 dblclick 就落到画布上）
+  const jitter = runTake({ pointerId: 1, x: 100, y: 100 }, { pointerId: 1, clientX: 101, clientY: 100 })
+  ok(jitter.captured.length === 0, '移动 1px（手抖）不抢捕获')
+  ok(jitter.pending !== null, '不抢时登记还留着（后面动得更远再抢）')
+
+  const moved = runTake({ pointerId: 1, x: 100, y: 100 }, { pointerId: 1, clientX: 104, clientY: 100 })
+  ok(moved.captured.join(',') === '1', '移动 4px（真的在拖）才抢捕获：' + moved.captured.join(','))
+  ok(moved.pending === null, '抢过之后登记清掉（不重复抢）')
+
+  const other = runTake({ pointerId: 1, x: 100, y: 100 }, { pointerId: 7, clientX: 200, clientY: 200 })
+  ok(other.captured.length === 0 && other.pending !== null, '别的 pointer 的移动不会替这一路抢捕获（多指/多设备）')
+
+  // 3px 判据与"越 3px 才算拖"同一套手感
+  const exactly = runTake({ pointerId: 1, x: 100, y: 100 }, { pointerId: 1, clientX: 103, clientY: 100 })
+  ok(exactly.captured.length === 0, '正好 3px 还不算拖（判据是 >3）')
+}
+
+console.log('\n线型与字号的手工入口')
+{
+  // 需求："添加直线（无折点），圆弧线等" + "文字的字号均可修改"。
+  // 线型是"语义 + 几何"两件事（直线要清折点、曲线要补弓形中点），所以走 applyLineKind，
+  // 不是普通 updateEdge；字号是三个地方共用同一个控件。
+  ok(/function applyLineKind\(/.test(src), '有 applyLineKind（线型连带几何一起改）')
+  ok(
+    /\['straight', '直线'/.test(src) && /\['sharp', '直角折线'/.test(src) && /\['rounded', '圆角折线'/.test(src) && /\['curved', '曲线'/.test(src),
+    '连线菜单里有 直线 / 直角折线 / 圆角折线 / 曲线 四个入口',
+  )
+  ok(/rounded', '圆角折线', '正交折线，只在折点处倒圆角/.test(src), '圆角折线的说明写清了"只在折点处"（rounded=1）')
+  ok(/applyLineKind\(edgeTargets, it\[0\]\)/.test(src), '点线型对整组连线生效（与改色/箭头一致）')
+  ok(/kind === 'straight'\) \{\s*\n\s*delete e\.points/.test(src) || /if \(kind === 'straight'\) \{\n\s+delete e\.points/.test(src), '选直线会清掉折点')
+  ok(/e\.points = \[\{ x: snap\(/.test(src), '选曲线会给"本来就笔直"的边补一个弓形中点（否则弧看不见）')
+  ok(!/'╱ 直线'/.test(src), '空白处右键不再提供直线创建入口')
+  ok(!/createFreeEdgeAt\(menu\.userX/.test(src), '右键菜单不再调用连线创建函数')
+  ok(/styleWithLineKind\(DEFAULT_EDGE_STYLE, lineKind\)/.test(src), '独立线按线型落 style（styleWithLineKind）')
+  ok(/isEdgeLineKind\(kind\) \? kind : 'rounded'/.test(src), '缺省/未知线型回落到折线（rounded）')
+  // 字号：节点/文字与连线共用同一个控件
+  ok(/function fontSizeRow\(/.test(src), '有 fontSizeRow（三个地方共用）')
+  ok(/const FONT_SIZE_PRESETS = \[/.test(src), '字号有档位表（不写死在 UI 里）')
+  ok(/key: 'fontSize',\s*\n\s*label: '字号',\s*\n\s*value: styleSummary\(nodeStyle, 'fontSize'\)/.test(src), '节点菜单（含独立文字）有字号行')
+  ok(/key: 'fontSize',\s*\n\s*label: '字号',\s*\n\s*value: styleSummary\(edgeBaseStyle, 'fontSize'\)/.test(src), '连线菜单有字号行（改的是线上的字）')
+  ok(/fontSize: v === null \? null : String\(v\)/.test(src), '「默认」= 删掉 fontSize 键（不留 fontSize=0 之类噪音）')
+}
+
+console.log('\n右键菜单：几类只显示当前值，并排成一行')
+{
+  // 需求："右键时不要把所有元素的所有类型都展示出来……仅展示每一类的当前值，每一类可通过下拉列表切换"，
+  // 随后确认："三个「类：当前值」并排成一行"。
+  // 以前一屏铺着 形状 10 个缩略图 + 配色 8 个色块 + 字号 6 个 + 线型 4 个 + 样式 3 个 + 箭头 4 个。
+  ok(/function menuSelectRow\(cats\)/.test(src), '有 menuSelectRow（一次给出若干类）')
+  ok(/menu\.openKey === cat\.key/.test(src), '展开状态记在 menu.openKey 上（换元素右键自动收起、点另一类收起上一类）')
+  ok(/className: 'drawai-btn drawai-select-chip'/.test(src), '每一类是一个 chip 按钮（不是整行）')
+  ok(/cat\.label \+ '：' \+ cat\.value/.test(src), 'chip 上显示的就是「类名：当前值」')
+  ok(/if \(menu\.openKey !== cats\[i\]\.key\) continue/.test(src), '选项体只在展开的那一类下面渲染（收起时一个按钮都不多）')
+  ok(/function closeSelect\(\)/.test(src), '选完一个值就收起来')
+
+  // 三个菜单各自**一次**menuSelectRow 调用里给出全部类 —— 这才是"并排成一行"。
+  // （形状**不在**右键里：入口是右侧常驻元素条 — 族入口 + 同族变体侧面板。）
+  const callSites = src.match(/menuSelectRow\(\[/g) || []
+  ok(callSites.length === 2, '仅节点和连线菜单保留样式选项，空白菜单只提供编辑操作')
+  const categories = ['color', 'fontSize', 'line', 'dash', 'arrow', 'fontColor']
+  for (const key of categories) {
+    ok(new RegExp("key: '" + key + "'").test(src), '「' + key + '」这一类在 menuSelectRow 的 cats 里')
+  }
+  ok(!/key: 'shape',\s*\n\s*label: '形状',\s*\n\s*value:/.test(src), '形状不再是一类"当前值 ▾"（它在右侧元素条）')
+  ok(!/rows\.push\(swatchRow\(/.test(src), '配色不再把 8 个色块直接铺在菜单里')
+  ok(!/rows\.push\(fontSizeRow\(/.test(src), '字号不再把 6 个档位直接铺在菜单里')
+  ok(
+    !/rows\.push\(dashRow\(/.test(src) && !/rows\.push\(arrowRow\(/.test(src) && !/rows\.push\(\s*\n\s*lineRow\(/.test(src),
+    '样式/箭头/线型也不再直接铺开',
+  )
+
+  // 并排：chips 横排 + 每个 chip 不换行；菜单再夹一道最大宽度（否则宽出来的部分会被 overflow:hidden 裁掉）
+  ok(/\.drawai-select-chips\{display:flex;flex-wrap:wrap/.test(src), 'chips 是横向 flex（右栏放不下才折行）')
+  ok(/\.drawai-select-chip\{display:inline-flex;align-items:center;gap:2px;white-space:nowrap\}/.test(src), '单个 chip 是 inline-flex 且不换行（"形状：矩形 ▾"不会被拆成两行）')
+  ok(/const maxWidth = size\.w > 0 \? Math\.max\(180, size\.w - left - 8\)/.test(src), '菜单夹了一道最大宽度（chips 横排后可能比 214px 宽）')
+  ok(/maxWidth: maxWidth === undefined \? undefined : maxWidth \+ 'px'/.test(src), '这个最大宽度真的落到菜单的 style 上')
+
+  // 当前值必须来自纯函数（能被命令行自测直接断言），而不是在 JSX 里现拼
+  ok(/styleSummary: styleSummary,/.test(src), 'styleSummary 挂进 internals（自测能直接调）')
+  ok(!/hint: '新建节点用的配色'/.test(src), '空白处右键不再显示新建节点配色偏好')
+  // 右侧条：主条只放族入口；同族变体进侧面板；放置单次。
+  ok(/function renderShapeRail\(/.test(src), '有右侧常驻元素条 renderShapeRail')
+  ok(/function pickFamilyFromRail\(/.test(src), '有 pickFamilyFromRail（按族放置）')
+  ok(/function pickVariantFromRail\(/.test(src), '有 pickVariantFromRail（同族变体）')
+  ok(/const RAIL_FAMILIES = \[/.test(src), '有 RAIL_FAMILIES（主条只列族，不铺全部形状）')
+  ok(/function railIcon\(/.test(src), '主条用 railIcon 线稿图标（飞书侧栏观感）')
+  ok(/function railIconButton\(/.test(src), '主条入口走 railIconButton，不用彩色形状预览')
+  ok(/function railShapeButton\(/.test(src), '侧面板变体仍用真实形状缩略图')
+  ok(/className: 'drawai-rail-panel'/.test(src), '同族变体走白色气泡面板，不铺在主条')
+  ok(/function openRailFamilyPanel\(/.test(src), '悬停打开同族气泡（openRailFamilyPanel）')
+  ok(/function openRailHover\(/.test(src), '侧栏悬停统一走 openRailHover（多变体面板 / 末级名称）')
+  ok(/function railHoverTipLabel\(/.test(src), '最后一级用 railHoverTipLabel 出名称')
+  ok(/drawai-rail-tip/.test(src), '最后一级名称气泡有 .drawai-rail-tip 样式')
+  ok(/scheduleCloseRailFamilyPanel/.test(src), '离开后延迟关闭气泡')
+  ok(/background:#ffffff/.test(src) && /border-radius:14px/.test(src), '元素选择气泡是白色圆角浮层')
+  ok(/railOpenFamily/.test(src), '气泡开关由悬停状态 railOpenFamily 控制（不靠选中/放置自动铺开）')
+  ok(/hoverHandlers\(entry\.family\)/.test(src), '各族入口都挂悬停（末级出名称、多变体出同族）')
+  ok(/family: 'edge'/.test(src) && /EDGE_LINE_LIBRARY/.test(src), '线条收成一族（EDGE_LINE_LIBRARY）')
+  ok(/kind: 'rounded'/.test(src) && /kind: 'sharp'/.test(src) && /kind: 'straight'/.test(src) && /kind: 'curved'/.test(src), '线条族含折线/直角折线/直线/曲线')
+  ok(/placeEdgeKind/.test(src), '线条放置走 placeEdgeKind（与形状 placeTool 分开，避免 rounded 撞名）')
+  ok(/createFreeEdgeAt\(drag\.x0, drag\.y0, drag\.placeEdge, drag\.x1, drag\.y1\)/.test(src), '武装线条后空白拖拽用起终点建独立线')
+  ok(/placeEdge: placeEdge/.test(src) && /key: 'place-edge-preview'/.test(src), '拖拽放置线条时画预览（不走框选矩形）')
+  ok(/rail-edge-straight/.test(src) === false, '不再单独挂「独立直线」入口（已并进线条族）')
+  ok(/function railShapeFace\(/.test(src) && /function railEdgeFace\(/.test(src), '母图标随选中子类型变（railShapeFace / railEdgeFace）')
+  ok(/face = railEdgeFace\(kind\)/.test(src) && /face = railShapeFace\(shape\)/.test(src), '图形/线条族入口把 face 传给 railIconButton')
+  ok(/className: 'drawai-body'/.test(src), '画布与元素条包在 drawai-body 横排里')
+  ok(/\.drawai-rail\{/.test(src), '有 .drawai-rail 样式（右侧竖条）')
+  ok(/\.drawai-rail-cap\{/.test(src), '条顶有细分隔线（飞书侧栏顶部细线）')
+  ok(/placeShape: typeof placeTool === 'string'/.test(src), '空白按下会记下 placeTool，松手落下')
+  ok(/createNodeAt\(drag\.placeShape, menuStyle, drag\.x0, drag\.y0\)/.test(src), '放置工具武装时点空白 = createNodeAt')
+  ok(/setPlaceTool\(null\)/.test(src) && /落下\*\*一个\*\*节点/.test(src), '放置是单次（放完卸工具）')
+  ok(/function shapeFamilyOf\(/.test(src), '有 shapeFamilyOf（同族换形）')
+  ok(/shape === 'text'/.test(src) && /shape === 'svg'/.test(src), '文字与 SVG 各自成族（不算图形同族）')
+  ok(/shape === 'image'/.test(src) && /family: 'image'/.test(src), '图片也自成一族（侧栏入口 + 粘贴/拖入）')
+  ok(/function imageFilesFromDataTransfer\(/.test(src), '有 imageFilesFromDataTransfer（从剪贴板/拖放抽图片）')
+  ok(/function insertImageFiles\(/.test(src), '有 insertImageFiles（落成 image 节点）')
+  ok(/addEventListener\('paste', onPaste, true\)/.test(src), '挂了 paste 捕获监听（系统剪贴板图片 → 节点）')
+  ok(/onDrop:/.test(src) && /mediaFilesFromDataTransfer\(event\.dataTransfer\)/.test(src), '画布通过统一媒体入口支持拖入图片和视频文件')
+  ok(/styleWithImageDataUri/.test(src), '贴图走 styleWithImageDataUri（drawio 的 shape=image + data URI）')
+  ok(!/'＋ 新增节点'/.test(src), '「＋ 新增节点」按钮已移除')
+  ok(!/key: 'shape-pick'/.test(src), '右键菜单不再内嵌形状平铺块')
+  ok(!/rows\.push\(shapeGrid\(/.test(src) && !/body: shapeGrid\(/.test(src), '形状不再挂在任何下拉的 body 里')
+  // 动作类（改标签/删除/顺序…）仍然是一排按钮：它们没有"当前值"，收进下拉反而多一次点击
+  ok(/reorderItem\('node', menu\.id, 'front'\)/.test(src) && /openNodeEditor\(menu\.id\)/.test(src), '动作类仍然是按钮（顺序 / 改标签 / 删除…）')
+  // 展开体的样式：缩进 + 左侧竖线，看起来是那排 chips 的下拉面板
+  ok(/\.drawai-menu-select-body\{/.test(src), '展开体有对应样式（缩进 + 左侧竖线）')
+}
+
+console.log('\n下拉里的选项横着排 + 字号可手动调节')
+{
+  // 需求："下拉列表横向排布，字号需要可以手动调节大小"。
+  const body = bodyOf('fontSizeRow') || ''
+  ok(body.length > 0, '有 fontSizeRow')
+  // 横向排布：选项条一律 flex + 允许换行，形状缩略图按原尺寸自动填充（不被挤扁）
+  ok(/\.drawai-menu-select-body>\.drawai-menu-row,\.drawai-menu-select-body>\.drawai-fontrow\{[^}]*display:flex;flex-wrap:wrap/.test(src), '下拉里的选项条是横向 flex（放不下才换行）')
+  ok(/\.drawai-fontrow\{display:flex;flex-wrap:wrap/.test(src), '字号那一行也是横向 flex')
+  ok(/\.drawai-menu-select-body>\.drawai-grid\{grid-template-columns:repeat\(auto-fill,minmax\(42px,1fr\)\)\}/.test(src), '形状缩略图按 42px 自动填充（5 列 1fr 会把 44px 的缩略图挤扁）')
+  ok(/\.drawai-menu-select-body>\.drawai-swatches\{margin-top:0;flex-wrap:wrap\}/.test(src), '色板也横排并允许换行')
+
+  // 字号手动调节：− [输入框] ＋
+  ok(/function clampFontSize\(value\)/.test(src), '有 clampFontSize（纯函数，边界自测在 check-render）')
+  ok(/const FONT_SIZE_MIN = 8/.test(src) && /const FONT_SIZE_MAX = 72/.test(src), '手动输入有范围常量（8–72）')
+  ok(/type: 'number'/.test(body) && /min: FONT_SIZE_MIN/.test(body) && /max: FONT_SIZE_MAX/.test(body), '输入框是 number 且带 min/max')
+  ok(/className: 'drawai-fontsize'/.test(body), '输入框有自己的样式类')
+  ok(/if \(event\.key === 'Enter'\)/.test(body) && /commit\(event\.target\.value, true\)/.test(body), '回车生效并收起')
+  ok(/onBlur: \(event\) => commit\(event\.target\.value, false\)/.test(body), '失焦也生效（且不收起，方便接着点 ＋/−）')
+  ok(!/onChange:/.test(body), '打字过程中不写文档（回车/失焦才落盘 —— 与"双击改标签"同一套节奏）')
+  ok(/key: 'fs-minus'/.test(body) && /key: 'fs-plus'/.test(body), '有 − / ＋ 两个步进按钮')
+  ok(/const next = clampFontSize\(raw\)/.test(body) && /if \(next !== current\) apply\(next\)/.test(body), '输入值先夹取、与当前值相同就不写（不制造无意义的撤销步）')
+  ok(/const next = Math\.min\(FONT_SIZE_MAX, Math\.max\(FONT_SIZE_MIN, base \+ delta\)\)/.test(body), '步进同样受范围限制')
+  ok(/if \(String\(current\) !== String\(it\[0\]\)\) apply\(it\[0\]\)/.test(body), '点档位时值没变也不写文档（以前每次点击都会压一步撤销历史）')
+  ok(/key: 'fs-input-' \+ String\(current\)/.test(body), '输入框非受控但随当前值重挂（步进之后显示的仍是新值）')
+}
+
+console.log('\n独立文字：右侧元素条能放一段字（不接节点、也不接边）')
+{
+  // 需求："添加可独立放置的文字"。实现上它是**一个节点**，只是形状是 drawio 的 text
+  // （没有边框、没有底色），于是拖动/缩放/改字/进图层/复制粘贴全都免费复用节点那一套。
+  // 入口是右侧元素条的「文字」—— 点它武装放置，再点画布走 createNodeAt。
+  ok(/createNodeAt\(drag\.placeShape, menuStyle, drag\.x0, drag\.y0\)/.test(src), '放置工具点空白 = createNodeAt(形状, 配色, 点的位置)（「文字」也走这一条）')
+  ok(/\{ shape: 'text', label: '文字' \}/.test(src), '形状面板里有「文字」（点它就是放一段独立文字）')
+  // 直接验证新建结果，避免增加视频分支后旧的源码正则误报。
+  const placeholder = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><path d="M0 0L10 0L10 10z"/></svg>'
+  const freshContext = Object.assign({}, styleKernel, {
+    DEFAULT_SVG_MARKUP: placeholder, DEFAULT_VIDEO_POSTER: placeholder,
+    NEW_VIDEO_W: 160, NEW_VIDEO_H: 90, NEW_SVG_SIZE: 100, NEW_SECTION_W: 300, NEW_SECTION_H: 200,
+    NEW_NODE_W: 130, NEW_NODE_H: 60, GRID: 10, snap: (v) => v, snapTo: (v) => v, nodeTextFitHeight: () => 0,
+  })
+  const fresh = new Function(...Object.keys(freshContext), 'id', 'shape', 'styleName', 'userX', 'userY', 'label', bodyOf('freshNode')).bind(null, ...Object.values(freshContext))
+  const textNode = fresh('t', 'text', 'blue', 0, 0)
+  const svgNode = fresh('s', 'svg', 'blue', 0, 0)
+  ok(textNode.label === '文字' && svgNode.label === '', '文字元素的默认文字是「文字」（svg 节点不给默认文字，免得压在图上）')
+  // 文字不吃配色：它的样式就是 drawio 的 defaultTextStyle，盖上 fillColor/strokeColor
+  // 只会让文件与 drawio 不一致，屏幕上还什么都看不出来。svg 同理（图片不吃填充/描边）。
+  // 分区自带淡底虚线，也不盖调色板。
+  ok(
+    textNode.style === styleKernel.styleWithNodeShape('', 'text'),
+    '新建节点对文字不套配色（保持 drawio 的 defaultTextStyle）',
+  )
+  ok(/\{ shape: 'section', label: '分区' \}/.test(src), '形状面板里有「分区」（可插入的区块元素）')
+  ok(!/成为一组/.test(src) && !/取消组合/.test(src), '不再用编辑菜单「成为一组/取消组合」')
+  ok(/解散分区/.test(src), '分区右键可解散（删框留内容）')
+  ok(styleKernel.svgMarkupFromStyle(svgNode.style) === placeholder, '放 svg 节点时带上一张占位图（否则拿到的是看不见的空框）')
+  ok(/if \(isText\) openNodeEditor\(id\)/.test(src), '放下来直接进编辑态（drawio 的 insertText 也是这样）')
+  ok(
+    /labelOnlyColor \? styleWithTextColorName\(nodeStyle, color\) : styleWithColorName/.test(src),
+    '文字元素的调色板改 fontColor 而不是填充/描边（否则点一圈颜色毫无变化）',
+  )
+}
+
+console.log('\nSVG 内容节点：元素条里有入口、右键里能改内容')
+{
+  // 需求："添加一种节点，该节点内容可以直接使用 SVG 绘制"。
+  // 这条链路上有三个必须接上的点：① 元素条里有这一格；② 右键能把内容贴进去；
+  // ③ 贴进去之后要真的写进 style（不是只在界面上画个框）。
+  ok(/\{ shape: 'svg', label: 'SVG 图形' \}/.test(src), '元素条里有「SVG 图形」（点它武装放置）')
+  ok(/const DEFAULT_SVG_MARKUP =/.test(src), '有默认占位图（否则点下去得到的是看不见的空框）')
+  ok(/function styleForShapePick\(style, shape\)/.test(src), '换形状走 styleForShapePick（唯一"形状决定不了内容"的那一个）')
+  ok(/shape === 'svg' && svgMarkupFromStyle\(next\) === null/.test(src), '只给空节点补占位图（已有内容的不覆盖）')
+  ok(/currentShape === 'svg' && isVideoNodeData\(node.data\) === false \? React\.createElement/.test(src) && !/'改成 SVG 图形…'/.test(src), '右键仅允许编辑已有 SVG 内容，不提供转换入口')
+  ok(/onClick: \(\) => openSvgEditor\(menu\.id\)/.test(src), '那个按钮接的是 openSvgEditor')
+  ok(/function openSvgEditor\(id\)/.test(src) && /kind: 'svg'/.test(src), 'openSvgEditor 打开 svg 面板')
+  ok(/function commitSvgEditor\(id, text\)/.test(src), '有保存函数（内容整段替换）')
+  // 保存时必须**校验 + 写文档**：贴一段不是 SVG 的文本进来，不能悄悄写进去（那会变成一个空框）
+  const commitBody = (() => {
+    const start = src.indexOf('function commitSvgEditor(')
+    const open = src.indexOf('{', start)
+    let depth = 0
+    for (let i = open; i < src.length; i += 1) {
+      if (src[i] === '{') depth += 1
+      else if (src[i] === '}') {
+        depth -= 1
+        if (depth === 0) return src.slice(open, i + 1)
+      }
+    }
+    return ''
+  })()
+  ok(/isSvgMarkup\(raw\) === false/.test(commitBody), '保存前先判"这段文本里有没有 <svg"')
+  ok(/styleWithSvgMarkup\(style, raw\)/.test(commitBody), '合法内容 → styleWithSvgMarkup（内容与形状一起落盘）')
+  ok(/styleWithoutSvgMarkup\(style\)/.test(commitBody), '留空保存 = 清掉内容、回到矩形（与宿主 svg:null 同一件事）')
+  ok(/applyLocal\(/.test(commitBody), '改动走 applyLocal（进撤销历史、也会写盘）')
+  // 安全边界：标记只喂给 <image href>（那里的 SVG 是独立文档，脚本不执行、也不碰页面 DOM）。
+  // 内联进页面 DOM 的另一条路（dangerouslySetInnerHTML）在这份代码里必须**一处都没有**
+  //（注释里提到它是解释"为什么不那么做"，不算）。
+  const inlineHits = src.split('\n').filter((line) => {
+    if (line.indexOf('dangerouslySetInnerHTML') < 0) return false
+    const t = line.trim()
+    return t.indexOf('//') !== 0 && t.indexOf('*') !== 0 && t.indexOf('/*') !== 0
+  })
+  ok(inlineHits.length === 0, '**没有任何地方把标记内联进页面 DOM**（<image> 里的 SVG 是独立文档、脚本不执行）')
+  ok(/React\.createElement\('image', \{/.test(src), '画的是 <image>（不是把标记拼成 DOM）')
+}
+
+console.log('\n自环与复制粘贴的接线（手势与快捷键必须真的连上）')
+{
+  // 用与产物同款的组合 body 当"源码"：这里断言的是文本接线，不是运行行为。
+  const source = src
+  // 自环：手势不能再被挡住，且预览与落盘共用"进出口不同侧"的纠正。
+  ok(!/if \(linking\.from === id\) return/.test(source), '连线拖回起点不再被直接 return 掉（自环手势通了）')
+  ok(/selfLoopPath/.test(source) && /nextSideOf/.test(source), '自环路由与"换一个侧"的纠正都在')
+  ok(/toSide === seedSide\) toSide = nextSideOf/.test(source), '预览里也做同侧纠正（预览即结果）')
+  // 剪贴板：快捷键与菜单项都接上了（字母匹配走 accelLetter，兼容 event.code）。
+  ok(/function accelLetter\(event, letter\)/.test(source) && /copySelection\(\)/.test(source), 'Ctrl+C → copySelection（accelLetter）')
+  ok(/accelLetter\(event, 'x'\)/.test(source) && /cutSelection\(\)/.test(source), 'Ctrl+X → cutSelection')
+  ok(/accelLetter\(event, 'v'\)/.test(source) && /pasteClipboard\(\)/.test(source), 'Ctrl+V → pasteClipboard')
+  ok(/addEventListener\('copy', onCopy, true\)/.test(source) && /addEventListener\('cut', onCut, true\)/.test(source), 'copy/cut 捕获监听（主通道，防 DSH 截走 Ctrl+C）')
+  ok(/addEventListener\('keydown', onKey, true\)/.test(source), 'keydown 挂在捕获阶段')
+  ok(
+    /item\('复制', copySelection/.test(source) && /item\('剪切', cutSelection/.test(source) && /item\('粘贴', pasteClipboard/.test(source),
+    '编辑菜单里有复制 / 剪切 / 粘贴',
+  )
+  ok(/let clipboard = null/.test(source), '剪贴板是模块级的（跨标签页也能贴）')
+}
+
+console.log('\n键盘归属：在别处打字时画布一个键都不许碰')
+{
+  // 用户实测报过两条：
+  //   · 在输入框里按退格 → 删掉的是**画布里的选中内容**；
+  //   · 画布打开时，输入框里的 Ctrl+C/V 不管用。
+  // 根因是画布的快捷键挂在 window 上，而**DSH 的输入框是 Lexical 的 contenteditable**：
+  // 之前只挡 input/textarea，事件目标又常常是输入框内部的 span，于是全部漏过去。
+  //
+  // 这一节喂假 DOM 节点给那个纯函数，把判据钉住。
+  const mod = { exports: {} }
+  // 这个 window 桩要能被下面 `withSelection` 改（模块里的 hasTextSelectionOutside
+  // 读的就是**传进去的这个对象**，不是 globalThis.window）—— 所以留一个引用出来。
+  const testWindow = { addEventListener() {}, removeEventListener() {} }
+  globalThis.__drawaiTestWindow = testWindow
+  new Function('module', 'exports', 'require', 'window', 'document', src)(
+    mod,
+    mod.exports,
+    (s) => {
+      if (s === 'react') return makeReact()
+      throw new Error('unexpected require ' + s)
+    },
+    testWindow,
+    fakeDocument,
+  )
+  const internals = mod.exports.__routeInternals
+  const owns = internals.canvasOwnsKeyboard
+  const isText = internals.isTextEntry
+
+  const el = (tag, extra) => Object.assign({ tagName: tag, closest: () => null }, extra || {})
+  /** 输入框**里面**的 span：closest 能找到外面的 contenteditable。 */
+  const innerOf = (host) => el('SPAN', { closest: (sel) => (String(sel).indexOf('contenteditable') >= 0 ? host : null) })
+  // 面板根就是 rootRef.current 那一个元素（CanvasView 的 .drawai-root），
+  // 所以假 DOM 里 `pane` 必须**就是 root 本身**（按身份比较）。
+  const root = { name: 'drawai-root', contains: (node) => node === root || node.inRoot === true }
+  const key = (target, active) => owns({ target: target }, root, active)
+
+  ok(isText(el('TEXTAREA')) && isText(el('INPUT')) && isText(el('SELECT')), 'isTextEntry：input / textarea / select 都算')
+  ok(isText(el('DIV', { isContentEditable: true })) === true, 'isTextEntry：contenteditable 宿主算（DSH 的输入框就是它）')
+  const lexicalHost = el('DIV', { isContentEditable: true })
+  ok(isText(innerOf(lexicalHost)) === true, 'isTextEntry：输入框里的 span 也算（事件目标就是它）')
+  ok(isText(el('DIV', { isContentEditable: false })) === false, 'isTextEntry：普通 div 不算')
+
+  ok(key(el('TEXTAREA'), el('TEXTAREA')) === false, '<textarea> 里按键 → 画布放手')
+  ok(key(innerOf(lexicalHost), lexicalHost) === false, 'Lexical 输入框里按键 → 画布放手（退格不再删画布内容）')
+  ok(key(el('DIV', { isContentEditable: true }), el('BODY')) === false, '目标就是输入宿主 → 放手')
+  ok(key(el('BODY'), el('BODY')) === true, '焦点在 body（刚点过画布）→ 画布处理')
+  ok(key(el('BODY'), undefined) === true, '什么都没有聚焦 → 画布处理')
+  ok(key(el('BUTTON', { inRoot: true }), el('BUTTON', { inRoot: true })) === true, '焦点在本面板的按钮上 → 画布处理')
+  ok(key(el('BUTTON'), el('BUTTON')) === false, '焦点在别的面板的按钮上 → 画布放手')
+  ok(key(el('BODY'), null) === true, '焦点是 null → 画布处理')
+
+  // ---- Ctrl+C/X/A：用户手里有"画布之外"的选中文字时必须放手，否则对话里的字复制不出来 ----
+  //
+  // 实测场景：点过画布之后焦点落在 body → canvasOwnsKeyboard 判定"画布拥有键盘" →
+  // Ctrl+C 被 preventDefault，用户在对话里划好的一段文字复制不出任何东西。
+  // 判据是"这段选中的文字属于哪个面板"，所以这里喂假 Selection + 假 DOM 树。
+  const outside = internals.hasTextSelectionOutside
+  ok(typeof outside === 'function', 'hasTextSelectionOutside 有导出（能直接断言）')
+
+  /** 假元素：带 closest、能靠 parentNode 往上走。 */
+  const node = (opts) => {
+    const el = {
+      parentNode: (opts && opts.parent) || null,
+      closest: (sel) =>
+        opts !== undefined && opts.pane !== undefined && opts.pane !== null && String(sel).indexOf('drawai-root') >= 0 ? opts.pane : null,
+    }
+    return el
+  }
+  const inPane = node({ pane: root })
+  const inConv = node({ pane: null, parent: node({ pane: null }) })
+  /**
+   * 喂一个假 Selection 再问一次。
+   *
+   * 模块里的 `window` 用的是 `new Function(...)` 传进去的那个桩，所以这里换**全局**
+   * `globalThis.window` 没用 —— 要换的是本节那个桩对象自己（它就在上面建好了）。
+   */
+  const withSelection = (text, anchor, fn) => {
+    const w = globalThis.__drawaiTestWindow
+    const saved = w.getSelection
+    w.getSelection = () => ({ toString: () => text, anchorNode: anchor })
+    try {
+      return fn()
+    } finally {
+      if (saved === undefined) delete w.getSelection
+      else w.getSelection = saved
+    }
+  }
+
+  ok(withSelection('', null, () => outside(root)) === false, '没有选中任何文字 → 不算外部选区（画布照常处理 Ctrl+C）')
+  ok(withSelection('对话里的一段话', inConv, () => outside(root)) === true, '选中了对话里的文字（锚点不在面板里）→ 是外部选区（Ctrl+C 交给浏览器）')
+  ok(withSelection('节点标签', inPane, () => outside(root)) === false, '选中了画布面板里的文字 → 不算外部选区（Ctrl+C 仍然复制画布选区）')
+  ok(withSelection('有字但拿不到锚点', null, () => outside(root)) === true, '有选中文字但拿不到锚点 → 倾向放手（宁可让浏览器复制一次）')
+  // SVG 标签没有 closest：锚点是 <text> 时必须继续往上找，不能一遇到没有 closest 就放弃
+  const svgText = { closest: undefined, parentNode: node({ pane: root }) }
+  ok(withSelection('节点标签', svgText, () => outside(root)) === false, 'SVG <text>（没有 closest）里选中的文字，仍然被认成"画布自己的"')
+
+  // 接线：window 上的那个 keydown 必须**先问归属**再动任何东西（否则上面这些判据白搭）。
+  const onKeyStart = src.indexOf('function onKey(event) {')
+  const onKeyBody = onKeyStart >= 0 ? src.slice(onKeyStart, src.indexOf('window.addEventListener(', onKeyStart)) : ''
+  ok(/canvasOwnsKeyboard\(event, rootRef\.current, document\.activeElement\)/.test(onKeyBody), 'onKey 第一件事就是问 canvasOwnsKeyboard')
+  const guardAt = onKeyBody.indexOf('canvasOwnsKeyboard(')
+  const firstAction = Math.min(
+    ...[onKeyBody.indexOf('preventDefault()'), onKeyBody.indexOf('deleteSelected()'), onKeyBody.indexOf('copySelection()')].filter((i) => i >= 0),
+  )
+  ok(guardAt >= 0 && guardAt < firstAction, '归属判定排在 preventDefault / 删除 / 复制之前')
+
+  // 接线：Ctrl+C/X/A 之前必须先问"外面有没有选中的文字"
+  ok(
+    /hasTextSelectionOutside\(rootRef\.current\)/.test(onKeyBody),
+    'onKey 里问了 hasTextSelectionOutside（否则对话里选中的文字按 Ctrl+C 没反应）',
+  )
+  ok(
+    onKeyBody.indexOf('hasTextSelectionOutside(') < onKeyBody.indexOf('copySelection()'),
+    '这一问排在 copySelection() 之前',
+  )
+  ok(
+    /accelLetter\(event, 'a'\)/.test(onKeyBody) && onKeyBody.indexOf('selectAll()') > onKeyBody.indexOf('hasTextSelectionOutside('),
+    'Ctrl+A 同样受这一条保护（在对话里按 Ctrl+A 不该变成"全选画布"）',
+  )
+  // **画布里有选中元素时不能放手** —— 否则"先在对话里划字、再点画布元素"之后
+  // Ctrl+C 复制不出画布里的东西（实测报过："又无法复制画布中的元素了"）。
+  ok(
+    /selectedIds\.length === 0 && hasTextSelectionOutside\(rootRef\.current\)/.test(onKeyBody),
+    '放手的前提是"画布空着"（画布里有选中元素时，Ctrl+C 仍然归画布）',
+  )
+
+  // ---- 在画布上按下 = 清掉残留在别处的文字选区（否则会一直挡住画布的复制）----
+  const clearSel = internals.clearStaleTextSelection
+  ok(typeof clearSel === 'function', 'clearStaleTextSelection 有导出')
+  const runClear = (button, targetClosest) => {
+    const calls = []
+    const saved = testWindow.getSelection
+    testWindow.getSelection = () => ({ removeAllRanges: () => calls.push('cleared') })
+    try {
+      clearSel({ closest: targetClosest === undefined ? () => null : targetClosest }, button)
+    } finally {
+      if (saved === undefined) delete testWindow.getSelection
+      else testWindow.getSelection = saved
+    }
+    return calls
+  }
+  ok(runClear(0).length === 1, '左键按在画布上 → 清掉别处的文字选区')
+  ok(runClear(2).length === 0, '右键不清（要留给"复制这段文字"的右键菜单）')
+  ok(
+    runClear(0, (sel) => (String(sel).indexOf('drawai-edit') >= 0 ? { className: 'drawai-edit' } : null)).length === 0,
+    '按在就地编辑框里 → 不动（那是用户自己在框里选字）',
+  )
+  // 接线：canvas 的按下处理必须真的调它
+  const rootDownAt = src.indexOf('function onRootPointerDown(event) {')
+  const rootDownBody = rootDownAt >= 0 ? src.slice(rootDownAt, src.indexOf('setDocMenu(null)', rootDownAt)) : ''
+  ok(/clearStaleTextSelection\(target,/.test(rootDownBody), 'onRootPointerDown 里调了 clearStaleTextSelection（画布上的按下都会走到这里）')
+  // DSH 0.2：点画布后焦点常仍停在对话 contenteditable → 必须主动 claim 焦点，否则 Delete/复制粘贴全死。
+  ok(/claimCanvasKeyboard\(rootRef\.current, target\)/.test(rootDownBody), 'onRootPointerDown 里调了 claimCanvasKeyboard（收回键盘焦点）')
+  ok(/tabIndex:\s*-1/.test(src), '面板根可聚焦（tabIndex=-1），claimCanvasKeyboard 才收得住焦点')
+  const claim = internals.claimCanvasKeyboard
+  ok(typeof claim === 'function', 'claimCanvasKeyboard 有导出')
+  {
+    const calls = []
+    const root = {
+      focus(opts) {
+        calls.push(opts === undefined ? 'focus' : opts)
+      },
+    }
+    claim(root, { tagName: 'DIV', closest: () => null, isContentEditable: false })
+    ok(calls.length === 1 && calls[0] !== undefined && calls[0].preventScroll === true, '普通目标 → focus({preventScroll:true})')
+    calls.length = 0
+    claim(root, { tagName: 'TEXTAREA', isContentEditable: false, closest: () => null })
+    ok(calls.length === 0, '按在 textarea 上 → 不抢焦点')
+    calls.length = 0
+    claim(root, {
+      tagName: 'DIV',
+      isContentEditable: false,
+      closest: (sel) => (String(sel).indexOf('drawai-edit') >= 0 ? { className: 'drawai-edit' } : null),
+    })
+    ok(calls.length === 0, '按在就地编辑框里 → 不抢焦点')
+  }
+}
+
+console.log('\n选区上报：客户端把"用户选中了什么"告诉宿主（AI 侧才读得到）')
+{
+  // 为什么单列一节：这一条**只在客户端成立**（宿主那一半 check-host 已经测了：selection 端点
+  // 存下来、diagram_read 带回去、按文件配对、删掉就划掉）。客户端这边最容易犯的错是
+  // "每次 setSelectedIds 就发一次请求"（框选时等于按帧打宿主）或者"藏着不发"（AI 又看不见了）。
+  const at = src.indexOf("action: 'selection'")
+  ok(at > 0, "客户端有选区上报（action: 'selection'）")
+  // 以上报点为中心取一段窗口做结构性守卫（跨到别的函数去就会假绿，所以窗口刻意收窄）。
+  const around = at > 0 ? src.slice(Math.max(0, at - 1200), at + 700) : ''
+  ok(/React\.useEffect\(/.test(around), '上报挂在 effect 里（渲染期发请求会每帧打一次）')
+  ok(/setTimeout\(/.test(around) && /clearTimeout\(handle\)/.test(around), '有防抖：setTimeout + 清理 clearTimeout（框选时选区每动一下就变）')
+  ok(around.indexOf('SELECTION_REPORT_MS') >= 0, '防抖时长走 SELECTION_REPORT_MS 常量，不是就地写个魔数')
+  ok(/\[selectedIds, target, sessionId, active, hasPath\]/.test(around), '依赖里有 selectedIds（选区变了才重发）与 target/hasPath（带路径给宿主按文件配对）')
+  ok(/path: hasPath \? target : ''/.test(around), "上报带着当前画布路径（不带路径的旧选区会串到别的文件上）")
+  ok(/client === null \|\| !active/.test(around), '隐藏标签、或根 ctx 还没绑定时不上报')
+  ok(/\.catch\(\(\) => \{\}\)/.test(around), '上报失败静默（老宿主没这条路由时不该在界面上冒错）')
+}
+
+console.log('\n导出通道：客户端接住 AI 的导出请求、渲染、回执')
+{
+  // 渲染器只在客户端，所以 AI 的 `{op:'export'}` 是"宿主挂请求 → 客户端轮询取走 → 渲染 → 回执"。
+  // 这半边最容易犯的两个错：**不去重**（每 3 秒下载一次 PNG）与**把 svg 也下载**（AI 要的是
+  // 工作区里的一个文件，不是用户下载目录里的一份）。
+  ok(src.indexOf("action: 'export-result'") > 0, "客户端会回执导出结果（action: 'export-result'）")
+  ok(/function reportExportResult\(requestId, format, payload\)/.test(src), '有 reportExportResult（唯一的上报出口）')
+  ok(/payload\.export/.test(src), '轮询回执里读 payload.export（宿主把请求挂在那儿）')
+  ok(/exportHandledRef\.current !== wantExport\.requestId/.test(src), '按 requestId 去重（不去重就是每 3 秒下载一次）')
+  ok(/format: wantExport\.format === 'png' \? 'png' : 'svg'/.test(src), 'AI 的请求走对象形态（带 requestId 与 format）')
+  const pick = src.indexOf('const wantExport = payload.export')
+  const pickBody = pick >= 0 ? src.slice(pick, pick + 900) : ''
+  ok(/setSelectedIds\(\[\]\)/.test(pickBody) && /setExportRequest\(/.test(pickBody), '导出前先清掉选中（不然手柄会被拍进产物）')
+  const effectAt = src.indexOf("reportExportResult(requestId, 'svg'")
+  ok(effectAt > 0, 'AI 的 svg 回执给宿主落盘（不是浏览器下载）')
+  ok(/reportExportResult\(requestId, 'png', \{ ok: true, downloaded: true \}\)/.test(src), 'png 走浏览器下载，只回执"已下载"')
+  ok(/reportExportResult\(requestId, format, \{ ok: false, error:/.test(src), '渲染不出来时也要回执失败（AI 才能如实告诉用户）')
+}
+
+console.log('\n字色：节点与连线的标签颜色都能改（fontColor）')
+{
+  // 以前只有「独立文字」的配色会落到 fontColor —— 普通节点/连线的**字色**在画布上根本没有入口
+  //（节点菜单里的"配色"改的是填充+描边，连线菜单里连颜色都只有 strokeColor）。
+  // 这一节盯的是"接线"：两类各有一行字色、写的是同一个键、色板预览的是文字色。
+  const labelHits = src.match(/label: '字色'/g) || []
+  ok(labelHits.length === 2, '节点菜单与连线菜单各有一类「字色」（实际 ' + labelHits.length + ' 处）')
+  const keyHits = src.match(/key: 'fontColor'/g) || []
+  ok(keyHits.length === 2, '两类的 key 都是 fontColor（实际 ' + keyHits.length + ' 处）')
+  ok(/label: labelOnlyColor \? '字色' : '配色'/.test(src), '文字、图片及视频等无边框节点只提供字色，不提供无效配色')
+  ok(/\.\.\.\(labelOnlyColor\s*\n\s*\? \[\]/.test(src), '无边框节点不再多出重复的「字色」入口')
+  // 写入路径：节点走内核的 styleWithTextColorName（'plain' = 删键回缺省字色），连线走 updateEdge 的 fontColor
+  ok(
+    /updateNode\(nodeTargets, \{ style: styleWithTextColorName\(nodeStyle, color\) \}\)/.test(src),
+    '节点字色写进 fontColor（与独立文字同一套内核函数）',
+  )
+  ok(/updateEdge\(edgeTargets, \{ fontColor: color \}\)/.test(src), '连线字色走 updateEdge 的 fontColor')
+  ok(
+    /if \(has\(patch, 'fontColor'\)\) style = styleWithTextColorName\(style, patch\.fontColor\)/.test(src),
+    'updateEdge 真的把 fontColor 落成 style 键（不是记在别处）',
+  )
+  // 色板预览：字色那一行必须显示**文字色**（调色板的 stroke 那一支），否则点"黄"得到的字色看着像点错了
+  ok(/forFont \? '字色：' : ''/.test(src), '字色色板的 title 标明是字色')
+  ok(/background: isPlain \? '#000000' : entry\.stroke/.test(src), '字色色板用 stroke 那一支预览（与 styleWithTextColorName 同源）')
+  const fontKind = src.match(/,\s*\n\s*'font',\s*\n/g) || []
+  ok(fontKind.length === 2, '两类字色都用了 kind="font" 的色板（实际 ' + fontKind.length + ' 处）')
+}
+
+console.log('\n「看一眼」：客户端渲成 PNG 回执给宿主（不下载、不落工作区）')
+{
+  // AI 的 `diagram_read {render:true}` 靠这半边把画布变成图：渲成 PNG → base64 回执 →
+  // 宿主存进附件库（工作区零文件）。最容易犯的错是**去下载**（那就跑到用户下载目录去了）。
+  // 体量不再由客户端预检截断：宿主对 render-result 单独放开了 body 上限。
+  ok(src.indexOf("action: 'render-result'") > 0, "客户端会回执渲染结果（action: 'render-result'）")
+  ok(/function reportRenderResult\(requestId, payload\)/.test(src), '有 reportRenderResult（这条路上唯一的上报出口）')
+  ok(/function renderPngPayload\(node, width, height, scale\)/.test(src), '有 renderPngPayload（渲成 base64，不触发下载）')
+  const payloadAt = src.indexOf('function renderPngPayload(')
+  const payloadSrc = payloadAt >= 0 ? src.slice(payloadAt, payloadAt + 1600) : ''
+  ok(/toDataURL\('image\/png'\)/.test(payloadSrc), '用 canvas 的 toDataURL 取 PNG（不落文件）')
+  ok(/downloadBlob|downloadPng/.test(payloadSrc) === false, '这条路上**没有任何下载**（下载 = 跑到用户的下载目录里去了）')
+  ok(/context\.fillStyle = mode === 'dark'/.test(payloadSrc), '底色跟随主题（深色模式下别给模型一张纯白底图）')
+  ok(/payload\.render/.test(src), '轮询回执里读 payload.render（宿主把请求挂在那儿）')
+  ok(/lookHandledRef\.current !== wantLook\.requestId/.test(src), '按 requestId 去重（不去重就是每 3 秒渲一遍）')
+  ok(/LOOK_MAX_BASE64/.test(src) === false, '客户端不再预检 PNG 体量（LOOK_MAX_BASE64 已去掉）')
+  ok(/renderPngPayload\(built\.node, built\.width, built\.height, 2\)/.test(src), '看一眼按 2× 渲（比手动导出的 4× 更轻）')
+  ok(/reportRenderResult\(requestId, \{ ok: false, error: message \}\)/.test(src), '渲染失败也要回执 ok:false（否则宿主永远 pending）')
+  ok(/function renderPngPayload/.test(src) && /function downloadPng/.test(src), '「给模型看」与「给用户导出」各走各的（但共用同一套取图路径）')
+}
+
+console.log('\n「自动路由」不许把悬空端的落点一起删掉（独立线会整条消失）')
+{
+  // 真实事故（AI 那条 op 上先踩到的）：给一条"两端都是自由点"的独立线清折点，
+  // 自由端点被无条件删掉 → 这条边一个落点都不剩 → 写回整条跳过 → 画布上那条线就没了。
+  // AI 侧已修（check-host 里盯着），这里是画布这一侧的同一处。
+  const body = bodyOf('clearEdgeWaypoints')
+  ok(body !== null, '源码里有 clearEdgeWaypoints')
+  const clearSrc = body === null ? '' : body
+  ok(/delete e\.points/.test(clearSrc), '折点照旧无条件清掉（它本来就是折点）')
+  ok(/if \(typeof e\.from === 'string'\) delete e\.sourcePoint/.test(clearSrc), '自由端点只在那一端**有真实顶点**时才删（起点）')
+  ok(/if \(typeof e\.to === 'string'\) delete e\.targetPoint/.test(clearSrc), '自由端点只在那一端**有真实顶点**时才删（终点）')
+  ok(
+    /^\s*delete e\.sourcePoint\s*$/m.test(clearSrc) === false && /^\s*delete e\.targetPoint\s*$/m.test(clearSrc) === false,
+    '没有"无条件删自由端点"那种写法（那正是上面那个事故）',
+  )
+}
+
+console.log('\n浮动工具栏：批量改样式保留各对象其余属性')
+{
+  const doc = { nodes: [
+    { id: 'a', x: 0, y: 0, w: 100, h: 60, style: 'fillColor=#ff0000;strokeWidth=2;custom=keepA;' },
+    { id: 'b', x: 150, y: 0, w: 100, h: 60, style: 'fillColor=#00ff00;strokeWidth=4;custom=keepB;' },
+  ], edges: [{ id: 'e', style: 'dashed=1;custom=keepEdge;' }] }
+  let mutations = 0
+  let lineChange = null
+  // 与真实客户端保持相同的解构边界，不能把内核全部导出注入桩中，掩盖漏引入错误。
+  const importedNames = /const\s*\{([^}]+)\}\s*=\s*styleKernel/.exec(src)[1].split(',').map((name) => name.trim()).filter(Boolean)
+  const importedKernel = Object.fromEntries(importedNames.map((name) => [name, styleKernel[name]]))
+  const context = Object.assign({}, importedKernel, {
+    doc, view: { x: 0, y: 0, w: 500, h: 500 }, size: { w: 260, h: 400 },
+    editing: null, menu: null, placeEdgeKind: null, placeTool: null,
+    selectedIds: ['a', 'b', 'e'], routeMemoryRef: { current: new Map() },
+    React: { createElement: (type, props, ...children) => ({ type, props: props || {}, children }) },
+    filterEditableIds: (doc, ids) => ids,
+    nodeBoxOf: (n) => n,
+    edgeRoutePoints: () => [{ x: 100, y: 30 }, { x: 150, y: 30 }],
+    boxOfBoxes: () => ({ x: 0, y: 0, w: 250, h: 60 }),
+    clampNumber: (v, min, max) => Math.min(max, Math.max(min, v)),
+    clampFontSize: (v) => Math.max(8, Math.min(72, Math.round(Number(v)))),
+    shapeFamilyOf: new Function('shape', bodyOf('shapeFamilyOf')),
+    styleForShapePick: styleKernel.styleWithNodeShape,
+    SHAPE_LIBRARY: ['rect', 'ellipse', 'svg', 'image', 'text', 'section'].map((shape) => ({ shape, label: shape })),
+    edgeLineLabelOf: (kind) => kind,
+    railShapeFace: (shape) => ({ type: 'svg', props: { 'data-shape': shape }, children: [] }),
+    railEdgeFace: (kind) => ({ type: 'svg', props: { 'data-line': kind }, children: [] }),
+    applyLocal: (mutate) => { mutations++; mutate(doc) },
+    applyLineKind: (ids, kind) => { lineChange = { ids, kind } },
+    updateEdge: () => {},
+    lastCoalesceRef: { current: null },
+    ColorPalette: 'color-palette', uid: 'test', prefs: { customColors: [] },
+    customColorList: new Function('normalizeCustomColor', 'value', bodyOf('customColorList')).bind(null, new Function('value', bodyOf('normalizeCustomColor'))),
+    loadDrawaiPrefs: () => ({ customColors: [] }), patchPrefs: () => {},
+    ImageTraceControl: 'image-trace-control',
+    ToolbarPopover: 'toolbar-popover',
+    exportNodeImage: (node, format) => { lineChange = { node, format } },
+    nodeImageExportInfo: new Function('isVideoNodeData', 'imageValueFromStyle', 'isRasterDataUri', 'isSvgDataUri', 'node', bodyOf('nodeImageExportInfo')).bind(null,
+      styleKernel.isVideoNodeData, styleKernel.imageValueFromStyle, styleKernel.isRasterDataUri, styleKernel.isSvgDataUri),
+    generateImageTrace: () => {},
+    hasPath: true, enqueueImageTrace: () => {},
+    applyImageTrace: () => {},
+  })
+  context.isBasicShapeStyle = new Function('shapeFamilyOf', 'nodeShapeFromStyle', 'imageValueFromStyle', 'styleGet', 'style', bodyOf('isBasicShapeStyle')).bind(null,
+    context.shapeFamilyOf, styleKernel.nodeShapeFromStyle, styleKernel.imageValueFromStyle, styleKernel.styleGet)
+  context.nodeShowsLabel = new Function('isVideoNodeData', 'shapeOf', 'node', bodyOf('nodeShowsLabel')).bind(null,
+    context.isVideoNodeData, new Function('nodeShapeFromStyle', 'node', bodyOf('shapeOf')).bind(null, context.nodeShapeFromStyle))
+  const start = src.indexOf('function renderSelectionToolbar(')
+  const end = src.indexOf('function renderShapeRail(', start)
+  const render = () => new Function(...Object.keys(context), src.slice(start, end) + '\nreturn renderSelectionToolbar()')(...Object.values(context))
+  const flatten = (node) => Array.isArray(node) ? node.flatMap(flatten) : node && typeof node === 'object' ? [node].concat(flatten(node.children || [])) : []
+  const tree = render()
+  ok(tree.props.role === 'toolbar' && tree.props.style.width === '244px', '窄侧栏中浮动工具栏限制在画布宽度内')
+  const controls = flatten(tree)
+  const control = (label) => controls.find((el) => el.props.label === label || el.props['aria-label'] === label)
+  ok(control('字号').props.value === '', '节点与边字号不同，显示混合状态')
+  control('字号').props.onChange('24')
+  ok(doc.nodes.concat(doc.edges).every((cell) => styleKernel.styleGet(cell.style, 'fontSize') === '24'), '字号一次应用到混合选区所有对象')
+  ok(styleKernel.styleGet(doc.nodes[0].style, 'fillColor') === '#ff0000' && styleKernel.styleGet(doc.nodes[1].style, 'fillColor') === '#00ff00', '批量改字号保留不同填充色')
+  ok(styleKernel.styleGet(doc.nodes[1].style, 'custom') === 'keepB' && styleKernel.styleGet(doc.edges[0].style, 'custom') === 'keepEdge', '不覆盖未知样式属性')
+  controls.find((el) => el.type === 'color-palette' && el.props.label === '填充').props.onPick('#123456')
+  ok(doc.nodes.every((n) => styleKernel.styleGet(n.style, 'fillColor') === '#123456') && styleKernel.styleGet(doc.edges[0].style, 'fillColor', '') === '', '填充只作用于图形，不修改混合选区的连线')
+  control('线型').props.onChange('straight')
+  ok(lineChange.kind === 'straight' && JSON.stringify(lineChange.ids) === '["e"]', '线型仅应用到选中的连线，并走几何处理入口')
+  ok(mutations === 2, '每次批量样式修改只提交一次历史操作')
+  const fillPicker = controls.find((el) => el.type === 'color-palette' && el.props.label === '填充')
+  fillPicker.props.onOpacityChange(45)
+  ok(doc.nodes.every((n) => styleKernel.styleGet(n.style, 'fillOpacity') === '45') && styleKernel.styleGet(doc.edges[0].style, 'fillOpacity', '') === '', '填充透明度仅修改节点，不修改混合选区的连线')
+  context.editing = { kind: 'node', id: 'a' }
+  ok(render() === null, '文字输入时工具栏不遮挡编辑框')
+  context.editing = null
+  context.selectedIds = ['a', 'b']
+  const shapeControl = flatten(render()).find((el) => el.props.label === '形状')
+  ok(shapeControl.props.options.every(([value, label, icon]) => ['rect', 'ellipse'].includes(value) && icon.type === 'svg'), '基础图形以同类形状图标展示，排除 SVG/图片/文字/分区')
+  shapeControl.props.onChange('ellipse')
+  ok(doc.nodes.every((node) => styleKernel.nodeShapeFromStyle(node.style) === 'ellipse'), '基础图形可批量切换形状')
+  ok(styleKernel.styleGet(doc.nodes[1].style, 'custom') === 'keepB', '切换形状保留每个节点自己的属性')
+  const markup = '<svg viewBox="0 0 10 10"><path d="M0 0h10v10z"/></svg>'
+  for (const shape of ['svg', 'image', 'text', 'section']) {
+    doc.nodes[1].style = shape === 'svg' ? styleKernel.styleWithSvgMarkup('', markup)
+      : shape === 'image' ? styleKernel.styleWithImageDataUri('', 'data:image/png;base64,aGVsbG8=')
+      : styleKernel.styleWithNodeShape('', shape)
+    context.selectedIds = ['b']
+    const drawControl = flatten(render()).find((el) => el.type === 'image-trace-control')
+    const exportControl = flatten(render()).find((el) => el.props.label === '导出图片' || el.props['aria-label'] === '导出图片')
+    ok(Boolean(exportControl) === ['image', 'svg'].includes(shape), shape + ' 按节点类别提供图片导出入口')
+    if (shape === 'svg') {
+      const choices = flatten(exportControl.props.renderPanel(() => {})).filter((el) => el.type === 'button')
+      choices[1].props.onClick()
+      ok(choices.length === 2 && lineChange.node.id === 'b' && lineChange.format === 'png', 'SVG 导出卡片提供 SVG 与 PNG，并将 PNG 请求传给当前节点')
+    }
+    if (shape === 'image') {
+      exportControl.props.onClick()
+      ok(lineChange.node.id === 'b' && lineChange.format === undefined, '位图导出直接下载当前节点原图')
+    }
+    if (['svg', 'image', 'text'].includes(shape)) ok(!flatten(render()).some((el) => el.props.label === '描边'), shape + ' 无边框内容节点不显示无效的描边工具')
+    ok(Boolean(drawControl) === (shape === 'image'), shape + ' 的工具栏绘制入口按节点类别显示')
+    if (shape === 'image') {
+      ok(drawControl.props.source && drawControl.props.source.id === 'b', '绘制控件绑定当前选中的图片节点')
+      ok(drawControl.props.disabled !== true, '已导入位图时绘制可用')
+    }
+    ok(!flatten(render()).some((el) => el.props.label === '形状'), shape + ' 单选不显示跨类别换形入口')
+    context.selectedIds = ['a', 'b']
+    ok(!flatten(render()).some((el) => el.props.label === '形状'), shape + ' 混合选区也不显示换形入口')
+    const original = doc.nodes[1].style
+    shapeControl.props.onChange('rect')
+    ok(doc.nodes[1].style === original, '旧换形回调也不会转换 ' + shape + ' 节点')
+  }
+  ok(new Function('setHoverNodeId', 'id', bodyOf('onNodePointerEnter'))((id) => id, 'a') === undefined, '悬停节点仅更新悬停状态，不再触发工具栏气泡')
+  doc.nodes[1].style = 'shape=image;image=refs/logo.png;'
+  context.selectedIds = ['b']
+  ok(!flatten(render()).some((el) => el.props.label === '形状'), '外链图片占位节点也不提供换形入口')
+  ok(flatten(render()).find((el) => el.type === 'image-trace-control').props.disabled === true, '外链图片未导入时禁用绘制')
+  context.selectedIds = []
+  ok(render() === null, '清除选择后关闭浮动工具栏')
+}
+
+console.log('\n标准色与自定义色板')
+{
+  const normalize = new Function('value', bodyOf('normalizeCustomColor'))
+  const colors = new Function('normalizeCustomColor', 'value', bodyOf('customColorList')).bind(null, normalize)
+  ok(normalize(' #AbC ') === '#aabbcc' && normalize('#AABBCC') === '#aabbcc', 'HEX 输入支持简写、大小写和空白归一化')
+  ok(normalize('rgb(0,0,0)') === null && normalize('#12345z') === null, '非法颜色不会加入色板')
+  ok(JSON.stringify(colors(['#abc', '#AABBCC', 'invalid', '#123456'])) === '["#aabbcc","#123456"]', '自定义颜色去重并过滤非法值')
+  ok(colors(null).length === 0 && colors({}).length === 0, '旧偏好或损坏偏好没有自定义色时仍可使用')
+  const React = makeReact()
+  const colorsStart = src.indexOf('const STANDARD_COLORS =')
+  const colorsEnd = src.indexOf('function normalizeCustomColor(', colorsStart)
+  const standard = new Function(src.slice(colorsStart, colorsEnd) + ';return STANDARD_COLORS')()
+  ok(standard.length >= 24 && standard.some(([color]) => color === '#ffffff') && standard.some(([color]) => color === '#000000'), '标准色板包含黑白、常用色与浅色')
+  let chosen = null
+  let saved = null
+  let opacity = null
+  const timers = new Map()
+  let timerId = 0
+  const props = { label: '填充', value: '#ffffff', customColors: ['#123456'], opacity: 100, onOpacityChange: (value) => { opacity = value }, onPick: (color) => { chosen = color }, onSaveColor: (color) => { saved = color } }
+  const Palette = new Function('React', 'normalizeCustomColor', 'customColorList', 'STANDARD_COLORS', 'document', 'setTimeout', 'clearTimeout', 'props', bodyOf('ColorPalette')).bind(null,
+    React, normalize, colors, standard, { documentElement: { clientWidth: 360, clientHeight: 800 } },
+    (fn) => { const id = ++timerId; timers.set(id, fn); return id }, (id) => timers.delete(id))
+  const render = () => { React.__reset(); return Palette(props) }
+  const flatten = (node) => Array.isArray(node) ? node.flatMap(flatten) : node && typeof node === 'object' ? [node].concat(flatten(node.children || [])) : []
+  let tree = render()
+  const popup = flatten(tree).find((el) => el.props.className === 'drawai-palette-panel')
+  const anchor = { open: true, getBoundingClientRect: () => ({ left: 330, top: 400, bottom: 436 }) }
+  const panel = { style: {}, offsetWidth: 320, shown: false, getBoundingClientRect: () => ({ height: 230 }), matches() { return this.shown }, showPopover() { this.shown = true }, hidePopover() { this.shown = false } }
+  tree.props.ref.current = anchor
+  popup.props.ref.current = panel
+  tree.props.onToggle({ target: anchor, currentTarget: anchor })
+  ok(panel.shown && panel.style.top === '158px' && panel.style.left === '28px', '色板在工具栏上方弹出，窄窗口中自动靠内定位')
+  tree.props.onPointerEnter()
+  ok(anchor.open && panel.shown, '悬停工具入口直接打开上浮面板')
+  tree.props.onPointerLeave()
+  ok(timers.size === 1 && anchor.open, '移出入口时延迟关闭，留出移向上方浮窗的时间')
+  popup.props.onPointerEnter()
+  ok(timers.size === 0 && anchor.open, '进入浮窗取消关闭计时，不会闪退')
+  popup.props.onPointerLeave()
+  Array.from(timers.values())[0]()
+  ok(!anchor.open && !panel.shown, '移出浮窗后关闭面板')
+  tree.props.onPointerEnter()
+  let prevented = false
+  popup.props.onKeyDown({ key: 'Escape', preventDefault() { prevented = true }, stopPropagation() {} })
+  ok(prevented && !anchor.open && !panel.shown, 'Esc 关闭上浮面板')
+  flatten(tree).find((el) => el.props['aria-label'] === '填充不透明度').props.onChange({ target: { value: '35' } })
+  ok(opacity === 35, '不透明度滑杆传递实际百分比')
+  const details = { open: true }
+  const click = { currentTarget: { closest: () => details } }
+  flatten(tree).find((el) => el.props['aria-label'] === '填充：红').props.onClick(click)
+  ok(chosen === '#ef4444' && details.open === true, '点标准色直接应用并保留面板，可继续调整不透明度')
+  flatten(tree).find((el) => el.props['aria-label'] === '填充：#123456').props.onClick(click)
+  ok(chosen === '#123456', '保存的自定义颜色可直接点击复用')
+  flatten(tree).find((el) => el.props['aria-label'] === '添加自定义颜色').props.onClick()
+  tree = render()
+  flatten(tree).find((el) => el.props['aria-label'] === '自定义颜色 HEX').props.onChange({ target: { value: '#AbC' } })
+  tree = render()
+  const add = flatten(tree).find((el) => el.type === 'button' && el.children.includes('添加并应用'))
+  add.props.onClick(click)
+  ok(saved === '#aabbcc' && chosen === '#aabbcc', '添加自定义色时保存并应用归一化值')
+  tree = render()
+  flatten(tree).find((el) => el.props['aria-label'] === '添加自定义颜色').props.onClick()
+  tree = render()
+  flatten(tree).find((el) => el.props['aria-label'] === '自定义颜色 HEX').props.onChange({ target: { value: '#oops' } })
+  tree = render()
+  ok(flatten(tree).find((el) => el.type === 'button' && el.children.includes('添加并应用')).props.disabled === true, '非法输入时禁用添加按钮')
+  props.options = [['rect', '矩形', { type: 'svg', props: {}, children: [] }], ['ellipse', '椭圆', { type: 'svg', props: {}, children: [] }]]
+  props.label = '形状'
+  props.value = 'rect'
+  props.onChange = (value) => { chosen = value }
+  tree = render()
+  const choices = flatten(tree).filter((el) => el.type === 'button' && el.props['aria-label'] && el.props['aria-label'].startsWith('形状：'))
+  ok(choices.length === 2 && choices.every((el) => el.children[0].type === 'svg'), '形状面板使用图标网格，不使用文字下拉框')
+  choices[1].props.onClick()
+  ok(chosen === 'ellipse', '点击图标触发形状切换')
+}
+
+console.log('\n图层列表：名称编辑和独立操作')
+{
+  const React = makeReact()
+  const editRef = { current: null }
+  React.useRef = () => editRef
+  const calls = []
+  const doc = { nodes: [{ id: 'n', layer: '1' }], edges: [], layers: [{ id: '1', name: '主流程' }, { id: '2', name: '草稿', locked: true, visible: false }] }
+  const props = { doc, selectedIds: ['n'], activeId: '1', uid: 'layer-test', mode: 'light',
+    onRename: (id, name) => { calls.push(['rename', id, name]); doc.layers.find((l) => l.id === id).name = name },
+    onSelect: (id) => calls.push(['select', id]), onVisible: (id) => calls.push(['visible', id]), onLocked: (id) => calls.push(['locked', id]),
+    onRemove: (id) => calls.push(['remove', id]), onMove: (id) => calls.push(['move', id]), onCreate: () => { doc.layers.push({ id: '3', name: '图层 3' }); return '3' },
+  }
+  const events = new Map()
+  const label = new Function('layer', 'index', bodyOf('layerLabelOf'))
+  const Panel = new Function('React', 'layerLabelOf', 'filterEditableIds', 'LayerThumbnail', 'layerActionIcon', 'document', 'props', bodyOf('LayersPanel')).bind(null, React, label, (doc, ids) => ids, 'thumbnail', (kind) => kind,
+    { addEventListener: (name, callback) => events.set(name, callback), removeEventListener: (name) => events.delete(name) })
+  const render = () => { React.__reset(); return Panel(props) }
+  const flatten = (node) => Array.isArray(node) ? node.flatMap(flatten) : node && typeof node === 'object' ? [node].concat(flatten(node.children || [])) : []
+  const find = (tree, label) => flatten(tree).find((node) => node.props['aria-label'] === label)
+  let tree = render()
+  React.__runEffects()
+  ok(flatten(tree).filter((node) => node.props.className && node.props.className.startsWith('drawai-layer-row')).length === 2, '每个图层只占一个主行')
+  ok(flatten(tree).filter((node) => node.type === 'thumbnail').length === 2, '每层有内容缩略图')
+  find(tree, '隐藏 主流程').props.onClick()
+  find(tree, '解锁 草稿').props.onClick()
+  ok(JSON.stringify(calls) === '[["visible","1"],["locked","2"]]', '可见性和锁定操作不切换当前层')
+  find(tree, '重命名 主流程').props.onClick()
+  tree = render()
+  const input = find(tree, '图层名称')
+  input.props.onChange({ target: { value: '业务流程' } })
+  tree = render()
+  const key = (key, value) => ({ key, target: { value }, preventDefault() {}, stopPropagation() {} })
+  const editing = find(tree, '图层名称')
+  editing.props.onKeyDown(key('Enter', '业务流程'))
+  editing.props.onBlur({ target: { value: '业务流程' } })
+  ok(doc.layers[0].name === '业务流程' && calls.filter((call) => call[0] === 'rename').length === 1, '名称 Enter 保存且失焦不会重复提交')
+  tree = render()
+  find(tree, '重命名 业务流程').props.onClick()
+  tree = render()
+  find(tree, '图层名称').props.onKeyDown(key('Escape', '不应保存'))
+  ok(doc.layers[0].name === '业务流程', 'Esc 取消图层重命名')
+  tree = render()
+  find(tree, '重命名 业务流程').props.onClick()
+  tree = render()
+  find(tree, '图层名称').props.onChange({ target: { value: '点击外部保存' } })
+  events.get('pointerdown')({ target: { closest: () => null } })
+  ok(doc.layers[0].name === '点击外部保存', '菜单关闭前通过捕获事件保存名称草稿，避免依赖卸载时 blur')
+  tree = render()
+  const move = find(tree, '移动到图层')
+  ok(flatten(move).find((node) => node.type === 'option' && node.props.value === '2').props.disabled === true, '移层选择器禁用锁定目标')
+  move.props.onChange({ target: { value: '1' } })
+  ok(calls.some((call) => call[0] === 'move' && call[1] === '1'), '移层动作携带目标层 id')
+  flatten(tree).find((node) => node.type === 'button' && node.children.includes('＋ 新建图层')).props.onClick()
+  tree = render()
+  ok(find(tree, '图层名称').props.value === '图层 3', '新建图层后直接进入名称编辑')
+}
+
+console.log('\n连续调整画布窗口大小')
+{
+  const element = { clientWidth: 800, clientHeight: 600 }
+  const measuredRef = { current: { w: 800, h: 600 } }
+  const viewRef = { current: { x: 40, y: -20, w: 400, h: 300 } }
+  let nextView = null
+  let nextSize = null
+  const resizeViewFor = new Function('current', 'prevSize', 'nextSize', bodyOf('resizeViewFor'))
+  const measure = new Function('element', 'measuredRef', 'viewRef', 'resizeViewFor', 'setViewOverride', 'setSize', bodyOf('measure'))
+    .bind(null, element, measuredRef, viewRef, resizeViewFor, (value) => { nextView = value }, (value) => { nextSize = value })
+  const commit = new Function('measuredRef', 'viewRef', 'size', 'view', bodyOf('syncCommittedViewport'))
+    .bind(null, measuredRef, viewRef)
+  // 两次 observer 通知之间不模拟 React 渲染，复现布局拖动比提交更快的情况。
+  for (const [w, h] of [[1000, 600], [1200, 500], [500, 900], [800, 600]]) {
+    const oldSize = measuredRef.current
+    const oldView = viewRef.current
+    element.clientWidth = w; element.clientHeight = h
+    measure()
+    // observer 之后旧渲染才提交：旧尺寸不能覆盖下一次通知使用的视口。
+    commit(oldSize, oldView)
+    ok(nextSize.w / nextView.w === 2 && nextSize.h / nextView.h === 2, '连续通知 ' + w + '×' + h + ' 保持横纵缩放比例')
+    ok(nextView.x === 40 && nextView.y === -20 && viewRef.current === nextView, '视野原点不变且同步更新事件读取的视口')
+  }
+  const previous = viewRef.current
+  element.clientWidth = 0; element.clientHeight = 0
+  measure()
+  ok(viewRef.current === previous && measuredRef.current.w === 800, '标签页隐藏时保留有效的视口和尺寸')
+  element.clientWidth = 1000; element.clientHeight = 700
+  measure()
+  ok(nextSize.w / nextView.w === 2 && nextSize.h / nextView.h === 2, '重新显示标签页后仍保持原有比例')
+  commit(nextSize, { x: 10, y: 20, w: 1000, h: 700 })
+  element.clientWidth = 500; element.clientHeight = 400
+  measure()
+  ok(nextSize.w / nextView.w === 1 && nextSize.h / nextView.h === 1 && nextView.x === 10 && nextView.y === 20,
+    '主动缩放和平移提交后，后续拖动保持新的比例和原点')
+}
+
+console.log('\n导出参数面板')
+{
+  const React = makeReact()
+  let request = null
+  let saved = null
+  const props = { doc: { nodes: [{ id: 'n' }], edges: [] }, selectedIds: ['n'], path: 'docs/示意.drawio', prefs: { exportOptions: { format: 'png', scale: 2 } },
+    onPrefs: (value) => { saved = value }, onExport: (value) => { request = value } }
+  const bounds = () => ({ minX: 0, minY: 0, maxX: 100, maxY: 50 })
+  const numberOr = new Function('value', 'fallback', bodyOf('numberOr'))
+  const normalizeCustomColor = new Function('value', bodyOf('normalizeCustomColor'))
+  const hiddenLayerIds = new Function('doc', bodyOf('hiddenLayerIds'))
+  const isHiddenCell = new Function('hidden', 'cell', bodyOf('isHiddenCell'))
+  const exportDocument = new Function('docFilteredToIds', 'nodeBoxOf', 'hiddenLayerIds', 'isHiddenCell', 'doc', 'options', bodyOf('exportDocument')).bind(null, (doc) => doc, (node) => node, hiddenLayerIds, isHiddenCell)
+  const exportGeometry = new Function('numberOr', 'paintedBounds', 'contentBounds', 'doc', 'options', bodyOf('exportGeometry')).bind(null, numberOr, bounds, bounds)
+  const exportOutputSize = new Function('numberOr', 'width', 'height', 'options', bodyOf('exportOutputSize')).bind(null, numberOr)
+  const context = { React, numberOr, normalizeCustomColor, exportDocument, exportGeometry, exportOutputSize, hiddenLayerIds, isHiddenCell,
+    layerLabelOf: (layer) => layer.name, ColorPalette: 'color-palette', customColorList: (list) => list }
+  const Panel = new Function(...Object.keys(context), 'props', bodyOf('ExportPanel')).bind(null, ...Object.values(context))
+  const render = () => { React.__reset(); return Panel(props) }
+  const flatten = (node) => Array.isArray(node) ? node.flatMap(flatten) : node && typeof node === 'object' ? [node].concat(flatten(node.children || [])) : []
+  const find = (tree, label) => flatten(tree).find((node) => node.props['aria-label'] === label)
+  let tree = render()
+  ok(find(tree, '导出范围').props.value === 'all', '导出默认整张画布，不隐式裁到当前选区')
+  ok(find(tree, '导出分辨率').props.value === '2' && find(tree, '导出文件名').props.value === '示意', '恢复本机分辨率偏好，并预填画布名称')
+  find(tree, '导出范围').props.onChange({ target: { value: 'selection' } })
+  find(tree, '导出格式').props.onChange({ target: { value: 'svg' } })
+  find(tree, '导出背景').props.onChange({ target: { value: 'transparent' } })
+  tree = render()
+  ok(find(tree, '导出分辨率') === undefined, 'SVG 格式隐藏无关的分辨率选项')
+  find(tree, '导出文件名').props.onChange({ target: { value: '图/样.svg' } })
+  find(tree, '四周留白').props.onChange({ target: { value: '0' } })
+  find(tree, '导出网格').props.onChange({ target: { checked: true } })
+  tree = render()
+  find(tree, '导出尺寸方式').props.onChange({ target: { value: 'custom' } })
+  tree = render()
+  find(tree, '宽度 px').props.onChange({ target: { value: '800' } })
+  tree = render()
+  ok(Number(find(tree, '高度 px').props.value) === 400, '指定宽度后按内容比例调整高度，留白为零仍正确')
+  find(tree, '保持宽高比').props.onChange({ target: { checked: false } })
+  tree = render()
+  find(tree, '高度 px').props.onChange({ target: { value: '300' } })
+  tree = render()
+  flatten(tree).find((node) => node.type === 'button' && node.children.includes('导出')).props.onClick()
+  ok(request.format === 'svg' && request.transparent && request.name === '图_样' && JSON.stringify(request.ids) === '["n"]', '格式、范围、透明度和合法文件名传入现有导出通道')
+  ok(saved.exportOptions.format === 'svg' && saved.exportOptions.scale === 2, '导出设置保存到本机偏好')
+  ok(request.padding === 0 && request.grid && request.pixelWidth === 800 && request.pixelHeight === 300 && request.lockAspect === false, '高级尺寸、留白、独立网格和比例设置传入实际导出')
+}
+
+console.log('\n' + (failures === 0 ? '全部通过' : failures + ' 项失败') + '（共 ' + checks + ' 项）')
+process.exitCode = failures === 0 ? 0 : 1
