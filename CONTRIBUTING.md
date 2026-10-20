@@ -1,6 +1,6 @@
 # 贡献指南
 
-本仓库是 [dsh-drawai](https://github.com/fourzkw/dsh-drawai) 的增强 fork，欢迎提交改进。
+本仓库是 [fourzkw/dsh-drawai](https://github.com/fourzkw/dsh-drawai) 的增强 fork（本仓库为 `dsh-drawai-vectorizer`），欢迎提交改进。
 
 ## 开发环境
 

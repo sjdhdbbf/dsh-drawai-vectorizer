@@ -28,7 +28,7 @@ function check(label, ok, detail) {
   console.log(`  [${mark}] ${label}${detail === undefined ? '' : ' — ' + detail}`)
 }
 
-console.log('dsh-drawai 安装前烟测\n')
+console.log('dsh-drawai-vectorizer 安装前烟测\n')
 
 console.log('[0] lib/ 是否与 src/ 同步（防止改了源文件忘了构建）')
 try {

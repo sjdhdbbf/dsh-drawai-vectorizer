@@ -80,7 +80,7 @@ function compressedMxfile(modelXml) {
   return '<mxfile host="app.diagrams.net" compressed="true">\n  <diagram id="p1" name="Page-1">\n    ' + payload + '\n  </diagram>\n</mxfile>\n'
 }
 
-console.log('dsh-drawai mxfile 编解码自测\n')
+console.log('dsh-drawai-vectorizer mxfile 编解码自测\n')
 
 console.log('[1] 读未压缩的 .drawio（真实产物形状）')
 const plain = parseMxfile(PLAIN)

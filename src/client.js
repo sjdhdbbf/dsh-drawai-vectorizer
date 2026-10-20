@@ -1,5 +1,5 @@
 /**
- * dsh-drawai —— 浏览器半边（Client half）· 源文件
+ * dsh-drawai-vectorizer —— 浏览器半边（Client half）· 源文件
  *
  * 这是**源文件**，不要改 lib/client.js —— 那个由 tools/build.mjs 生成。
  *
@@ -3241,7 +3241,7 @@ function docFilteredToIds(doc, ids) {
 }
 
 /** 本机偏好（不进文件）：网格、默认形状/配色。 */
-const DRAWAI_PREFS_KEY = 'dsh-drawai.prefs'
+const DRAWAI_PREFS_KEY = 'dsh-drawai-vectorizer.prefs'
 const DEFAULT_DRAWAI_PREFS = { showGrid: true, showTaskList: false, defaultShape: 'rounded', defaultColor: 'blue' }
 
 const STANDARD_COLORS = [
@@ -13273,14 +13273,14 @@ function CanvasTitle(props) {
   return React.createElement('span', null, '📐 DrawAI 画布')
 }
 
-const STYLE_ID = 'dsh-drawai/client.css'
+const STYLE_ID = 'dsh-drawai-vectorizer/client.css'
 
 function apply(ctx) {
   client = ctx
   ctx.effect(() => () => canvasSessions.dispose())
 
   const styleEl = document.createElement('style')
-  styleEl.setAttribute('data-plugin', 'dsh-drawai')
+  styleEl.setAttribute('data-plugin', 'dsh-drawai-vectorizer')
   styleEl.setAttribute('data-plugin-css', STYLE_ID)
   styleEl.textContent = CSS
   document.head.appendChild(styleEl)

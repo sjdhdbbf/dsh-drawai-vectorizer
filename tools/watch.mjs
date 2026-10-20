@@ -1,5 +1,5 @@
 /**
- * dsh-drawai 构建监视器 —— 零依赖。
+ * dsh-drawai-vectorizer 构建监视器 —— 零依赖。
  *
  * 监听 src/，变化后重建 lib/。这是 dsh-client-hmr 需要的那一环：
  * 它的 Node 半边每 500ms 轮询 graph bundle 的时间戳，发现 lib/client.js 内容变了

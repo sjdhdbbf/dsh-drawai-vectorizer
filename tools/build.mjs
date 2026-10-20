@@ -1,5 +1,5 @@
 /**
- * dsh-drawai 构建器 —— 零依赖。
+ * dsh-drawai-vectorizer 构建器 —— 零依赖。
  *
  * 职责：
  *   src/index.js        → lib/index.js          加生成标记，其余原样（宿主半边本就是可直接运行的 ESM）

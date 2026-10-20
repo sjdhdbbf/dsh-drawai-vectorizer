@@ -1,5 +1,5 @@
 {
-  "name": "dsh-drawai",
+  "name": "dsh-drawai-vectorizer",
   "version": "0.4.0",
   "type": "module",
   "description": "DSH 右侧栏的可编辑画布 + AI 语义绘图工具（diagram_apply / diagram_read），直接读写原生 .drawio 文件；本版新增 vtracer 高质量矢量化引擎（贝塞尔样条 / 每通道位深 / 一半核心并行）",

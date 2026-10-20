@@ -1,5 +1,5 @@
 /**
- * dsh-drawai —— 宿主半边（Host half）· 源文件
+ * dsh-drawai-vectorizer —— 宿主半边（Host half）· 源文件
  *
  * 这是**源文件**，不要改 lib/index.js —— 那个由 tools/build.mjs 生成。
  *

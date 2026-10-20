@@ -1,4 +1,4 @@
-# dsh-drawai bundle patch
+# dsh-drawai-vectorizer bundle patch
 #
 # 这个文件是 `dsh.bundle.patch` 层：当本包通过 bundle 通道安装时，
 # `dsh plugin --profile <name> add` 会把它并入 profile 的 bundle 栈，
@@ -11,4 +11,4 @@
 # 注意：patch 文件不能是空的或只有注释——loader 会启动失败。留空请写 `[]`。
 - insert:
     - id: drawai
-      name: 'dsh-drawai'
+      name: 'dsh-drawai-vectorizer'

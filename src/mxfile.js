@@ -1713,8 +1713,8 @@ export function buildMxfile(doc, options) {
   // 纸张：模型里带了就照它写（读进来是什么尺寸，从零重建时还是什么尺寸），没带就用 drawio 的缺省。
   const pageW = doc.page !== undefined && doc.page !== null && Number.isFinite(Number(doc.page.w)) && Number(doc.page.w) > 0 ? Number(doc.page.w) : PAGE_W
   const pageH = doc.page !== undefined && doc.page !== null && Number.isFinite(Number(doc.page.h)) && Number(doc.page.h) > 0 ? Number(doc.page.h) : PAGE_H
-  lines.push('<mxfile host="dsh-drawai" agent="dsh-drawai" type="device">')
-  lines.push('  <diagram id="dsh-drawai-page-1" name="' + escapeAttr(pageName) + '">')
+  lines.push('<mxfile host="dsh-drawai-vectorizer" agent="dsh-drawai-vectorizer" type="device">')
+  lines.push('  <diagram id="dsh-drawai-vectorizer-page-1" name="' + escapeAttr(pageName) + '">')
   lines.push(
     '    <mxGraphModel dx="0" dy="0" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="' +
       pageW +
@@ -1799,7 +1799,7 @@ export function buildMxfile(doc, options) {
   if (!compressed) return { text: head + '\n' + model + '\n' + tail, dropped: dropped }
   return {
     text:
-      '<mxfile host="dsh-drawai" agent="dsh-drawai" type="device">\n  <diagram id="dsh-drawai-page-1" name="' +
+      '<mxfile host="dsh-drawai-vectorizer" agent="dsh-drawai-vectorizer" type="device">\n  <diagram id="dsh-drawai-vectorizer-page-1" name="' +
       escapeAttr(pageName) +
       '">\n    ' +
       compressModel(model) +

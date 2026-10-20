@@ -2,7 +2,7 @@
 ![Social preview](docs/social-preview.png)
 -->
 
-# dsh-drawai-hq
+# dsh-drawai-vectorizer-hq
 
 > **这是 [fourzkw/dsh-drawai](https://github.com/fourzkw/dsh-drawai) 的增强 fork（v0.4.0，基于上游 0.3.2）。**
 > 保留上游全部功能，新增 **vtracer 高质量矢量化引擎**。上游版权与 MIT 许可完整保留。
@@ -88,7 +88,7 @@ dsh plugin --profile desktop add <本仓库路径或 tgz>
 
 ## 功能一览
 
-`dsh-drawai` 把可编辑画布放进 DeepSeek Harness 右侧栏，并给模型两个改图工具；人和 AI 读写的是同一份原生 `.drawio`。
+`dsh-drawai-vectorizer` 把可编辑画布放进 DeepSeek Harness 右侧栏，并给模型两个改图工具；人和 AI 读写的是同一份原生 `.drawio`。
 
 1. **右侧栏可编辑画布** —— 打开 / 新建工作区 `.drawio`：画节点、连边、就地改字、分层、排序、对齐、导出；双击即可改标签。
 2. **自然语言改图** —— 对话里说需求，模型用 `diagram_read` / `diagram_apply` 读现状、结构化改图、自动布局并原子写回。
@@ -110,7 +110,7 @@ dsh plugin --profile desktop add <本仓库路径或 tgz>
 
 ```sh
 # 从 npm 安装（推荐：预构建，跳过 allowBuilds 构建授权）
-dsh plugin --profile web add dsh-drawai
+dsh plugin --profile web add dsh-drawai-vectorizer
 
 # 或者直接从 GitHub 装（仓库里没有 prepare 脚本，同样不需要构建）
 dsh plugin --profile web add github:fourzkw/dsh-drawai
@@ -118,7 +118,7 @@ dsh plugin --profile web add github:fourzkw/dsh-drawai
 
 然后**重启 `dsh web`** —— 宿主侧只在启动时加载，这一步不能省。
 
-> **更新到最新版**：`dsh plugin --profile web update dsh-drawai@latest`
+> **更新到最新版**：`dsh plugin --profile web update dsh-drawai-vectorizer@latest`
 
 重启之后，你会看到：
 

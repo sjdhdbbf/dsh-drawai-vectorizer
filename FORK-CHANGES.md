@@ -1,4 +1,4 @@
-# dsh-drawai · HQ fork（v0.4.0）
+# dsh-drawai-vectorizer · HQ fork（v0.4.0）
 
 > 上游：[fourzkw/dsh-drawai](https://github.com/fourzkw/dsh-drawai) @ 0.3.2（MIT）
 > 本 fork 保留上游全部功能，新增 **vtracer 高质量矢量化引擎**。

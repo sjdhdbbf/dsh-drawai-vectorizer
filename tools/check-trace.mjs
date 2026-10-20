@@ -379,7 +379,7 @@ if (!hasSample) {
   const CANVAS = resolvePath(ROOT, 'canvas.drawio')
   writeFileSync(
     CANVAS,
-    '<?xml version="1.0" encoding="UTF-8"?>\n<mxfile host="dsh-drawai" agent="dsh-drawai" type="device">\n' +
+    '<?xml version="1.0" encoding="UTF-8"?>\n<mxfile host="dsh-drawai-vectorizer" agent="dsh-drawai-vectorizer" type="device">\n' +
       '  <diagram id="p1" name="Page-1">\n' +
       '    <mxGraphModel dx="0" dy="0" grid="1" gridSize="10" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">\n' +
       '      <root><mxCell id="0" /><mxCell id="1" parent="0" /></root>\n' +
